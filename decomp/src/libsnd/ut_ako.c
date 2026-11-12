@@ -31,9 +31,14 @@ void SsUtAllKeyOff(short mode) {
 
 #ifdef __psyz
 #undef SsUtAllKeyOff
+void Psyz_SpendCycles(unsigned cycles);
+/* PS1 time: 951 system clocks a voice (DuckStation, Ridge Racer Type 4's
+ * libsnd: 22.8k for its 24 voices, a SpuSetVoiceAttr each). */
+enum { SS_UT_ALL_KEY_OFF_VOICE_CYCLES = 951 };
 void SsUtAllKeyOff(short mode) {
     Psyz_KernelLockInterrupts();
     SsUtAllKeyOff_Unlocked(mode);
     Psyz_KernelUnlockInterrupts();
+    Psyz_SpendCycles((unsigned)(SS_UT_ALL_KEY_OFF_VOICE_CYCLES * _SsVmMaxVoice));
 }
 #endif
