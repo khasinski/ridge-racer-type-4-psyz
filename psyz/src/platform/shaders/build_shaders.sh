@@ -38,20 +38,22 @@ sha256() {
 
 emit_header() {
     src=$1        # intermediate file, e.g. psx.vert.spv
-    name=$2       # canonical base, e.g. psx_vert
+    # (POSIX sh has no locals: header, not name, which the loop below keeps
+    # for the DXIL header after psx.frag's framebuffer-fetch MSL)
+    header=$2     # canonical base, e.g. psx_vert
     suffix=$3     # spv, msl or dxil
     {
         echo "// clang-format off"
         xxd -i "$src" | sed \
-            -e "s/unsigned char [A-Za-z0-9_]*\[\]/unsigned char ${name}_${suffix}[]/" \
-            -e "s/unsigned int [A-Za-z0-9_]*_len/unsigned int ${name}_${suffix}_len/"
+            -e "s/unsigned char [A-Za-z0-9_]*\[\]/unsigned char ${header}_${suffix}[]/" \
+            -e "s/unsigned int [A-Za-z0-9_]*_len/unsigned int ${header}_${suffix}_len/"
         # the interface revision the C side checks (PSX_SHADER_REVISION)
         if [ -n "$revision" ]; then
-            echo "#define ${name}_${suffix}_revision $revision"
+            echo "#define ${header}_${suffix}_revision $revision"
         fi
         # the source it was built from (check_shaders.cmake)
-        echo "#define ${name}_${suffix}_source_sha256 \"$source_sha256\""
-    } > "${name}_${suffix}.h"
+        echo "#define ${header}_${suffix}_source_sha256 \"$source_sha256\""
+    } > "${header}_${suffix}.h"
 }
 
 # Metal on Apple GPUs: the fragment shader reads the destination pixel from
