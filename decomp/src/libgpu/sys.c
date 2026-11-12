@@ -368,11 +368,34 @@ void DrawPrim(void* p) {
     D_800B8920->cwb((u32*)&((P_TAG*)p)->r0, len);
 }
 
+#ifdef __psyz
+/* The list DMA DrawOTag starts walks the ordering table: until the first
+ * packet with data it only reads headers, and the CPU waits for it (61
+ * system clocks a node on DuckStation: 43.4k for an empty 704-entry table);
+ * from there the GPU's FIFO paces it and the CPU runs on. */
+enum { DRAW_OTAG_NODE_CYCLES = 61, DRAW_OTAG_NODES_MAX = 0x10000 };
+static unsigned DrawOTagEmptyNodes(OT_TYPE* p) {
+    unsigned n = 0;
+    while (p && n < DRAW_OTAG_NODES_MAX && getlen(p) == 0) {
+        n++;
+        if (isendprim(p)) {
+            break;
+        }
+        p = (OT_TYPE*)nextPrim(p);
+    }
+    return n;
+}
+#endif
+
 void DrawOTag(OT_TYPE* p) {
     if (info.level >= 2) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
+#ifdef __psyz
+    GPU_TIME(DRAW_OTAG_CYCLES + DRAW_OTAG_NODE_CYCLES * DrawOTagEmptyNodes(p));
+#else
     GPU_TIME(DRAW_OTAG_CYCLES);
+#endif
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
