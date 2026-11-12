@@ -344,6 +344,113 @@ static unsigned interp_capture_indices;
 static bool InterpGhostCovers(float (*pos)[3],unsigned count);
 static void InterpStore(InterpPair *p,unsigned pair,const Vertex *v,unsigned count);
 static void InterpBuildGhosts(void);
+/* The triangles (bits) of the polygon being queued that the GPU skips for
+ * their size (1024+ columns or 512+ rows): see InterpCaptureDraw. */
+static unsigned interp_size_culled;
+/* The primitive being captured waits for InterpFinishPending. */
+static bool interp_capture_pending;
+/* The drawing offset in VRAM: tells the views of a frame (split screen,
+ * mirror) apart in the motion fields. */
+static int InterpOffsetX(void);
+static int InterpOffsetY(void);
+/* How the midpoint moved this frame's paired vertices (InterpCaptureDraw):
+ * field 0 by their pose in the frame before, field 1 by their pose in this
+ * frame. A ghost's vertex (a pose of the frame before only) moves as the
+ * nearest vertex at a like depth in field 0, a new identity's (a pose of
+ * this frame only) as the nearest in field 1, joined to it where it is the
+ * same vertex (InterpFinishPending). A ghost's own continued motion does
+ * not know how the view moved this frame, and a new identity's pose in
+ * this frame is not where its neighbours are in the midpoint. Entries are
+ * hashed by cells of their pose. */
+#define INTERP_FIELD 16384u
+#define INTERP_FIELD_CELL 16
+#define INTERP_FIELD_REACH 24.0f
+#define INTERP_FIELD_CELLS 4096u
+typedef struct { float x, y, depth, dx, dy; short ox, oy; unsigned next; } InterpFieldEntry;
+typedef struct {
+    InterpFieldEntry entry[INTERP_FIELD];
+    unsigned len, frame, head[INTERP_FIELD_CELLS], stamp[INTERP_FIELD_CELLS];
+} InterpField;
+static InterpField interp_field[2];
+static unsigned InterpFieldCell(int cx,int cy,int ox,int oy) {
+    uint32_t h=(uint32_t)cx*0x9E3779B1u^(uint32_t)cy*0x85EBCA77u^(uint32_t)(ox*977+oy)*0xC2B2AE3Du;
+    return (h^h>>16)&(INTERP_FIELD_CELLS-1);
+}
+static void InterpFieldAdd(unsigned which,const float *from,float depth,int ox,int oy,const float *to) {
+    InterpField *f=&interp_field[which];
+    if(f->frame!=interp_frame){f->frame=interp_frame;f->len=0;}
+    if(f->len>=INTERP_FIELD||!(SDL_fabsf(from[0])<2048.0f&&SDL_fabsf(from[1])<2048.0f))return;
+    const unsigned c=InterpFieldCell((int)SDL_floorf(from[0]/INTERP_FIELD_CELL),(int)SDL_floorf(from[1]/INTERP_FIELD_CELL),ox,oy);
+    if(f->stamp[c]!=interp_frame){f->stamp[c]=interp_frame;f->head[c]=0;}
+    f->entry[f->len]=(InterpFieldEntry){from[0],from[1],depth,to[0]-from[0],to[1]-from[1],(short)ox,(short)oy,f->head[c]};
+    f->head[c]=++f->len;
+}
+/* The motion of the nearest entry within reach at a like depth (depth 0:
+ * any), its squared distance at *distance; false for none. */
+static bool InterpFieldMotion(unsigned which,const float *at,float depth,int ox,int oy,float motion[2],float *distance) {
+    const InterpField *f=&interp_field[which];
+    if(f->frame!=interp_frame||!(SDL_fabsf(at[0])<2048.0f&&SDL_fabsf(at[1])<2048.0f))return false;
+    const int cx=(int)SDL_floorf(at[0]/INTERP_FIELD_CELL),cy=(int)SDL_floorf(at[1]/INTERP_FIELD_CELL);
+    float best=INTERP_FIELD_REACH*INTERP_FIELD_REACH;bool found=false;
+    for(int y=cy-2;y<=cy+2;++y)for(int x=cx-2;x<=cx+2;++x){const unsigned c=InterpFieldCell(x,y,ox,oy);
+        if(f->stamp[c]!=interp_frame)continue;
+        for(unsigned k=f->head[c];k;k=f->entry[k-1].next){const InterpFieldEntry *e=&f->entry[k-1];
+            if(e->ox!=ox||e->oy!=oy)continue;
+            if(depth>0.0f&&e->depth>0.0f&&SDL_fabsf(e->depth-depth)>0.25f*SDL_max(e->depth,depth))continue;
+            const float d=(e->x-at[0])*(e->x-at[0])+(e->y-at[1])*(e->y-at[1]);
+            if(d<best){best=d;motion[0]=e->dx;motion[1]=e->dy;found=true;}}}
+    if(found)*distance=best;
+    return found;
+}
+/* Where a primitive drawn now lands in the frame's buffer: the drawing
+ * offset, the widescreen squeeze and the drawing area. */
+typedef struct { float ox, oy, squeeze, centre; int clip[4]; } InterpExposeView;
+static void InterpExposeViewNow(InterpExposeView *view);
+/* Ghosts (field 0) and new identities (field 1) queued since the last
+ * flush: their midpoint pose is final once the primitives queued with them
+ * are (Draw_FlushBuffer). from: the pose they move from. */
+#define INTERP_PENDING 2048u
+typedef struct {
+    unsigned pair, base;
+    unsigned char which, count, indices, index[6];
+    short ox, oy;
+    float from[6][2], depth[6];
+    InterpExposeView view;
+} InterpPending;
+static InterpPending interp_pending[INTERP_PENDING];
+static unsigned interp_pending_len;
+static bool InterpPend(unsigned which,unsigned pair,unsigned base,unsigned count,const float (*from)[3],const float *depth,
+                       const unsigned char *index,unsigned indices,int ox,int oy) {
+    if(interp_pending_len>=INTERP_PENDING||count>6||indices>6)return false;
+    InterpPending *q=&interp_pending[interp_pending_len++];
+    q->pair=pair;q->base=base;q->which=(unsigned char)which;q->count=(unsigned char)count;q->indices=(unsigned char)indices;
+    q->ox=(short)ox;q->oy=(short)oy;
+    for(unsigned i=0;i<count;++i){q->from[i][0]=from[i][0];q->from[i][1]=from[i][1];q->depth[i]=depth[i];}
+    for(unsigned i=0;i<indices;++i)q->index[i]=index[i];
+    InterpExposeViewNow(&q->view);
+    return true;
+}
+static void InterpFinishPending(void);
+/* Exposure: what the midpoint shows where both frames show something
+ * nearer. Each frame's opaque primitives and the midpoint's are rasterized
+ * at cell centres into depth grids (the nearest view depth, 0 for 2D),
+ * relative to the frame's buffer (Psyz_GpuInterpolationBackdrop). A cell
+ * both frames cover that the midpoint leaves uncovered, or covers with
+ * something much farther, shows what neither frame shows (a hole, the
+ * background through a gap): such a midpoint is not shown (see
+ * InterpMidpointUnsound). PSYZ_INTERP_EXPOSE=<cells> sets the limit. */
+#define INTERP_EXPOSE_CELL 4
+#define INTERP_EXPOSE_W (VRAM_W/INTERP_EXPOSE_CELL)
+#define INTERP_EXPOSE_H (VRAM_H/INTERP_EXPOSE_CELL)
+typedef struct { float depth; unsigned frame; } InterpExposeCell;
+/* [0], [1]: the frames by parity; [2]: the midpoint */
+static InterpExposeCell interp_expose[3][INTERP_EXPOSE_H][INTERP_EXPOSE_W];
+static struct { int x, y, w, h; unsigned frame; } interp_expose_rect[2];
+static float interp_mid_depth[MAX_VERTEX_COUNT];
+static void InterpExposeTriangle(unsigned grid,const float *a,const float *b,const float *c,float da,float db,float dc,const int clip[4]);
+static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const unsigned short *index,unsigned indices,unsigned base,bool precise);
+static unsigned InterpExposed(void);
+static unsigned interp_exposed_holes;
 static bool present_commit_pending,present_commit_mid;
 static Uint64 present_window_start;
 static unsigned present_window_frames,present_window_mid;
@@ -526,9 +633,10 @@ static void InterpStatsFrame(void) {
     for(unsigned i=0;i<INTERP_PAIRS;++i){InterpPair *p=&interp_pairs[i];
         if(p->serial&&p->tagged&&p->frame+1==interp_frame&&!p->midpoint_pose){
             interp_area[ISTAT_VANISHED]+=InterpArea(p->position,p->count);++interp_count[ISTAT_VANISHED];}}
-    SDL_Log("[interp-stats] f=%u paired=%u/%.0f new=%u/%.0f mismatch=%u/%.0f frameonly=%u/%.0f midonly=%u/%.0f vanished=%u/%.0f ghost=%u/%.0f replaced=%u/%.0f cut=%d",interp_frame,
+    const unsigned exposed=InterpExposed();
+    SDL_Log("[interp-stats] f=%u paired=%u/%.0f new=%u/%.0f mismatch=%u/%.0f frameonly=%u/%.0f midonly=%u/%.0f vanished=%u/%.0f ghost=%u/%.0f replaced=%u/%.0f cut=%d exposed=%u holes=%u",interp_frame,
         interp_count[0],interp_area[0],interp_count[1],interp_area[1],interp_count[2],interp_area[2],interp_count[3],interp_area[3],
-        interp_count[4],interp_area[4],interp_count[5],interp_area[5],interp_count[6],interp_area[6],interp_count[7],interp_area[7],interp_ghost_cut);
+        interp_count[4],interp_area[4],interp_count[5],interp_area[5],interp_count[6],interp_area[6],interp_count[7],interp_area[7],interp_ghost_cut,exposed,interp_exposed_holes);
     memset(interp_area,0,sizeof(interp_area));memset(interp_count,0,sizeof(interp_count));
 }
 void Psyz_GpuBeginInterpolationFrame(void) {
@@ -588,6 +696,8 @@ void Psyz_GpuInterpolationBackdrop(int x,int src_y,int dst_y,int w,int h) {
     Draw_FlushBuffer();
     interp_backdrop.x=x;interp_backdrop.src_y=src_y;interp_backdrop.dst_y=dst_y;
     interp_backdrop.w=w;interp_backdrop.h=h;interp_backdrop.frame=interp_frame;
+    interp_expose_rect[interp_frame&1].x=x;interp_expose_rect[interp_frame&1].y=dst_y;
+    interp_expose_rect[interp_frame&1].w=w;interp_expose_rect[interp_frame&1].h=h;interp_expose_rect[interp_frame&1].frame=interp_frame;
     InterpBackdropCopy(x,dst_y,w,h);
 }
 void Psyz_GpuSetInterpolationCamera(int x,int y) {
@@ -599,15 +709,20 @@ void Psyz_GpuSetInterpolationCamera(int x,int y) {
     interp_camera_x=x;interp_camera_y=y;interp_camera_frame=interp_frame;
 }
 /* The midpoint of the frame just drawn is no plausible in-between: a cut
- * (most of the frame's identities are new), or much of the picture is
+ * (most of the frame's identities are new), much of the picture is
  * geometry without a pose in the frame before, which the midpoint can only
- * draw where this frame has it. The frame before stays on screen for that
- * field instead. PSYZ_INTERP_HOLD=share of the picture (default 0.15). */
+ * draw where this frame has it, or it shows what neither frame shows (a
+ * hole or the background through a gap, InterpExposed). The frame before
+ * stays on screen for that field instead. PSYZ_INTERP_HOLD=share of the
+ * picture (default 0.15), PSYZ_INTERP_EXPOSE=cells (default 8, 0: off). */
 static Posi display_size;
 static bool InterpMidpointUnsound(void) {
     static float share=-1;
     if(share<0){const char *e=SDL_getenv("PSYZ_INTERP_HOLD");share=e&&*e?(float)SDL_atof(e):0.15f;}
+    static int expose=-1;
+    if(expose<0){const char *e=SDL_getenv("PSYZ_INTERP_EXPOSE");expose=e&&*e?SDL_atoi(e):8;}
     if(interp_ghost_cut)return true;
+    if(expose>0&&InterpExposed()>=(unsigned)expose)return true;
     const double picture=(double)display_size.x*display_size.y;
     const double posed=interp_area[ISTAT_PAIRED]+interp_area[ISTAT_GHOST]+interp_area[ISTAT_REPLACED];
     const double unposed=interp_area[ISTAT_NEW]+interp_area[ISTAT_MISMATCH];
@@ -681,7 +796,15 @@ static void InterpCapture(const void *packet,Vertex *v,unsigned count,const unsi
     interp_capture_index=index;interp_capture_indices=indices;
     if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
     interp_probe_what="untracked";interp_probe_pair=0;interp_probe_flags=0;
+    interp_capture_pending=false;
     InterpCaptureDraw(packet,v,count);
+    interp_size_culled=0;
+    if(interpolation_enabled&&!interp_line_mode&&count<=6&&v>=vertex_buf&&v+count<=vertex_buf+MAX_VERTEX_COUNT){
+        const unsigned base=(unsigned)(v-vertex_buf);
+        InterpExposeView view;InterpExposeViewNow(&view);
+        InterpExposePrimitive(0,&view,v,&vertex_depth[base],index,indices,base,(geometry_correction||effect_geometry_correction)&&internal_res>1);
+        if(!interp_capture_pending)InterpExposePrimitive(2,&view,interpolated_vertices+base,&interp_mid_depth[base],index,indices,base,true);
+    }
     if(probe&&!interp_line_mode&&count<=6)InterpProbe(packet,v,interpolated_vertices+(v-vertex_buf),count,interp_probe_what);
 }
 /* A screen position the GTE did not clamp to its limit (a projection). */
@@ -691,6 +814,7 @@ static bool InterpUnclamped(const float *pos) {
 static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
     unsigned offset=(unsigned)(v-vertex_buf);
     memcpy(interpolated_vertices+offset,v,count*sizeof(*v));
+    for(unsigned i=0;i<count&&offset+i<MAX_VERTEX_COUNT;++i)interp_mid_depth[offset+i]=vertex_depth[offset+i];
     for(unsigned i=0;i<count;++i)if(!((geometry_correction||effect_geometry_correction)&&internal_res>1&&(v[i].t&TPAGE_POLYGON)&&v[i].pgxp_pos[2]>0.0f))interpolated_vertices[offset+i].pgxp_pos[2]=-1;
     if(interp_line_mode){
         /* runs of a line: 1 its own pose only, 2 the midpoint only, 3 both */
@@ -812,8 +936,42 @@ static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
         }else if(clamped&&midpoint_only){
             out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048.0f;out->pgxp_pos[2]=-1.0f;
         }
+        if(valid&&depth[i]>0.0f&&p->depth[i]>0.0f)interp_mid_depth[offset+i]=(depth[i]+p->depth[i])*0.5f;
+        else if(extrapolated||(valid&&p->depth[i]>0.0f))interp_mid_depth[offset+i]=p->depth[i];
         if(valid||extrapolated){p->out[i][0]=out->pgxp_pos[0];p->out[i][1]=out->pgxp_pos[1];p->out[i][2]=out->pgxp_pos[2];p->out_mode=1;}
     }
+    if(valid&&!frame_only)for(unsigned i=0;i<count;++i){
+        InterpFieldAdd(0,p->position[i],p->depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);
+        InterpFieldAdd(1,position[i],depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);}
+    /* A new identity, and one whose pose this frame is none (it continues
+     * its last motion): placed as their neighbours are in the midpoint
+     * (InterpFinishPending), from this frame's pose or the last one. */
+    const bool newcomer=p->tagged&&!valid&&!extrapolated&&!camera_fallback&&!frame_only&&!midpoint_only&&
+       !(p->frame&&p->frame+1==interp_frame);
+    if((newcomer||(extrapolated&&!frame_only))&&interp_capture_indices<=6){
+        bool usable=true;unsigned char index[6];
+        for(unsigned i=0;i<count;++i)usable&=InterpUnclamped(newcomer?position[i]:p->position[i]);
+        for(unsigned k=0;k<interp_capture_indices;++k){const unsigned i=(unsigned)interp_capture_index[k]-offset;
+            usable&=i<count;index[k]=(unsigned char)i;}
+        if(usable)interp_capture_pending=newcomer?
+            InterpPend(1,e->pair,offset,count,(const float (*)[3])position,depth,index,interp_capture_indices,InterpOffsetX(),InterpOffsetY()):
+            InterpPend(0,e->pair,offset,count,(const float (*)[3])p->position,p->depth,index,interp_capture_indices,InterpOffsetX(),InterpOffsetY());
+    }
+    /* A triangle the GPU skips for its size in this frame (it passes close
+     * to the view) that the frame before drew: the midpoint still draws
+     * it, rather than show what it covered there. (Triangle t of a polygon
+     * has vertices 3t..3t+2.) */
+    unsigned mid_only_triangles=0;
+    static int size_culled=-1;
+    if(size_culled<0){const char *e=SDL_getenv("PSYZ_INTERP_SIZE_CULLED");size_culled=!(e&&*e=='0');}
+    if(size_culled&&interp_size_culled&&(valid||extrapolated)&&!frame_only&&(count==3||count==6))
+        for(unsigned t=0;t<count/3;++t){
+            if(!(interp_size_culled>>t&1))continue;
+            float x0=1e9f,x1=-1e9f,y0=1e9f,y1=-1e9f;
+            for(unsigned k=0;k<3;++k){const float *q=p->position[3*t+k];
+                x0=SDL_min(x0,q[0]);x1=SDL_max(x1,q[0]);y0=SDL_min(y0,q[1]);y1=SDL_max(y1,q[1]);}
+            if(x1-x0<(float)VRAM_W&&y1-y0<(float)VRAM_H)mid_only_triangles|=1u<<t;
+        }
     if(valid&&!midpoint_only){
         for(unsigned i=0;i<count;++i){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
         p->motion_frame=interp_frame;
@@ -826,6 +984,10 @@ static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
     if(frame_only)for(unsigned i=0;i<count;++i){Vertex *out=interpolated_vertices+offset+i;out->x=out->y=-2048;out->pgxp_pos[0]=out->pgxp_pos[1]=-2048;out->pgxp_pos[2]=-1;}
     if(midpoint_only)for(unsigned i=0;i<count;++i){
         v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
+    for(unsigned t=0;t<2;++t)if(mid_only_triangles>>t&1)
+        for(unsigned k=0;k<3;++k){const unsigned i=3*t+k;
+            index_cur[i]=(unsigned short)(offset+i);
+            v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
 }
 
 /* Optional room-local atlas cache: bounded storage, no native VRAM changes. */
@@ -860,6 +1022,8 @@ static Posi cur_display_size = {-1, -1};
 static Posi draw_offset = {0, 0};
 static Posi draw_area_start = {0, 0};
 static Posi draw_area_end = {0x10000, 0x10000};
+static int InterpOffsetX(void){return draw_offset.x;}
+static int InterpOffsetY(void){return draw_offset.y;}
 /* The on-screen area of a primitive's pose (vertex space), clipped to the
  * drawing area's bounding box by clamping. */
 static float InterpArea(float (*pos)[3],unsigned count) {
@@ -1001,9 +1165,11 @@ static void InterpProbe(const void *packet,const Vertex *v,const Vertex *mid,uns
     const float x=(float)(px+draw_area_start.x-draw_offset.x)+0.5f,y=(float)(py+draw_area_start.y-draw_offset.y)+0.5f;
     const bool own=InterpProbeCovers(v,count,true,x,y),in_mid=InterpProbeCovers(mid,count,true,x,y);
     if(!own&&!in_mid&&!all)return;
-    char line[512];int n=SDL_snprintf(line,sizeof(line),"[probe] f=%u %p id=%llx fl=%u %s%s%s n=%u rgb=%d,%d,%d t=%04x",interp_frame,packet,interp_pairs[interp_probe_pair].id,interp_probe_flags,what,own?" own":"",in_mid?" mid":"",count,v->r,v->g,v->b,(unsigned)v->t);
+    char line[768];int n=SDL_snprintf(line,sizeof(line),"[probe] f=%u %p id=%llx fl=%u %s%s%s n=%u rgb=%d,%d,%d t=%04x",interp_frame,packet,interp_pairs[interp_probe_pair].id,interp_probe_flags,what,own?" own":"",in_mid?" mid":"",count,v->r,v->g,v->b,(unsigned)v->t);
     for(unsigned i=0;i<count&&n<(int)sizeof(line)-40;++i)n+=SDL_snprintf(line+n,sizeof(line)-(size_t)n," (%.1f,%.1f|%.1f,%.1f)",
         v[i].pgxp_pos[2]>0?v[i].pgxp_pos[0]:v[i].x,v[i].pgxp_pos[2]>0?v[i].pgxp_pos[1]:v[i].y,mid[i].pgxp_pos[2]>0?mid[i].pgxp_pos[0]:mid[i].x,mid[i].pgxp_pos[2]>0?mid[i].pgxp_pos[1]:mid[i].y);
+    if(v>=vertex_buf&&v+count<=vertex_buf+MAX_VERTEX_COUNT){n+=SDL_snprintf(line+n,sizeof(line)-(size_t)n," d=");
+        for(unsigned i=0;i<count&&n<(int)sizeof(line)-12;++i)n+=SDL_snprintf(line+n,sizeof(line)-(size_t)n,"%.0f,",vertex_depth[v-vertex_buf+i]);}
     SDL_Log("%s",line);
 }
 static SDL_Rect scissor_rect = {0, 0, VRAM_W, VRAM_H};
@@ -1228,6 +1394,87 @@ static float WidescreenCentre(void) {
     return (float)display_area.x +
            WidescreenPivot(ws_centred ? 0 : WidescreenDrawShift(),
                            WidescreenPictureSqueeze(WidescreenDrawPicture()));
+}
+
+/* Exposure grids (interp_expose): a triangle at cell centres, positions
+ * relative to the frame's buffer, view depths (0 for none: 2D, in front). */
+static void InterpExposeTriangle(unsigned grid,const float *a,const float *b,const float *c,float da,float db,float dc,const int clip[4]) {
+    const float area=(b[0]-a[0])*(c[1]-a[1])-(c[0]-a[0])*(b[1]-a[1]);
+    if(!(SDL_fabsf(area)>=0.25f))return;
+    const float lx=SDL_max(SDL_min(a[0],SDL_min(b[0],c[0])),(float)clip[0]),hx=SDL_min(SDL_max(a[0],SDL_max(b[0],c[0])),(float)clip[2]);
+    const float ly=SDL_max(SDL_min(a[1],SDL_min(b[1],c[1])),(float)clip[1]),hy=SDL_min(SDL_max(a[1],SDL_max(b[1],c[1])),(float)clip[3]);
+    if(!(hx>=lx&&hy>=ly&&hx>=0.0f&&hy>=0.0f&&lx<(float)VRAM_W&&ly<(float)VRAM_H))return;
+    /* the cells whose centre lies in the drawing area */
+    const int x0=SDL_max(0,(int)SDL_ceilf(lx/INTERP_EXPOSE_CELL-0.5f)),x1=SDL_min(INTERP_EXPOSE_W-1,(int)SDL_floorf(hx/INTERP_EXPOSE_CELL-0.5f));
+    const int y0=SDL_max(0,(int)SDL_ceilf(ly/INTERP_EXPOSE_CELL-0.5f)),y1=SDL_min(INTERP_EXPOSE_H-1,(int)SDL_floorf(hy/INTERP_EXPOSE_CELL-0.5f));
+    const bool deep=da>0.0f&&db>0.0f&&dc>0.0f;
+    const float ia=deep?1.0f/da:0,ib=deep?1.0f/db:0,ic=deep?1.0f/dc:0;
+    for(int y=y0;y<=y1;++y)for(int x=x0;x<=x1;++x){
+        const float px=(x+0.5f)*INTERP_EXPOSE_CELL,py=(y+0.5f)*INTERP_EXPOSE_CELL;
+        const float wa=(c[0]-b[0])*(py-b[1])-(px-b[0])*(c[1]-b[1]);
+        const float wb=(a[0]-c[0])*(py-c[1])-(px-c[0])*(a[1]-c[1]);
+        const float wc=area-wa-wb;
+        if(area>0?(wa<0||wb<0||wc<0):(wa>0||wb>0||wc>0))continue;
+        const float depth=deep?area/(wa*ia+wb*ib+wc*ic):0.0f;
+        InterpExposeCell *e=&interp_expose[grid][y][x];
+        if(e->frame!=interp_frame||depth<e->depth){e->frame=interp_frame;e->depth=depth;}
+    }
+}
+static void InterpExposeViewNow(InterpExposeView *view) {
+    const unsigned slot=interp_frame&1;
+    const bool wide=WidescreenDraw();
+    view->ox=(float)draw_offset.x;view->oy=(float)draw_offset.y;
+    view->squeeze=wide?WidescreenPictureSqueeze(WidescreenDrawPicture()):1.0f;
+    view->centre=wide?WidescreenCentre():0.0f;
+    /* the drawing area (inclusive), relative to the frame's buffer */
+    view->clip[0]=draw_area_start.x-interp_expose_rect[slot].x;view->clip[1]=draw_area_start.y-interp_expose_rect[slot].y;
+    view->clip[2]=draw_area_end.x+1-interp_expose_rect[slot].x;view->clip[3]=draw_area_end.y+1-interp_expose_rect[slot].y;
+}
+/* The opaque triangles of a queued primitive (vertices at base, their view
+ * depths at depth) into the frame's grid (0) or the midpoint's (2). */
+static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const unsigned short *index,unsigned indices,unsigned base,bool precise) {
+    const unsigned slot=interp_frame&1;
+    if(interp_expose_rect[slot].frame!=interp_frame||v[0].a!=0xFF||indices<3)return;
+    for(unsigned t=0;t+3<=indices;t+=3){float q[3][2],d[3];bool hidden=false;
+        for(unsigned k=0;k<3;++k){const unsigned i=index[t+k];
+            if(i<base||i>=base+6)return;
+            const Vertex *u=&v[i-base];
+            const bool p=precise&&u->pgxp_pos[2]>0.0f;
+            const float vx=p?u->pgxp_pos[0]:(float)u->x,vy=p?u->pgxp_pos[1]:(float)u->y;
+            hidden|=vx<=-2047.0f&&vy<=-2047.0f;
+            float x=vx+view->ox;
+            if(view->squeeze!=1.0f)x=view->centre+(x-view->centre)*view->squeeze;
+            q[k][0]=x-(float)interp_expose_rect[slot].x;q[k][1]=vy+view->oy-(float)interp_expose_rect[slot].y;
+            d[k]=depth[i-base]>0.0f?depth[i-base]:0.0f;}
+        if(!hidden)InterpExposeTriangle(grid?2u:slot,q[0],q[1],q[2],d[0],d[1],d[2],view->clip);
+    }
+}
+/* The cells of the midpoint of the last frame that show something much
+ * farther (or nothing) where it and the frame before show something, and
+ * whose four neighbours do too: an area at least two cells across, not the
+ * sub-cell shift of an edge between near and far. */
+static unsigned InterpExposed(void) {
+    static unsigned char mask[INTERP_EXPOSE_H][INTERP_EXPOSE_W];
+    const unsigned now=interp_frame&1,before=now^1;
+    interp_exposed_holes=0;
+    if(interp_expose_rect[now].frame!=interp_frame||interp_expose_rect[before].frame+1!=interp_frame||
+       interp_expose_rect[now].w!=interp_expose_rect[before].w||interp_expose_rect[now].h!=interp_expose_rect[before].h)return 0;
+    const int w=SDL_min(INTERP_EXPOSE_W,interp_expose_rect[now].w/INTERP_EXPOSE_CELL),h=SDL_min(INTERP_EXPOSE_H,interp_expose_rect[now].h/INTERP_EXPOSE_CELL);
+    for(int y=0;y<h;++y)for(int x=0;x<w;++x){
+        const InterpExposeCell *a=&interp_expose[before][y][x],*b=&interp_expose[now][y][x],*m=&interp_expose[2][y][x];
+        const float nearest=SDL_max(a->depth,b->depth);
+        mask[y][x]=a->frame+1==interp_frame&&b->frame==interp_frame&&
+            (m->frame!=interp_frame||(nearest>0.0f&&m->depth>nearest*1.5f));
+        interp_exposed_holes+=mask[y][x]&&m->frame!=interp_frame;
+    }
+    static int dump=-1;
+    if(dump<0)dump=SDL_getenv("PSYZ_INTERP_EXPOSE_DUMP")?SDL_atoi(SDL_getenv("PSYZ_INTERP_EXPOSE_DUMP")):0;
+    unsigned exposed=0;
+    for(int y=1;y+1<h;++y)for(int x=1;x+1<w;++x)
+        if(mask[y][x]&&mask[y-1][x]&&mask[y+1][x]&&mask[y][x-1]&&mask[y][x+1]){++exposed;
+            if(dump&&(int)interp_frame==dump){const InterpExposeCell *a=&interp_expose[before][y][x],*b=&interp_expose[now][y][x],*m=&interp_expose[2][y][x];
+                SDL_Log("[expose] %d,%d a=%.0f b=%.0f m=%.0f%s",x*INTERP_EXPOSE_CELL,y*INTERP_EXPOSE_CELL,a->depth,b->depth,m->depth,m->frame!=interp_frame?" none":"");}}
+    return exposed;
 }
 
 /* Game pixels the squeezed buffer holds past each side of the screen,
@@ -4301,6 +4548,7 @@ static void InterpInjectGhosts(unsigned h) {
         if(textured)ClutCacheUpdate(src[0].t,src[0].c);
         Draw_EnsureBufferWillNotOverflow((int)n,(int)ni);
         const unsigned base=n_vertices;
+        InterpPend(0,(unsigned)(g-interp_pairs),base,n,g->position,g->depth,g->store_index,ni,InterpOffsetX(),InterpOffsetY());
         for(unsigned i=0;i<n;++i){
             Vertex *out=&interpolated_vertices[base+i];float pose[2];
             *out=src[i];InterpGhostPose(g,i,0.5f,pose);
@@ -4316,6 +4564,39 @@ static void InterpInjectGhosts(unsigned h) {
         static int probe=-1;
         if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
         if(probe){interp_probe_pair=(unsigned)(g-interp_pairs);interp_probe_flags=0;InterpProbe(NULL,&vertex_buf[base],&interpolated_vertices[base],n,"ghost");}
+    }
+}
+/* Draw_FlushBuffer: the ghosts and new identities queued since the last
+ * flush move as the primitives next to them did (InterpFieldMotion), in the
+ * order queued, so one next to another follows it; vertices with none in
+ * reach move as the primitive's others, a primitive with none keeps its
+ * pose (a ghost its continued motion, a new identity this frame's pose). */
+static void InterpFinishPending(void) {
+    const unsigned pending=interp_pending_len;interp_pending_len=0;
+    static int field=-1;
+    if(field<0){const char *e=SDL_getenv("PSYZ_INTERP_FIELD");field=!(e&&*e=='0');}
+    static int probe=-1;
+    if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
+    for(unsigned k=0;k<pending;++k){
+        const InterpPending *q=&interp_pending[k];
+        const unsigned base=q->base,n=q->count;
+        float motion[6][2],shift[2]={0,0},weight=0;unsigned found=0;
+        for(unsigned i=0;i<n;++i){float d;
+            if(!field||!InterpFieldMotion(q->which,q->from[i],q->depth[i],q->ox,q->oy,motion[i],&d))continue;
+            const float w=1.0f/(1.0f+d);
+            shift[0]+=motion[i][0]*w;shift[1]+=motion[i][1]*w;weight+=w;found|=1u<<i;}
+        for(unsigned i=0;i<n;++i){Vertex *out=&interpolated_vertices[base+i];
+            /* a ghost's vertex with no neighbour keeps its continued
+             * motion; a new identity's moves as its neighbours do */
+            if((found>>i&1)||(found&&q->which==1)){const float *m=(found>>i&1)?motion[i]:(const float[2]){shift[0]/weight,shift[1]/weight};
+                out->pgxp_pos[0]=q->from[i][0]+m[0];out->pgxp_pos[1]=q->from[i][1]+m[1];
+                if(!(out->pgxp_pos[2]>0.0f))out->pgxp_pos[2]=1.0f;}
+            InterpFieldAdd(q->which,q->from[i],q->depth[i],q->ox,q->oy,out->pgxp_pos);
+            interp_mid_depth[base+i]=q->depth[i];}
+        unsigned short index[6];for(unsigned i=0;i<q->indices;++i)index[i]=(unsigned short)(base+q->index[i]);
+        InterpExposePrimitive(2,&q->view,&interpolated_vertices[base],&interp_mid_depth[base],index,q->indices,base,true);
+        if(probe){interp_probe_pair=q->pair;interp_probe_flags=found;
+            InterpProbe(NULL,&vertex_buf[base],&interpolated_vertices[base],n,q->which?"new-final":"ghost-final");}
     }
 }
 static void InterpEnqueued(void) {
@@ -4888,6 +5169,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 tpage |= TPAGE_DITHER;
             }
             /* the GPU skips a triangle spanning 1024+ columns or 512+ rows */
+            interp_size_culled = 0;
             for (int t = 0; t < nIndices / 3; ++t) {
                 static const int corner[2][3] = {{0, 1, 2}, {2, 1, 3}};
                 int x0 = vertex_cur[corner[t][0]].x, x1 = x0;
@@ -4899,9 +5181,11 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     y0 = q->y < y0 ? q->y : y0;
                     y1 = q->y > y1 ? q->y : y1;
                 }
-                if (x1 - x0 >= VRAM_W || y1 - y0 >= VRAM_H)
+                if (x1 - x0 >= VRAM_W || y1 - y0 >= VRAM_H) {
                     index_cur[t * 3] = index_cur[t * 3 + 1] =
                         index_cur[t * 3 + 2] = n_vertices + corner[t][0];
+                    interp_size_culled |= 1u << t;
+                }
             }
             if (!isGouraud || !isShadeTex) {
                 VRGBA(vertex_cur[1]) = VRGBA(vertex_cur[2]) =
@@ -5610,6 +5894,7 @@ void Draw_ResetBuffer(void) {
     }
     n_vertices = 0;
     n_indices = 0;
+    interp_pending_len = 0;
     vertex_cur = vertex_buf;
     index_cur = index_buf;
     batch_has_texture = false;
@@ -5774,6 +6059,7 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
 }
 
 void Draw_FlushBuffer(void) {
+    InterpFinishPending();
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
         return;
