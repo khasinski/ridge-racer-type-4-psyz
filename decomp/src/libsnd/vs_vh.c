@@ -31,6 +31,14 @@ short SsVabOpenHeadWithMode(
     VabHdr* vab_header;
 
     vab_id = NUM_VAB;
+#ifdef __psyz
+    {
+        /* PS1 time of the header parse (DuckStation, a Ridge Racer Type 4
+         * menu bank: 4.5k system clocks). */
+        void Psyz_SpendCycles(unsigned cycles);
+        Psyz_SpendCycles(4514);
+    }
+#endif
 #ifndef __psyz
     // TODO this locks on Psy-Z
     if (_spu_getInTransfer() == 1) {
