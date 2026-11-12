@@ -56,8 +56,18 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 /* The vblank handler's PS1 time besides the kernel's: libetc's VSync
  * handler and callbacks dispatch, the BIOS card driver's turn (2.4k clocks
  * on DuckStation), and libpad's controller exchange once PadStartCom ran
- * (16.1k: its SIO busy waits for a digital pad in port 1, port 2 empty). */
-enum { VBLANK_HANDLER_CYCLES = 2387, LIBPAD_VBLANK_CYCLES = 16084 };
+ * (16.1k: its SIO busy waits for a digital pad in port 1, port 2 empty;
+ * 4.8k more with a pad in port 2). */
+enum {
+    VBLANK_HANDLER_CYCLES = 2387,
+    LIBPAD_VBLANK_CYCLES = 16084,
+    LIBPAD_VBLANK_PORT2_CYCLES = 4790,
+};
+
+static int PadPort2Connected(void) {
+    return ports[1].frame[0] == 0 &&
+           (unsigned char)ports[1].frame[1] != PSYZ_CTRL_DISCONNECTED;
+}
 
 static uint64_t last_blank_us; // emulated time of the latest blank
 
@@ -66,7 +76,10 @@ void Psyz_VSyncBlank(void) {
     Psyz_GpuCrtcBlank();
     Psyz_KernelInterruptCycles(
         VBLANK_HANDLER_CYCLES +
-        (Psyz_PadDriverRunning() ? LIBPAD_VBLANK_CYCLES : 0));
+        (Psyz_PadDriverRunning()
+             ? LIBPAD_VBLANK_CYCLES +
+                   (PadPort2Connected() ? LIBPAD_VBLANK_PORT2_CYCLES : 0)
+             : 0));
     ReadPadsOnVsync();
     Psyz_CardVBlank();
     if (g_PsyzVsyncCb)
