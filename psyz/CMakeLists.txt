@@ -30,6 +30,7 @@ set(PSYZ_SOURCES
     src/psyz/libapi.c
     src/psyz/kernel.c
     src/psyz/libetc.c
+    src/psyz/pad.c
     src/psyz/libgpu.c
     src/psyz/gpudump.c
     ../decomp/src/libcard/card.c
@@ -267,6 +268,9 @@ endif()
 message(STATUS "Using the ${PSYZ_RENDERER} rendering backend")
 
 set(PSYZ_LIBS)
+if(UNIX AND NOT APPLE)
+    list(APPEND PSYZ_LIBS m) # pad.c axis curves
+endif()
 set(PSYZ_INC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(EMSCRIPTEN)
     list(APPEND PSYZ_SOURCES src/platform/plat_unix.c)
@@ -383,6 +387,7 @@ endif()
 
 if(NOT PSP AND NOT EMSCRIPTEN AND PSYZ_RENDERER STREQUAL "sdl3_gpu")
     list(APPEND PSYZ_SOURCES src/platform/sdl3_software.c)
+    include(src/platform/shaders/check_shaders.cmake)
 endif()
 
 if(NOT PSP AND PSYZ_RENDERER STREQUAL "sdl3_gpu")

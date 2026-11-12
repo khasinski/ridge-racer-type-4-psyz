@@ -2980,3 +2980,4 @@ unsigned char psx_frag_spv[] = {
 };
 unsigned int psx_frag_spv_len = 35720;
 #define psx_frag_spv_revision 1
+#define psx_frag_spv_source_sha256 "7abcf8283d3cae5a58fb144f4195c3cb160c6bddfdb53b0e6e17d023149c4de8"

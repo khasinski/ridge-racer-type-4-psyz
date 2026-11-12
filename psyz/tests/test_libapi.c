@@ -354,3 +354,203 @@ ZTEST(card_utf8, save_list_reload_and_erase) {
     zexpect_s32_eq(-1, open(name, FREAD));
 }
 #endif
+
+#ifndef __psx__
+#include <libetc.h>
+#include <psyz/input.h>
+
+// libpad's side of the actuators (src/internal.h)
+void Psyz_PadsSetActuators(int port, const unsigned char* data, int len);
+void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align);
+void Psyz_PadsExchange(int port, const char* published);
+
+// Emulated controller frames (pad.c) and libpad's view of them (libetc.c).
+static const PsyzAxisResponse identity_response = {0.0f, 1.0f, 0.0f, 1.0f, 0xFF};
+
+ZTEST_SETUP(pad_frames) {
+    for (int a = 0; a < PSYZ_PAD_AXIS_COUNT; a++) {
+        Psyz_PadsSetAxisResponse((PsyzPadAxis)a, &identity_response);
+    }
+}
+
+ZTEST_TEARDOWN(pad_frames) {
+    Psyz_PadsSetKind(0, 0, PSYZ_CTRL_DIGITAL_PAD);
+    Psyz_PadsSetKind(1, 0, PSYZ_CTRL_DIGITAL_PAD);
+}
+
+static PsyzPadInput centred_input(void) {
+    PsyzPadInput in;
+    memset(&in, 0, sizeof(in));
+    in.right_x = in.right_y = in.left_x = in.left_y = 0x80;
+    return in;
+}
+
+ZTEST(pad_frames, digital_and_dualshock) {
+    char f[PSYZ_PAD_BUF_LEN];
+    PsyzPadInput in = centred_input();
+    in.buttons = PADRdown | PADLleft | PADstart;
+    in.left_x = 0x10;
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_DIGITAL_PAD, &in, f));
+    zexpect_u8_eq(0x00, f[0]);
+    zexpect_u8_eq(0x41, f[1]);
+    zexpect_u8_eq(0x77, f[2]); // Start (bit 3), Left (bit 7)
+    zexpect_u8_eq(0xBF, f[3]); // Cross (bit 6)
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_ANALOG_PAD, &in, f));
+    zexpect_u8_eq(0x73, f[1]);
+    zexpect_u8_eq(0x80, f[4]);
+    zexpect_u8_eq(0x80, f[5]);
+    zexpect_u8_eq(0x10, f[6]);
+    zexpect_u8_eq(0x80, f[7]);
+    // digital mode (PadSetMainMode 0) sends the digital pad's frame
+    Psyz_PadsSetDigitalMode(0, 1);
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_ANALOG_PAD, &in, f));
+    zexpect_u8_eq(0x41, f[1]);
+    // a different kind starts in its own default mode again
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f));
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_ANALOG_PAD, &in, f));
+    zexpect_u8_eq(0x73, f[1]);
+    zexpect_s32_eq(0, Psyz_PadsDigitalMode(0));
+}
+
+ZTEST(pad_frames, negcon) {
+    char f[PSYZ_PAD_BUF_LEN];
+    PsyzPadInput in = centred_input();
+    zassert_s32_eq(0, Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f));
+    zexpect_u8_eq(0x23, f[1]);
+    zexpect_u8_eq(0xFF, f[2]);
+    zexpect_u8_eq(0xFF, f[3]);
+    zexpect_u8_eq(0x80, f[4]); // twist centre
+    zexpect_u8_eq(0x00, f[5]);
+    zexpect_u8_eq(0x00, f[6]);
+    zexpect_u8_eq(0x00, f[7]);
+    // DuckStation's units: twist -1..1 -> 0x00..0xFF, pedals 0..1 -> 0..0xFF
+    in.steering = 0.5f;
+    in.pedal[0] = 1.0f;
+    in.pedal[1] = 0.5f;
+    in.buttons = PADRright | PADRup | PADR1 | PADselect | PADL2;
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    zexpect_u8_eq(0xC0, f[4]);
+    zexpect_u8_eq(0xFF, f[5]);
+    zexpect_u8_eq(0x80, f[6]);
+    zexpect_u8_eq(0xFF, f[2]); // no Select
+    zexpect_u8_eq(0xC7, f[3]); // A (Circle's bit), B (Triangle's), R; no L2
+    in.steering = -1.0f;
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    zexpect_u8_eq(0x00, f[4]);
+    // digital stand-ins: Right steers fully, Cross / Square / L1 press
+    // I / II / L fully, and none of them is sent as a button
+    in = centred_input();
+    in.buttons = PADLright | PADRdown | PADRleft | PADL1;
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    zexpect_u8_eq(0xFF, f[4]);
+    zexpect_u8_eq(0xFF, f[5]);
+    zexpect_u8_eq(0xFF, f[6]);
+    zexpect_u8_eq(0xFF, f[7]);
+    zexpect_u8_eq(0xDF, f[2]); // Right
+    zexpect_u8_eq(0xFF, f[3]);
+}
+
+ZTEST(pad_frames, axis_response) {
+    char f[PSYZ_PAD_BUF_LEN];
+    PsyzPadInput in = centred_input();
+    PsyzAxisResponse r = {0.5f, 1.0f, 0.0f, 1.0f, 0x6A};
+    zassert_s32_eq(0, Psyz_PadsSetAxisResponse(PSYZ_PAD_AXIS_I, &r));
+    in.pedal[0] = 0.75f; // halfway past the dead zone
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    zexpect_u8_eq(0x35, f[5]);
+    in.pedal[0] = 0.25f;
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    zexpect_u8_eq(0x00, f[5]);
+    // e^linearity: linearity ln(2) squares the travelled fraction
+    r = (PsyzAxisResponse){0.0f, 1.0f, 0.693147f, 1.0f, 0};
+    zexpect_s32_eq(25, (int)(Psyz_AxisCurve(0.5f, &r) * 100.0f + 0.5f));
+    r = (PsyzAxisResponse){0.0f, 0.5f, 0.0f, 1.0f, 0};
+    zexpect_s32_eq(100, (int)(Psyz_AxisCurve(0.6f, &r) * 100.0f + 0.5f));
+    r = (PsyzAxisResponse){0.0f, 1.0f, 0.0f, 0.5f, 0};
+    zexpect_s32_eq(50, (int)(Psyz_AxisCurve(1.0f, &r) * 100.0f + 0.5f));
+    zexpect_s32_eq(-1, Psyz_PadsSetAxisResponse(PSYZ_PAD_AXIS_COUNT, &r));
+}
+
+ZTEST(pad_frames, jogcon) {
+    char f[PSYZ_PAD_BUF_LEN];
+    unsigned char motor[1] = {0x1A}; // turn right at strength 10
+    unsigned char align[6] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    unsigned low, high;
+    PsyzPadInput in = centred_input();
+    Psyz_PadsBuildFrame(1, PSYZ_CTRL_JOGCON, &in, f);
+    zexpect_u8_eq(0xE3, f[1]);
+    zexpect_u8_eq(0x00, f[4]);
+    zexpect_u8_eq(0x00, f[6]);
+    Psyz_PadsExchange(1, f);
+    in.steering = 1.0f;
+    Psyz_PadsBuildFrame(1, PSYZ_CTRL_JOGCON, &in, f);
+    zexpect_u8_eq(0x7F, f[4]);
+    zexpect_u8_eq(0x00, f[5]);
+    zexpect_u8_eq(0x01, f[6]); // turned forward since the last frame
+    Psyz_PadsSetActuators(1, motor, 1);
+    Psyz_PadsSetActuatorAlign(1, align);
+    Psyz_PadsExchange(1, f);
+    Psyz_PadsGetRumble(1, &low, &high);
+    zexpect_u32_eq(0xAAAA, low);
+    zexpect_u32_eq(0xAAAA, high);
+    in.steering = -1.0f;
+    Psyz_PadsBuildFrame(1, PSYZ_CTRL_JOGCON, &in, f);
+    zexpect_u8_eq(0x80, f[4]); // -128
+    zexpect_u8_eq(0xFF, f[5]);
+    zexpect_u8_eq(0x02, f[6]); // the command shows one exchange later
+    Psyz_PadsExchange(1, f);
+    Psyz_PadsBuildFrame(1, PSYZ_CTRL_JOGCON, &in, f);
+    zexpect_u8_eq(0x10, f[6]);
+    Psyz_PadsSetActuators(1, NULL, 0);
+    Psyz_PadsSetActuatorAlign(1, NULL);
+}
+
+ZTEST(pad_frames, libpad_tables) {
+    char f[PSYZ_PAD_BUF_LEN];
+    // libpad keeps refreshing these at every VSync of the later tests
+    static unsigned char buf[2][PSYZ_PAD_BUF_LEN];
+    PsyzPadInput in = centred_input();
+    PadInitDirect(buf[0], buf[1]);
+    // DUAL SHOCK: stable, modes {4, 7}, the current one also its extended ID
+    Psyz_PadsSetKind(0, 0, PSYZ_CTRL_ANALOG_PAD);
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_ANALOG_PAD, &in, f);
+    Psyz_PadsSet(0, f, sizeof(f));
+    zexpect_s32_eq(6, PadGetState(0x00));
+    zexpect_s32_eq(7, PadInfoMode(0x00, 1, 0));
+    zexpect_s32_eq(7, PadInfoMode(0x00, 2, 0));
+    zexpect_s32_eq(1, PadInfoMode(0x00, 3, 0));
+    zexpect_s32_eq(2, PadInfoMode(0x00, 4, -1));
+    zexpect_s32_eq(4, PadInfoMode(0x00, 4, 0));
+    zexpect_s32_eq(2, PadInfoAct(0x00, -1, 0));
+    zexpect_s32_eq(2, PadInfoAct(0x00, 0, 2));
+    zexpect_s32_eq(20, PadInfoAct(0x00, 1, 4));
+    zexpect_s32_eq(1, PadSetMainMode(0x00, 0, 0));
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_ANALOG_PAD, &in, f);
+    Psyz_PadsSet(0, f, sizeof(f));
+    zexpect_u8_eq(0x41, f[1]);
+    zexpect_s32_eq(6, PadGetState(0x00));
+    zexpect_s32_eq(4, PadInfoMode(0x00, 1, 0));
+    zexpect_s32_eq(4, PadInfoMode(0x00, 2, 0));
+    zexpect_s32_eq(0, PadInfoMode(0x00, 3, 0));
+    // JogCon: modes {4, 0x300}, one motor
+    Psyz_PadsSetKind(0, 0, PSYZ_CTRL_JOGCON);
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_JOGCON, &in, f);
+    Psyz_PadsSet(0, f, sizeof(f));
+    zexpect_s32_eq(6, PadGetState(0x00));
+    zexpect_s32_eq(0xE, PadInfoMode(0x00, 1, 0));
+    zexpect_s32_eq(0x300, PadInfoMode(0x00, 2, 0));
+    zexpect_s32_eq(1, PadInfoAct(0x00, -1, 0));
+    // neGcon: no extended protocol
+    Psyz_PadsSetKind(0, 0, PSYZ_CTRL_NEGCON);
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_NEGCON, &in, f);
+    Psyz_PadsSet(0, f, sizeof(f));
+    zexpect_s32_eq(2, PadGetState(0x00));
+    zexpect_s32_eq(2, PadInfoMode(0x00, 1, 0));
+    zexpect_s32_eq(0, PadInfoMode(0x00, 2, 0));
+    zexpect_s32_eq(0, PadSetMainMode(0x00, 1, 0));
+    // disconnected
+    Psyz_PadsBuildFrame(0, PSYZ_CTRL_DISCONNECTED, &in, f);
+    Psyz_PadsSet(0, f, sizeof(f));
+    zexpect_s32_eq(0, PadGetState(0x00));
+}
+#endif

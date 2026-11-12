@@ -824,3 +824,4 @@ unsigned char psx_vert_spv[] = {
 };
 unsigned int psx_vert_spv_len = 9852;
 #define psx_vert_spv_revision 1
+#define psx_vert_spv_source_sha256 "292973bc1acaff69825fa9c6b20a70070927db736d62f1a589cb9ebbcd9e3c3c"

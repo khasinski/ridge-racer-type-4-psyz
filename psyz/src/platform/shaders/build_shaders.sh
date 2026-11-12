@@ -2,8 +2,12 @@
 
 # Compiles the SDL_GPU shaders to SPIR-V (Vulkan), MSL (Metal) and DXIL (D3D12)
 # Requirements: glslangValidator, xxd, spirv-cross, dxc or SDL shadercross.
-# SKIP_DXIL=1 regenerates only SPIR-V and MSL; the DXIL headers then keep
-# their older PSYZ_SHADER_REVISION and D3D12 keeps the older behaviour.
+# SKIP_DXIL=1 regenerates only SPIR-V and MSL (the Windows SDK dxc is needed
+# for DXIL: the psyz-shaders workflow of Ridge Racer Type 4 PC runs this on a
+# Windows runner). Every header records the SHA-256 of the GLSL it was built
+# from (CR stripped); check_shaders.cmake fails the build of a platform
+# whose headers no longer match their GLSL, so SKIP_DXIL leaves the Windows
+# build broken until the DXIL headers are rebuilt.
 
 # DXIL/Windows requires signing. The best way to pre-compile the shader is
 # C:\Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/dxc.exe
@@ -24,6 +28,14 @@ if [ -z "${SKIP_DXIL:-}" ] &&
     exit 1
 fi
 
+sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        tr -d '\r' < "$1" | sha256sum | cut -d' ' -f1
+    else
+        tr -d '\r' < "$1" | shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
 emit_header() {
     src=$1        # intermediate file, e.g. psx.vert.spv
     name=$2       # canonical base, e.g. psx_vert
@@ -37,6 +49,8 @@ emit_header() {
         if [ -n "$revision" ]; then
             echo "#define ${name}_${suffix}_revision $revision"
         fi
+        # the source it was built from (check_shaders.cmake)
+        echo "#define ${name}_${suffix}_source_sha256 \"$source_sha256\""
     } > "${name}_${suffix}.h"
 }
 
@@ -67,6 +81,7 @@ for shader in "$@"; do
     name=$(echo "$shader" | tr . _)
     stage=${shader##*.}
     revision=$(sed -n 's,^// PSYZ_SHADER_REVISION ,,p' "$shader.glsl")
+    source_sha256=$(sha256 "$shader.glsl")
     glslangValidator -V --target-env vulkan1.0 -S "$stage" \
         "$shader.glsl" -o "$shader.spv"
     emit_header "$shader.spv" "$name" spv

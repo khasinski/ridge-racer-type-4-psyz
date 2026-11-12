@@ -46,3 +46,4 @@ unsigned char clear_vert_msl[] = {
   0x72, 0x6e, 0x20, 0x6f, 0x75, 0x74, 0x3b, 0x0a, 0x7d, 0x0a, 0x0a
 };
 unsigned int clear_vert_msl_len = 527;
+#define clear_vert_msl_source_sha256 "06801fe6d6e5e26442379cf4a80da68fcb1975f8d001fb05606ff3069b457517"

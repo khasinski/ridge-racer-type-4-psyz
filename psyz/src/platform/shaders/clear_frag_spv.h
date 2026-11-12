@@ -34,3 +34,4 @@ unsigned char clear_frag_spv[] = {
   0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00
 };
 unsigned int clear_frag_spv_len = 380;
+#define clear_frag_spv_source_sha256 "dfc5ea1249133ecc1971168715b1c704be07929fb852ce066f4e5566dd237ea1"

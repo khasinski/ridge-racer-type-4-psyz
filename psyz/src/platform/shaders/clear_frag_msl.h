@@ -29,3 +29,4 @@ unsigned char clear_frag_msl[] = {
   0x75, 0x72, 0x6e, 0x20, 0x6f, 0x75, 0x74, 0x3b, 0x0a, 0x7d, 0x0a, 0x0a
 };
 unsigned int clear_frag_msl_len = 324;
+#define clear_frag_msl_source_sha256 "dfc5ea1249133ecc1971168715b1c704be07929fb852ce066f4e5566dd237ea1"

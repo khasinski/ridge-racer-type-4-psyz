@@ -275,3 +275,4 @@ unsigned char clear_vert_dxil[] = {
   0x03, 0x31, 0xc8, 0x1c, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 unsigned int clear_vert_dxil_len = 3276;
+#define clear_vert_dxil_source_sha256 "06801fe6d6e5e26442379cf4a80da68fcb1975f8d001fb05606ff3069b457517"

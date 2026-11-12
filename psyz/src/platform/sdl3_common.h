@@ -1168,67 +1168,95 @@ static bool PortHasHostInput(int port) {
     return false;
 }
 
+/* Host rumble: off by default (Psyz_SetRumble_SDL3); a request lasts a
+ * little longer than a field and is repeated while the motors run. */
+static unsigned rumble_gain;
+static unsigned rumble_sent[2][2];
+static Uint64 rumble_at[2];
+void Psyz_SetRumble_SDL3(unsigned gain_percent) {
+    rumble_gain = gain_percent > 100 ? 100 : gain_percent;
+}
+static void UpdateRumble(int port) {
+    unsigned low = 0, high = 0;
+    Uint64 now = SDL_GetTicks();
+    SDL_Gamepad* d = port < LEN(gamepads) ? gamepads[port].dev : NULL;
+    if (!d) {
+        return;
+    }
+    if (rumble_gain) {
+        Psyz_PadsGetRumble(port, &low, &high);
+        low = low * rumble_gain / 100;
+        high = high * rumble_gain / 100;
+    }
+    if (low == rumble_sent[port][0] && high == rumble_sent[port][1] &&
+        (!(low | high) || now - rumble_at[port] < 100)) {
+        return;
+    }
+    SDL_RumbleGamepad(d, (Uint16)low, (Uint16)high, 200);
+    rumble_sent[port][0] = low;
+    rumble_sent[port][1] = high;
+    rumble_at[port] = now;
+}
+
+static float AxisToUnit(short v) { return v < 0 ? v / 32768.0f : v / 32767.0f; }
+
 static void BuildPadFrame(int port, PsyzControllerKind kind, char* buf) {
+    PsyzPadInput in = {0};
     memset(buf, 0, PSYZ_PAD_BUF_LEN);
     // No physical input for this port -> report as disconnected regardless of
     // the requested kind. Games look at buf[0]=0xFF / buf[1]=0xFF to know.
     if (kind != PSYZ_CTRL_DISCONNECTED && !PortHasHostInput(port)) {
         kind = PSYZ_CTRL_DISCONNECTED;
     }
-    buf[0] = 0x00;
-    buf[1] = (char)kind;
-
+    in.right_x = in.right_y = in.left_x = in.left_y = 0x80;
     switch (kind) {
     case PSYZ_CTRL_DIGITAL_PAD:
     case PSYZ_CTRL_ANALOG_PAD:
-    case PSYZ_CTRL_ANALOG_STICK: {
-        unsigned int pressed = SinglePadRead(port);
-        if (kind == PSYZ_CTRL_ANALOG_STICK) {
-            // The analog stick (SCPH-1110) has no L3/R3; on real hardware
-            // those bits always read as released.
-            pressed &= ~(PADi | PADj);
-        }
-        buf[2] = (char)(~(pressed >> 8) & 0xFF);
-        buf[3] = (char)(~pressed & 0xFF);
-
-        if (kind == PSYZ_CTRL_DIGITAL_PAD) {
-            break;
-        }
-        unsigned char rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
+    case PSYZ_CTRL_ANALOG_STICK:
+    case PSYZ_CTRL_NEGCON:
+    case PSYZ_CTRL_JOGCON:
+        in.buttons = SinglePadRead(port);
         if (gamepads[port].dev) {
             SDL_Gamepad* d = gamepads[port].dev;
 #ifdef PE_PS5_PLUGINS
             extern int pe_ps5_mods_capture_pad(SDL_Gamepad *);
             if (!pe_ps5_mods_capture_pad(d)) {
 #endif
-            rx = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTX));
-            ry = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTY));
-            lx = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTX));
-            ly = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTY));
+            short lx = SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTX);
+            in.right_x = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTX));
+            in.right_y = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTY));
+            in.left_x = AxisToByte(lx);
+            in.left_y = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTY));
+            // neGcon / JogCon: left stick X twists, the right trigger
+            // presses I, the left one II (L follows L1's binding)
+            in.steering = AxisToUnit(lx);
+            in.pedal[0] = AxisToUnit(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+            in.pedal[1] = AxisToUnit(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
 #ifdef PE_PS5_PLUGINS
             }
 #endif
         }
-        buf[4] = (char)rx;
-        buf[5] = (char)ry;
-        buf[6] = (char)lx;
-        buf[7] = (char)ly;
+        Psyz_PadsBuildFrame(port, kind, &in, buf);
+        UpdateRumble(port);
         break;
-    }
     case PSYZ_CTRL_MOUSE:
         // TODO: read SDL mouse state into buf[3] buttons and buf[4..5] motion
+        buf[1] = (char)kind;
         buf[2] = (char)0xFF;
         buf[3] = (char)0xFC;
         buf[4] = 0x00;
         buf[5] = 0x00;
         break;
     case PSYZ_CTRL_KEYBOARD:
+        buf[1] = (char)kind;
         LOG_ONCE("keyboard controller kind not implemented");
         break;
     case PSYZ_CTRL_DISCONNECTED:
-        memset(buf, 0xFF, PSYZ_PAD_BUF_LEN);
+        Psyz_PadsBuildFrame(port, kind, &in, buf);
+        UpdateRumble(port);
         break;
     default:
+        buf[1] = (char)kind;
         WARNF("unknown controller kind 0x%02X", (unsigned)kind);
         break;
     }

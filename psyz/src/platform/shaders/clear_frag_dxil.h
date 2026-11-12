@@ -237,3 +237,4 @@ unsigned char clear_frag_dxil[] = {
   0x01, 0x62, 0x1d, 0x14, 0x55, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 unsigned int clear_frag_dxil_len = 2820;
+#define clear_frag_dxil_source_sha256 "dfc5ea1249133ecc1971168715b1c704be07929fb852ce066f4e5566dd237ea1"

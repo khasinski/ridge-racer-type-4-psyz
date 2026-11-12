@@ -1389,3 +1389,4 @@ unsigned char psx_frag_dxil[] = {
 };
 unsigned int psx_frag_dxil_len = 16624;
 #define psx_frag_dxil_revision 1
+#define psx_frag_dxil_source_sha256 "7abcf8283d3cae5a58fb144f4195c3cb160c6bddfdb53b0e6e17d023149c4de8"

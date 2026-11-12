@@ -31,6 +31,9 @@ int Psyz_SetKeyboardBinding_SDL3(unsigned button, SDL_Scancode key);
 /* SDL gamepad button, or SDL_GAMEPAD_BUTTON_COUNT + 0/1 for L/R trigger. */
 int Psyz_GetGamepadBinding_SDL3(unsigned button);
 int Psyz_SetGamepadBinding_SDL3(unsigned button, int binding);
+/* Gamepad rumble for the emulated controller's motors (Psyz_PadsGetRumble),
+ * 0 (the default, off) .. 100 percent. */
+void Psyz_SetRumble_SDL3(unsigned gain_percent);
 
 #ifdef __cplusplus
 }

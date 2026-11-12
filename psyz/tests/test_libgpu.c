@@ -4041,7 +4041,7 @@ ZTEST(gpu, sdl_gpu_rasterizer_matches_cpu_rasterizer_at_every_scale) {
         RasterStream(seed, cpu);
         Psyz_VideoSetNativeRasterizer(0);
         VSync(0);
-        for (unsigned scale = 1; scale <= 3; scale++) {
+        for (unsigned scale = 1; scale <= 4; scale++) {
             zassert_s32_eq(0, Psyz_VideoSetInternalResolution(scale));
             VSync(0);
             RasterStream(seed, gpu);

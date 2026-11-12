@@ -111,3 +111,4 @@ unsigned char clear_vert_spv[] = {
   0xfd, 0x00, 0x01, 0x00, 0x38, 0x00, 0x01, 0x00
 };
 unsigned int clear_vert_spv_len = 1304;
+#define clear_vert_spv_source_sha256 "06801fe6d6e5e26442379cf4a80da68fcb1975f8d001fb05606ff3069b457517"

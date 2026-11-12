@@ -106,6 +106,11 @@ void Psyz_KernelInterruptCycles(unsigned cycles);
 unsigned Psyz_KernelTakeInterruptCycles(void);
 // libpad's controller driver runs at each vblank (PadStartCom, libetc.c).
 int Psyz_PadDriverRunning(void);
+// libpad's actuator data (PadSetAct / PadSetActAlign) and the exchange at
+// each blank, before the frames are refreshed (pad.c).
+void Psyz_PadsSetActuators(int port, const unsigned char* data, int len);
+void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align);
+void Psyz_PadsExchange(int port, const char* published);
 
 // The BIOS memory card driver's work at a vblank (libcard.c).
 void Psyz_CardVBlank(void);
