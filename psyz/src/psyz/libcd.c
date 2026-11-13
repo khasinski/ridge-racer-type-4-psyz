@@ -494,8 +494,14 @@ static void* drive_bell(void) {
     return bell;
 }
 
-// Blocks until emulated time `until_us`, as a PS1 waiting on the drive.
-static void drive_wait_until(uint64_t until_us) {
+/* Blocks until emulated time `until_us`, as a PS1 waiting on the drive.
+ * The interrupt handlers' time owed so far stays owed, as on DuckStation for
+ * the waits CD_cw makes (the attract demo start keeps it). In a LIBCD
+ * polling loop (`poll`: CdSync(0), CdReady(0)) the handlers that come
+ * meanwhile run within the wait instead, and so does the time owed by the
+ * work before it unless that outlasts the wait: on DuckStation the pause
+ * that ends a movie (CdControlB) returns as the drive finishes it. */
+static void drive_wait_until_mode(uint64_t until_us, int poll) {
     if (drive_is_instant()) {
         return;
     }
@@ -504,7 +510,17 @@ static void drive_wait_until(uint64_t until_us) {
         return;
     }
     if (Psyz_KernelOfflineClock()) {
+        if (poll) {
+            uint64_t owed_us = (uint64_t)Psyz_KernelTakeInterruptCycles() *
+                               1000000u / 33868800u;
+            if (until_us - now < owed_us) {
+                until_us = now + owed_us;
+            }
+        }
         Psyz_AudioWaitUs(until_us - now);
+        if (poll) {
+            Psyz_KernelTakeInterruptCycles();
+        }
         return;
     }
     for (;;) {
@@ -519,6 +535,14 @@ static void drive_wait_until(uint64_t until_us) {
             Psyz_OsBellWait(drive_bell(), (uint32_t)(left - 1000));
         }
     }
+}
+
+static void drive_wait_until(uint64_t until_us) {
+    drive_wait_until_mode(until_us, 0);
+}
+
+static void drive_poll_until(uint64_t until_us) {
+    drive_wait_until_mode(until_us, 1);
 }
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
@@ -1432,7 +1456,7 @@ int CD_initvol(void) {
  * CdlNoIntr until it completes; mode 0 waits for it. */
 int CD_sync(int mode, u_char* result) {
     if (mode == 0) {
-        drive_wait_until(drive.done_us);
+        drive_poll_until(drive.done_us);
         Psyz_CdServiceDrive();
     } else {
         Psyz_CdPollQuery();
@@ -1475,7 +1499,7 @@ int CD_ready(int mode, u_char* result) {
         uint64_t at = drive_start_us +
                       (drive_delivered + 1) * 1000000 / drive_rate();
         if (mode == 0) {
-            drive_wait_until(at);
+            drive_poll_until(at);
         } else {
             Psyz_CdPollQuery();
             if (!drive_is_instant() && drive_now() < at)
