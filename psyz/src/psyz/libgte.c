@@ -1828,7 +1828,9 @@ typedef struct {
     float x, y, w;
 } PgxpSxyEntry;
 
-#define PGXP_ADDR_SETS 8192u
+/* 262144 entries: a race frame stores about 40000 precise vertices, and
+ * the queue words (Psyz_GteCopyQueuedPgxpSxy) keep theirs until reused. */
+#define PGXP_ADDR_SETS 32768u
 #define PGXP_ADDR_WAYS 8u
 #define PGXP_SXY_SETS 4096u
 #define PGXP_SXY_WAYS 2u
@@ -1862,8 +1864,14 @@ static PgxpSxyEntry pgxp_fifo[3];
 static PgxpAddrEntry pgxp_addr_cache[PGXP_ADDR_SETS][PGXP_ADDR_WAYS];
 static PgxpSxyEntry pgxp_sxy_cache[PGXP_SXY_SETS][PGXP_SXY_WAYS];
 
+/* Sets by the offset from this cache, not the absolute address: the game's
+ * packets and vertex caches are static data, which ASLR moves with the
+ * cache. By the absolute address, which entries share a set, and so which
+ * precise vertex a full set loses (a vertex then drawn at whole pixels, a
+ * hairline crack), changed from run to run. */
+static unsigned int pgxp_evicted_warned;
 static inline unsigned int PgxpHashAddr(const void* ptr) {
-    uintptr_t v = (uintptr_t)ptr;
+    uintptr_t v = (uintptr_t)ptr - (uintptr_t)pgxp_addr_cache;
     return (unsigned int)(((v >> 2) ^ (v >> 14) ^ (v >> 24)) &
                           (PGXP_ADDR_SETS - 1u));
 }
@@ -1922,6 +1930,13 @@ static inline void PgxpStoreAddr(const void* dst, PgxpSxyEntry entry) {
             replace == PGXP_ADDR_WAYS - 1u) {
             replace = w;
         }
+    }
+    if (set[replace].addr && set[replace].addr != addr &&
+        (set[replace].gen == pgxp_frame_gen || set[replace].queued) &&
+        !pgxp_evicted_warned) {
+        pgxp_evicted_warned = 1;
+        WARNF("PGXP address cache set full: a precise vertex of this frame "
+              "was dropped");
     }
     for (unsigned int w = replace; w > 0; --w) {
         set[w] = set[w - 1u];

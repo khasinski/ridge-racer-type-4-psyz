@@ -3164,6 +3164,9 @@ int Psyz_VideoSetWidescreen(int enabled) {
         return -1;
     if ((enabled != 0) != widescreen) {
         Draw_FlushBuffer();
+        /* the flush may have started the renderer, as the fallback */
+        if (fallback_presenter && enabled)
+            return -1;
         widescreen = enabled != 0;
         ws_picture[0].y = ws_picture[1].y = -1;
         ws_centred = false;

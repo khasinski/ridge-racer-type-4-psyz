@@ -329,6 +329,9 @@ int Psyz_GpuSetFrameInterpolation(int enabled) {
     static int logged_requested = -1, logged_effective = -1;
     if (interpolation_enabled != (enabled != 0)) {
         Draw_FlushBuffer();
+        /* the flush may have started the renderer, as the fallback */
+        if (fallback_presenter)
+            enabled = 0;
         InterpMidpointSync(INTERP_SYNC_SETTINGS);
         interpolation_enabled = enabled != 0;
         Psyz_GpuResetInterpolation();
