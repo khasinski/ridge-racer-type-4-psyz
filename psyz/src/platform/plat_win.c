@@ -267,9 +267,39 @@ long my_erase(char* path) {
     return SDL_RemovePath(adjPath);
 }
 
+// A card is a host directory: formatting removes its files, as plat_unix.c.
 long my_format(char* fs) {
-    NOT_IMPLEMENTED;
-    return 0;
+    char path[8192];
+    SDL_PathInfo info;
+    char** names;
+    int count = 0;
+    long ok = 1;
+
+    Psyz_AdjustPath(path, fs, sizeof(path));
+    DEBUGF("format('%s')", fs);
+    if (!SDL_GetPathInfo(path, &info) || info.type != SDL_PATHTYPE_DIRECTORY) {
+        ERRORF("failed to open directory '%s'", path);
+        return 0;
+    }
+    names = SDL_GlobDirectory(path, NULL, 0, &count);
+    if (!names) {
+        ERRORF("failed to list directory '%s'", path);
+        return 0;
+    }
+    for (int i = 0; i < count && ok; i++) {
+        char file[8192];
+        strncpy_s(file, sizeof(file), path, _TRUNCATE);
+        if (!Psyz_JoinPath(file, names[i], sizeof(file))) {
+            ok = 0;
+            break;
+        }
+        if (SDL_GetPathInfo(file, &info) && info.type == SDL_PATHTYPE_FILE &&
+            !SDL_RemovePath(file)) {
+            ok = 0;
+        }
+    }
+    SDL_free(names);
+    return ok;
 }
 
 int psyz_open(const char* devname, int flag, ...) {
