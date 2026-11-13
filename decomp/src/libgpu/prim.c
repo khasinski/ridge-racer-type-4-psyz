@@ -3,8 +3,9 @@
 #include <libgpu.h>
 
 #ifdef __psyz
-/* The PS1 time of a call (DuckStation, system clocks): AddPrim 38,
- * SetSemiTrans 13, SetSprt 5; the other setters are the same few stores. */
+/* The PS1 time of a call: PRIM_ADD_CYCLES (AddPrim), PRIM_SET_ATTR_CYCLES
+ * (SetSemiTrans, SetShadeTex), PRIM_SETTER_CYCLES (the other setters). */
+#include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 #define PRIM_TIME(cycles) Psyz_SpendCycles(cycles)
 #else
@@ -31,105 +32,105 @@ void DumpClut(u_short clut) {
 void* NextPrim(void* p) { return nextPrim(p); }
 int IsEndPrim(void* p) { return isendprim(p); }
 void AddPrim(void* ot, void* p) {
-    PRIM_TIME(38);
+    PRIM_TIME(PRIM_ADD_CYCLES);
     addPrim(ot, p);
 }
 void AddPrims(void* ot, void* p0, void* p1) {
-    PRIM_TIME(38);
+    PRIM_TIME(PRIM_ADD_CYCLES);
     addPrims(ot, p0, p1);
 }
 void CatPrim(void* p0, void* p1) { catPrim(p0, p1); }
 void TermPrim(void* p) { termPrim(p); }
 void SetSemiTrans(void* p, int abe) {
-    PRIM_TIME(13);
+    PRIM_TIME(PRIM_SET_ATTR_CYCLES);
     setSemiTrans(p, abe);
 }
 void SetShadeTex(void* p, int tge) {
-    PRIM_TIME(13);
+    PRIM_TIME(PRIM_SET_ATTR_CYCLES);
     setShadeTex(p, tge);
 }
 void SetPolyF3(POLY_F3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyF3(p);
 }
 void SetPolyFT3(POLY_FT3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyFT3(p);
 }
 void SetPolyG3(POLY_G3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyG3(p);
 }
 void SetPolyGT3(POLY_GT3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyGT3(p);
 }
 void SetPolyF4(POLY_F4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyF4(p);
 }
 void SetPolyFT4(POLY_FT4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyFT4(p);
 }
 void SetPolyG4(POLY_G4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyG4(p);
 }
 void SetPolyGT4(POLY_GT4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setPolyGT4(p);
 }
 void SetSprt8(SPRT_8* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setSprt8(p);
 }
 void SetSprt16(SPRT_16* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setSprt16(p);
 }
 void SetSprt(SPRT* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setSprt(p);
 }
 void SetTile1(TILE_1* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setTile1(p);
 }
 void SetTile8(TILE_8* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setTile8(p);
 }
 void SetTile16(TILE_16* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setTile16(p);
 }
 void SetTile(TILE* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setTile(p);
 }
 void SetLineF2(LINE_F2* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineF2(p);
 }
 void SetLineG2(LINE_G2* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineG2(p);
 }
 void SetLineF3(LINE_F3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineF3(p);
 }
 void SetLineG3(LINE_G3* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineG3(p);
 }
 void SetLineF4(LINE_F4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineF4(p);
 }
 void SetLineG4(LINE_G4* p) {
-    PRIM_TIME(5);
+    PRIM_TIME(PRIM_SETTER_CYCLES);
     setLineG4(p);
 }
 

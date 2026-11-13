@@ -40,6 +40,43 @@ static long tick(void) {
     calls++;
     return 0;
 }
+static unsigned timed_a, timed_b;
+static void timed_tick_a(void) { timed_a++; }
+static void timed_tick_b(void) { timed_b = timed_a + 1; } // records order
+
+/* Timed device completions (Psyz_KernelPostAt): one deadline per callback,
+ * so a repost moves it (a stale deadline never ends a later transfer), a
+ * cancel drops it, and different callbacks keep their own. */
+static int timed_queue_cases(void) {
+    clock_us = UINT64_C(5000000);
+    Psyz_KernelPostAt(clock_us + 100, timed_tick_a);
+    Psyz_KernelPostAt(clock_us + 300, timed_tick_a); // moves it
+    clock_us += 150;
+    Psyz_KernelPoll();
+    if (timed_a != 0)
+        return 20;
+    clock_us += 200;
+    Psyz_KernelPoll();
+    if (timed_a != 1)
+        return 21;
+    clock_us += 1000;
+    Psyz_KernelPoll();
+    if (timed_a != 1)
+        return 22;
+    Psyz_KernelPostAt(clock_us + 10, timed_tick_a);
+    Psyz_KernelCancel(timed_tick_a);
+    clock_us += 100;
+    Psyz_KernelPoll();
+    if (timed_a != 1)
+        return 23;
+    Psyz_KernelPostAt(clock_us + 50, timed_tick_b);
+    Psyz_KernelPostAt(clock_us + 20, timed_tick_a);
+    clock_us += 100;
+    Psyz_KernelPoll();
+    if (timed_a != 2 || timed_b != 3) // a first, then b
+        return 24;
+    return 0;
+}
 
 /* Standalone deterministic host-clock test. No real sleeps or game-memory
  * writes: build test_events.c with -DPSYZ_TEST_CLOCK and the PsyZ include path.
@@ -88,8 +125,11 @@ int main(void) {
             ++tested;
         }
     }
+    int timed = timed_queue_cases();
+    if (timed)
+        return timed;
     printf("host-clock cases=%u passed; ordinary periods, long-pause restart, "
-           "no catch-up storm\n",
+           "no catch-up storm, one timed deadline per callback\n",
            tested);
     return 0;
 }
@@ -1147,11 +1187,14 @@ ZTEST(events, card_file_read_takes_a_turn_per_frame) {
         zskip("slot 1 has no card ready for reading");
     }
     card_poll(card_hw, 0);
+    // count blanks, not loop turns: a stalled host can take several
+    // blanks in one VSync(0)
+    int start = VSync(-1);
     Psyz_CardFileTransfer(CARD_SLOT_1, 0x2000, 1);
     int n = 0;
     while (!TestEvent(card_sw[CARD_IOE]) && n <= 140) {
         VSync(0);
-        n++;
+        n = VSync(-1) - start;
     }
     zexpect_s32_ge(128, n);
     zexpect_s32_le(132, n);

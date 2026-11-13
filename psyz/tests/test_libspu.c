@@ -1862,11 +1862,45 @@ static void count_concurrent_pcm(
 }
 #endif
 
+#if defined(__psyz) && !defined(__PSP__)
+/* The audio_sync and audio_capture tests re-create the audio backend with a
+ * clock of their own. The teardown puts back the process's PSYZ_AUDIO_CLOCK
+ * and a fresh backend whether the test passed or not, so a failure cannot
+ * leave the next tests on another clock or with a capture callback. */
+static char* audio_saved_clock;
+static bool audio_clock_saved;
+
+static void audio_backend_save(void) {
+    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
+    audio_saved_clock = clock ? SDL_strdup(clock) : NULL;
+    audio_clock_saved = true;
+}
+
+static void audio_backend_restore(void) {
+    if (!audio_clock_saved)
+        return;
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    Psyz_AudioDestroy();
+    if (audio_saved_clock) {
+        SDL_SetEnvironmentVariable(
+            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", audio_saved_clock, true);
+        SDL_free(audio_saved_clock);
+        audio_saved_clock = NULL;
+    } else
+        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    audio_clock_saved = false;
+    zassert_s32_eq(0, Psyz_AudioInit());
+}
+
+ZTEST_SETUP(audio_sync) { audio_backend_save(); }
+ZTEST_TEARDOWN(audio_sync) { audio_backend_restore(); }
+ZTEST_SETUP(audio_capture) { audio_backend_save(); }
+ZTEST_TEARDOWN(audio_capture) { audio_backend_restore(); }
+#endif
+
 ZTEST(audio_sync, public_spu_access_waits_for_mixer_transaction) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
     SDL_SetEnvironmentVariable(
         SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true);
@@ -1908,14 +1942,6 @@ ZTEST(audio_sync, public_spu_access_waits_for_mixer_transaction) {
         }
         SDL_DestroySemaphore(access.entered);
     }
-    Psyz_AudioDestroy();
-    if (saved) {
-        SDL_SetEnvironmentVariable(
-            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
-        SDL_free(saved);
-    } else
-        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0, Psyz_AudioInit());
     zassert_u32_eq(0xFFF, started);
     zassert_u32_eq(0xFFF, completed);
     zassert_u32_eq(0, early);
@@ -1925,8 +1951,6 @@ ZTEST(audio_sync, public_spu_access_waits_for_mixer_transaction) {
 ZTEST(audio_sync, device_mix_survives_concurrent_rekey_reset_and_ram_transfer) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
     SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
     zassert_s32_eq(0, Psyz_AudioInit());
@@ -1949,14 +1973,6 @@ ZTEST(audio_sync, device_mix_survives_concurrent_rekey_reset_and_ram_transfer) {
         SDL_Delay(5);
     Psyz_AudioSetCaptureCallback(NULL, NULL);
     int frames = SDL_GetAtomicInt(&rendered);
-    Psyz_AudioDestroy();
-    if (saved) {
-        SDL_SetEnvironmentVariable(
-            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
-        SDL_free(saved);
-    } else
-        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0, Psyz_AudioInit());
     zassert_s32_eq(1, frames > 0);
 #endif
 }
@@ -1964,8 +1980,6 @@ ZTEST(audio_sync, device_mix_survives_concurrent_rekey_reset_and_ram_transfer) {
 ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
     zassert_s32_eq(
         1, SDL_SetEnvironmentVariable(
@@ -2009,14 +2023,6 @@ ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
     zassert_s32_eq(0, Psyz_AudioInit());
     Sdl3Audio_VBlank(false);
     zassert_u32_eq(6, proof.calls);
-    Psyz_AudioDestroy();
-    if (saved) {
-        SDL_SetEnvironmentVariable(
-            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
-        SDL_free(saved);
-    } else
-        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0, Psyz_AudioInit());
 #endif
 }
 
@@ -2025,8 +2031,6 @@ ZTEST(audio_capture, video_clock_observes_existing_pcm_without_advancing_spu) {
 ZTEST(audio_capture, video_clock_fields_last_as_long_as_on_hardware) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
     SDL_SetEnvironmentVariable(
         SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", "video", true);
@@ -2045,22 +2049,12 @@ ZTEST(audio_capture, video_clock_fields_last_as_long_as_on_hardware) {
     // a change of standard drops the fraction: 1000 * 897619 * 588 / 715909
     zassert_s32_eq(737244, SDL_GetAtomicInt(&rendered));
     Psyz_AudioSetCaptureCallback(NULL, NULL);
-    Psyz_AudioDestroy();
-    if (saved) {
-        SDL_SetEnvironmentVariable(
-            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
-        SDL_free(saved);
-    } else
-        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
-    zassert_s32_eq(0, Psyz_AudioInit());
 #endif
 }
 
 ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* clock = SDL_getenv("PSYZ_AUDIO_CLOCK");
-    char* saved = clock ? SDL_strdup(clock) : NULL;
     Psyz_AudioDestroy();
     SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
     zassert_s32_eq(0, Psyz_AudioInit());
@@ -2091,14 +2085,51 @@ ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
     unsigned calls = proof.calls;
     SDL_Delay(20);
     zassert_u32_eq(calls, proof.calls);
+#endif
+}
+
+#if defined(__psyz) && !defined(__PSP__)
+#include <libapi.h>
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
+typedef struct {
+    SDL_AtomicInt calls;
+} CaptureReentry;
+
+static void capture_delivers_event(
+    const short* samples, int frames, void* userdata) {
+    (void)samples;
+    (void)frames;
+    CaptureReentry* reentry = userdata;
+    DeliverEvent(DescUEV | 0x5C, EvSpCOMP); // takes the kernel lock
+    SDL_AddAtomicInt(&reentry->calls, 1);
+}
+#endif
+
+/* The device's capture callback runs outside the SPU lock: one that calls
+ * into the kernel cannot deadlock against a game thread that holds the
+ * kernel lock (an interrupt handler) and waits for the SPU. */
+ZTEST(audio_capture, device_callback_may_call_into_psyz) {
+    zskip_targets("ps1;psp");
+#if defined(__psyz) && !defined(__PSP__)
     Psyz_AudioDestroy();
-    if (saved) {
-        SDL_SetEnvironmentVariable(
-            SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK", saved, true);
-        SDL_free(saved);
-    } else
-        SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "PSYZ_AUDIO_CLOCK");
     zassert_s32_eq(0, Psyz_AudioInit());
+    static CaptureReentry reentry;
+    SDL_SetAtomicInt(&reentry.calls, 0);
+    capture_test_voice();
+    Psyz_AudioSetCaptureCallback(capture_delivers_event, &reentry);
+    for (unsigned i = 0; i < 400 && SDL_GetAtomicInt(&reentry.calls) < 4;
+         ++i) {
+        Psyz_KernelLockInterrupts();
+        Psyz_AudioLock();
+        SDL_Delay(1);
+        Psyz_AudioUnlock();
+        Psyz_KernelUnlockInterrupts();
+        SDL_Delay(1);
+    }
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    zassert_s32_eq(1, SDL_GetAtomicInt(&reentry.calls) >= 4);
 #endif
 }
 
@@ -2108,6 +2139,26 @@ ZTEST(audio_capture, device_callback_observes_pcm_and_detaches) {
 #include <libetc.h>
 static unsigned offline_timer_ticks;
 static bool offline_timer_mutes;
+static long audio_clock_event = -1;
+
+// Stops the test timer and closes its event; the teardown does it too, so a
+// failed assertion cannot leave RCnt2 interrupting the next tests.
+static void audio_clock_stop_timer(void) {
+    StopRCnt(RCntCNT2);
+    if (audio_clock_event != -1) {
+        DisableEvent(audio_clock_event);
+        CloseEvent(audio_clock_event);
+        audio_clock_event = -1;
+    }
+}
+
+ZTEST_TEARDOWN(audio_clock) {
+    audio_clock_stop_timer();
+    offline_timer_mutes = false;
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
+    Psyz_AudioUnpause();
+}
+
 static long offline_timer_tick(void) {
     ++offline_timer_ticks;
     if (offline_timer_mutes) {
@@ -2129,7 +2180,8 @@ ZTEST(audio_clock, root_counter_tracks_samples_and_ignores_host_delay) {
     zassert_s32_eq(0, Psyz_AudioInit());
     offline_timer_ticks = 0;
     zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
-    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    long event = audio_clock_event =
+        OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
     zassert_s32_eq(1, event != -1);
     zassert_s32_eq(1, EnableEvent(event));
     zassert_s32_eq(1, StartRCnt(RCntCNT2));
@@ -2147,9 +2199,7 @@ ZTEST(audio_clock, root_counter_tracks_samples_and_ignores_host_delay) {
     for (unsigned i = 0; i < 54; ++i)
         Sdl3Audio_VBlank(false);
     zassert_u32_eq(240, offline_timer_ticks);
-    StopRCnt(RCntCNT2);
-    DisableEvent(event);
-    CloseEvent(event);
+    audio_clock_stop_timer();
 #endif
 }
 
@@ -2170,7 +2220,8 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
     offline_timer_ticks = 0;
     offline_timer_mutes = true;
     zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
-    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    long event = audio_clock_event =
+        OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
     zassert_s32_eq(1, event != -1);
     EnableEvent(event);
     StartRCnt(RCntCNT2);
@@ -2178,15 +2229,15 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
     for (unsigned i = 0; i < 6; ++i)
         Sdl3Audio_VBlank(false);
     Psyz_AudioSetCaptureCallback(NULL, NULL);
-    StopRCnt(RCntCNT2);
-    DisableEvent(event);
-    CloseEvent(event);
+    audio_clock_stop_timer();
     offline_timer_mutes = false;
     zassert_u32_eq(24, offline_timer_ticks);
     zassert_u32_eq(4423, proof.frames);
     zassert_s32_eq(0, proof.overflow);
+    /* The tick lands inside a sample; the voice's gain latches the new
+     * volume one sample later (spu::VoiceGainLatchReference). */
     for (unsigned frame = 0; frame < 4423; ++frame) {
-        bool muted = ((frame * 4 / 735) & 1) != 0;
+        bool muted = frame > 0 && (((frame - 1) * 4 / 735) & 1) != 0;
         for (unsigned ch = 0; ch < 2; ++ch)
             zassert_s32_eq(muted ? 0 : expected[frame * 2 + ch],
                            proof.samples[frame * 2 + ch]);
@@ -2207,7 +2258,8 @@ ZTEST(audio_clock, synchronous_wait_services_timer_without_vblank) {
     memset(&proof, 0, sizeof(proof));
     offline_timer_ticks = 0;
     zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
-    long event = OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
+    long event = audio_clock_event =
+        OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
     zassert_s32_eq(1, event != -1);
     EnableEvent(event);
     StartRCnt(RCntCNT2);
@@ -2226,8 +2278,47 @@ ZTEST(audio_clock, synchronous_wait_services_timer_without_vblank) {
     zassert_u32_eq(4, proof.calls);
     Psyz_AudioSetCaptureCallback(NULL, NULL);
     Psyz_AudioUnpause();
-    StopRCnt(RCntCNT2);
-    DisableEvent(event);
-    CloseEvent(event);
+    audio_clock_stop_timer();
+#endif
+}
+
+#if defined(__psyz) && !defined(__PSP__)
+int Psyz_SpuDmaBusy(void);
+void Psyz_SpuDmaWait(void);
+static SDL_AtomicInt spu_dma_ends;
+static void count_spu_dma_end(void) { SDL_AddAtomicInt(&spu_dma_ends, 1); }
+#endif
+
+/* A transfer started while another runs ends that one at once; the old
+ * transfer's posted end must not end the new, longer one early. */
+ZTEST(spu_dma, new_transfer_outlives_the_previous_transfers_deadline) {
+    zskip_targets("ps1;psp");
+#if defined(__psyz) && !defined(__PSP__)
+    const char* timing = getenv("PSYZ_SPU_TIMING");
+    const char* clock = getenv("PSYZ_AUDIO_CLOCK");
+    if (timing && !strcmp(timing, "instant"))
+        zskip("PSYZ_SPU_TIMING=instant ends transfers at once");
+    if (clock && !strcmp(clock, "video"))
+        zskip("needs the real-time clock, which runs during SDL_Delay");
+    static u_char data[0x40000];
+    SpuInit();
+    SpuSetTransferMode(SPU_TRANSFER_BY_DMA);
+    SpuSetTransferCallback(count_spu_dma_end);
+    SDL_SetAtomicInt(&spu_dma_ends, 0);
+    SpuSetTransferStartAddr(0x1010);
+    SpuWrite(data, 0x400); // 0.24 ms of DMA
+    SpuSetTransferStartAddr(0x1010);
+    SpuWrite(data, sizeof(data)); // 62 ms; the first one ends now
+    int ended = SDL_GetAtomicInt(&spu_dma_ends);
+    SDL_Delay(5); // past the first transfer's deadline
+    int busy = Psyz_SpuDmaBusy();
+    int ended_after = SDL_GetAtomicInt(&spu_dma_ends);
+    Psyz_SpuDmaWait();
+    int ended_last = SDL_GetAtomicInt(&spu_dma_ends);
+    SpuSetTransferCallback(NULL);
+    zexpect_s32_eq(1, ended);
+    zexpect_s32_eq(1, busy);
+    zexpect_s32_eq(1, ended_after);
+    zexpect_s32_eq(2, ended_last);
 #endif
 }

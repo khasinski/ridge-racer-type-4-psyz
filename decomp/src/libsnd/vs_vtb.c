@@ -1,13 +1,14 @@
 #include "libsnd_private.h"
 
 #ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 #endif
 
 short SsVabTransBody(u_char* addr, short vabid) {
     unsigned vab_start;
 #ifdef __psyz
-    Psyz_SpendCycles(991); // PS1 time before the DMA (DuckStation)
+    Psyz_SpendCycles(SS_VAB_TRANS_BODY_CYCLES); // PS1 time before the DMA
 #endif
 
     if (vabid >= 0 && vabid <= NUM_VAB) {

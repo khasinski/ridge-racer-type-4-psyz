@@ -11,6 +11,7 @@
 #include <libetc.h>
 #include <psyz/system.h>
 #include "../internal.h"
+#include "../timing_profile.h"
 
 // 1:valid, 0:invalid
 static inline int validate_chan(long chan) {
@@ -111,10 +112,7 @@ static uint64_t card_fields_us(unsigned fields);
 enum {
     CARD_LOAD_TRANSFERS = 36,
     CARD_BU_INIT_TRANSFERS = 37,
-    CARD_SECTOR_CLOCKS = 266300,
-    CARD_BU_INIT_EMPTY_PORT_CLOCKS = 74200,
-    CARD_FINISH_ISR_CLOCKS = 5400,
-};
+}; // CARD_SECTOR_CLOCKS and the other times: timing_profile.h
 
 enum {
     CARD_RAISE_NONE,
@@ -265,7 +263,7 @@ void Psyz_CardVBlank(void) {
  * driver's vblank after a field and a half. */
 static void card_spin(void) {
     uint64_t before = Psyz_KernelNowUs();
-    Psyz_SpendTime(64000);
+    Psyz_SpendTime(CARD_SPIN_NS);
     uint64_t now = Psyz_KernelNowUs();
     // half a field of slack: a PAL field of the clock can end a spin late
     if (now == before ||

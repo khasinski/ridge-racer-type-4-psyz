@@ -41,15 +41,32 @@ static unsigned field_frames_left;
 static unsigned field_frames_total; // the current field's length
 static unsigned wait_fraction; // carried sub-sample part of waited time
 
+/* The capture callback runs under its own mutex, not the SPU's: it may call
+ * the SPU and audio APIs, and replacing it still waits for a running call. */
 static PsyzAudioCaptureCallback capture_callback;
 static void* capture_userdata;
+static SDL_Mutex* capture_mutex;
 
 void Psyz_AudioSetCaptureCallback(
     PsyzAudioCaptureCallback callback, void* userdata) {
-    Psyz_AudioLock();
+    if (!capture_mutex)
+        capture_mutex = SDL_CreateMutex();
+    SDL_LockMutex(capture_mutex);
     capture_callback = callback;
     capture_userdata = userdata;
-    Psyz_AudioUnlock();
+    SDL_UnlockMutex(capture_mutex);
+}
+
+/* Hands mixed samples to the capture callback, after the SPU mutex is
+ * released: a callback that calls back into PsyZ (Psyz_AudioLock, the SPU)
+ * from the audio thread cannot deadlock against the game thread. */
+static void Capture(const short* samples, int frames) {
+    if (!capture_mutex)
+        return;
+    SDL_LockMutex(capture_mutex);
+    if (capture_callback)
+        capture_callback(samples, frames, capture_userdata);
+    SDL_UnlockMutex(capture_mutex);
 }
 
 // Audio callback: SDL pulls audio from the SPU via this callback.
@@ -63,18 +80,17 @@ static void SDLCALL audio_callback(void* userdata, SDL_AudioStream* stream,
 
     int num_frames = additional_amount / (N_CHANNELS * SAMPLE_SIZE);
     short buf[4096] = {0};
-    SDL_LockMutex(mutex);
     while (num_frames > 0) {
         int batch = num_frames;
         if (batch > 2048)
             batch = 2048;
+        SDL_LockMutex(mutex);
         Psyz_SpuPullSamples(buf, batch);
-        if (capture_callback)
-            capture_callback(buf, batch, capture_userdata);
+        SDL_UnlockMutex(mutex);
+        Capture(buf, batch);
         SDL_PutAudioStreamData(stream, buf, batch * N_CHANNELS * SAMPLE_SIZE);
         num_frames -= batch;
     }
-    SDL_UnlockMutex(mutex);
 }
 
 static bool is_audio_init = false;
@@ -144,8 +160,7 @@ void Psyz_AudioDestroy(void) {
         SDL_DestroyMutex(mutex);
         mutex = NULL;
     }
-    capture_callback = NULL;
-    capture_userdata = NULL;
+    Psyz_AudioSetCaptureCallback(NULL, NULL);
     is_audio_init = false;
     video_clock = false;
 }
@@ -197,8 +212,8 @@ int Psyz_AudioIsPaused(void) {
  * a wait inside one spends no further time. */
 static int mixing;
 
-static void MixOfflineFrames(unsigned frames) {
-    short samples[2 * FIELD_FRAMES_MAX];
+// Mixes frames (at most FIELD_FRAMES_MAX) into samples; holds the mutex.
+static void MixOfflineFrames(short* samples, unsigned frames) {
     unsigned offset = 0;
     mixing++;
     while (offset < frames) {
@@ -208,16 +223,21 @@ static void MixOfflineFrames(unsigned frames) {
         offset += batch;
     }
     mixing--;
-    if (capture_callback)
-        capture_callback(samples, (int)frames, capture_userdata);
+}
+
+// Mixes frames under the mutex, then captures them outside it.
+static void MixAndCapture(unsigned frames) {
+    short samples[2 * FIELD_FRAMES_MAX];
+    SDL_LockMutex(mutex);
+    MixOfflineFrames(samples, frames);
+    SDL_UnlockMutex(mutex);
+    Capture(samples, (int)frames);
 }
 
 int Psyz_AudioWaitForTimer(void) {
     if (!is_audio_init || !video_clock || video_paused)
         return 0;
-    SDL_LockMutex(mutex);
-    MixOfflineFrames(Psyz_KernelAudioBatch(FIELD_FRAMES_MAX));
-    SDL_UnlockMutex(mutex);
+    MixAndCapture(Psyz_KernelAudioBatch(FIELD_FRAMES_MAX));
     return 1;
 }
 
@@ -261,9 +281,7 @@ int Psyz_AudioWaitUs(uint64_t us) {
             batch = FIELD_FRAMES_MAX;
         if (batch > frames)
             batch = (unsigned)frames;
-        SDL_LockMutex(mutex);
-        MixOfflineFrames(batch);
-        SDL_UnlockMutex(mutex);
+        MixAndCapture(batch);
         frames -= batch;
         field_frames_left -= batch;
         if (!field_frames_left) {
@@ -335,9 +353,7 @@ void Sdl3Audio_VBlank(bool pal) {
         return;
     if (!field_frames_left || pal != video_pal)
         field_frames_left = field_frames_total = NextFieldFrames(pal);
-    SDL_LockMutex(mutex);
-    MixOfflineFrames(field_frames_left);
-    SDL_UnlockMutex(mutex);
+    MixAndCapture(field_frames_left);
     field_frames_left = 0;
 }
 

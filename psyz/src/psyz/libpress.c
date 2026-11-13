@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../internal.h"
+#include "../timing_profile.h"
 #include "../../../decomp/src/libpress/libpress_private.h"
 
 /* Native implementation of the MDEC commands used by LIBPRESS. Serialized
@@ -20,12 +21,10 @@ static struct {
 } mdec;
 
 /* The decoder takes its PS1 time: a macroblock (a block in the mono
- * depths) leaves it about every 101 us (DuckStation: 2688 cycles per
- * macroblock and the DMA; Ridge Racer Type 4's 320x176 frames, 220
- * macroblocks, take 22.2 ms), so an output transfer completes, and raises
- * its DMA callback, once the decoder has produced its words.
- * Psyz_MdecSetInstantTiming(1) completes transfers at once. */
-#define MDEC_UNIT_NS 101000
+ * depths) leaves it every MDEC_UNIT_NS (timing_profile.h), so an output
+ * transfer completes, and raises its DMA callback, once the decoder has
+ * produced its words. Psyz_MdecSetInstantTiming(1) completes transfers at
+ * once. */
 static int mdec_instant;
 
 void Psyz_MdecSetInstantTiming(int instant) { mdec_instant = instant != 0; }

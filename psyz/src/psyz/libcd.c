@@ -11,6 +11,7 @@
 #include <math.h>
 #include <kernel.h>
 #include "../internal.h"
+#include "../timing_profile.h"
 #include "os.h"
 #include "../../../decomp/src/libcd/libcd_stream.h"
 #include "../../decomp/src/libspu/libspu_private.h"
@@ -1519,12 +1520,8 @@ static int drive_ready_sector = -1; // sector the ready callback may fetch
 
 /* PS1 time of one poll of the drive in a busy loop: StGetNext and its retry
  * loop in a movie player, CPU time only, so the interrupts that come
- * meanwhile lengthen the wait (Ridge Racer Type 4 spins 4,000,000 polls on
- * an empty ring before its first read: 290 fields with one pad connected,
- * 292 with two, on DuckStation without breakpoints, which slow its CPU);
- * and the other drive queries (time including interrupts). */
-#define ST_POLL_MILLICYCLES 46800
-#define CD_POLL_NS 2000
+ * meanwhile lengthen the wait (ST_POLL_MILLICYCLES); and the other drive
+ * queries, time including interrupts (CD_POLL_NS; timing_profile.h). */
 
 // Sectors the current read has reached by `now` (0 while seeking).
 static uint64_t drive_sectors_due(uint64_t now) {
@@ -1647,12 +1644,13 @@ static void drive_poll(unsigned ns) {
     Psyz_CdServiceDrive();
 }
 
+static unsigned poll_millicycles; // a poll's clock fraction, reset by CdInit
+
 void Psyz_CdPollDrive(void) {
-    static unsigned millicycles;
     if (!drive_is_instant()) {
-        millicycles += ST_POLL_MILLICYCLES;
-        Psyz_SpendCycles(millicycles / 1000);
-        millicycles %= 1000;
+        poll_millicycles += ST_POLL_MILLICYCLES;
+        Psyz_SpendCycles(poll_millicycles / 1000);
+        poll_millicycles %= 1000;
     }
     Psyz_CdServiceDrive();
 }
@@ -2168,6 +2166,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
 // then installs callbacks delivering HwCdRom events; PsyZ raises those from
 // CD_cw, and a ready callback would take the sectors of polled reads.)
 int CdInit(void) {
+    poll_millicycles = 0;
     for (int i = 0; i < 5; i++) {
         if (CD_init() == 0 && CD_initvol() == 0) {
             return 1;

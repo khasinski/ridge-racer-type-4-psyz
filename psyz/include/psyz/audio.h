@@ -14,9 +14,11 @@ extern "C" {
  * Observe playback PCM after mixing, without pulling additional samples.
  * Frames are interleaved signed 16-bit stereo at 44100 Hz, in host byte order.
  * The buffer is valid only during the callback and must not be modified.
- * Runs under the audio lock, on the SDL/PSP audio thread or video-clock thread.
- * Do not call audio/SPU APIs from the callback. Keep device callbacks brief.
- * Pass NULL to detach; return guarantees the old callback is no longer running.
+ * Runs on the SDL/PSP audio thread or the video-clock thread, after the mixed
+ * samples left the audio lock (SDL backend), so it may call PsyZ. Keep
+ * device callbacks brief. Pass NULL to detach;
+ * return guarantees the old callback is no longer running, so do not set it
+ * while holding Psyz_AudioLock (a running callback may be waiting for it).
  * Registration may precede init; AudioDestroy clears it. Direct SpuPullSamples
  * calls bypass this observer. Paused playback emits no callbacks.
  */

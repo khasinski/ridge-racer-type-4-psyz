@@ -126,25 +126,19 @@ int D_800B8A44 = 0;
 #endif
 
 #ifdef __psyz
-/* The PS1 CPU time of the calls, in system clocks (DuckStation, measured at
- * the call): the library code, its BIOS memcpy of the PS1 environment
- * (A(2Ah): 258 + 204 clocks per byte, DRAWENV 0x5C and DISPENV 0x14 bytes)
+/* The PS1 CPU time of the calls (timing_profile.h): the library code, its
+ * BIOS memcpy of the PS1 environment (DRAWENV 0x5C and DISPENV 0x14 bytes)
  * and the DMA the CPU waits for (17 clocks per 16 words: the ordering table
  * clear and an image upload, which the next DrawSync(0) finishes). */
+#include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 #define GPU_TIME(cycles) Psyz_SpendCycles(cycles)
-#define GPU_BIOS_MEMCPY_CYCLES(bytes) (258 + 204 * (bytes))
+#define GPU_BIOS_MEMCPY_CYCLES(bytes) \
+    (BIOS_COPY_CYCLES + BIOS_COPY_BYTE_CYCLES * (bytes))
 #define GPU_DMA_CYCLES(words) ((words) + ((words) + 15) / 16)
 enum {
     PS1_DRAWENV_SIZE = 0x5C,
     PS1_DISPENV_SIZE = 0x14,
-    PUT_DRAW_ENV_CYCLES = 1165, // PutDrawEnv without its memcpy
-    PUT_DISP_ENV_CYCLES = 396,  // PutDispEnv (unchanged ranges), ditto
-    GET_ENV_CYCLES = 40,
-    DRAW_OTAG_CYCLES = 483,
-    CLEAR_OTAG_R_CYCLES = 330, // and the OTC DMA of n words
-    LOAD_IMAGE_CYCLES = 830,   // and the DMA of the image
-    DRAW_SYNC_CYCLES = 246,    // an idle GPU queue
 };
 #else
 #define GPU_TIME(cycles)
@@ -370,10 +364,10 @@ void DrawPrim(void* p) {
 
 #ifdef __psyz
 /* The list DMA DrawOTag starts walks the ordering table: until the first
- * packet with data it only reads headers, and the CPU waits for it (61
- * system clocks a node on DuckStation: 43.4k for an empty 704-entry table);
- * from there the GPU's FIFO paces it and the CPU runs on. */
-enum { DRAW_OTAG_NODE_CYCLES = 61, DRAW_OTAG_NODES_MAX = 0x10000 };
+ * packet with data it only reads headers, and the CPU waits for it
+ * (DRAW_OTAG_NODE_CYCLES a node); from there the GPU's FIFO paces it and
+ * the CPU runs on. */
+enum { DRAW_OTAG_NODES_MAX = 0x10000 };
 static unsigned DrawOTagEmptyNodes(OT_TYPE* p) {
     unsigned n = 0;
     while (p && n < DRAW_OTAG_NODES_MAX && getlen(p) == 0) {

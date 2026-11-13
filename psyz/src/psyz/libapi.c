@@ -5,6 +5,7 @@
 #include "libgpu.h"
 #include "../draw.h"
 #include "../internal.h"
+#include "../timing_profile.h"
 
 #undef _get_errno // Windows: avoid conflicts
 #undef undelete   // macOS: avoid conflicts
@@ -54,15 +55,9 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 }
 
 /* The vblank handler's PS1 time besides the kernel's: libetc's VSync
- * handler and callbacks dispatch, the BIOS card driver's turn (2.4k clocks
- * on DuckStation), and libpad's controller exchange once PadStartCom ran
- * (16.1k: its SIO busy waits for a digital pad in port 1, port 2 empty;
- * 4.8k more with a pad in port 2). */
-enum {
-    VBLANK_HANDLER_CYCLES = 2387,
-    LIBPAD_VBLANK_CYCLES = 16084,
-    LIBPAD_VBLANK_PORT2_CYCLES = 4790,
-};
+ * handler and callbacks dispatch, the BIOS card driver's turn, and libpad's
+ * controller exchange once PadStartCom ran, more with a pad in port 2
+ * (VBLANK_HANDLER_CYCLES, LIBPAD_VBLANK_*: timing_profile.h). */
 
 static int PadPort2Connected(void) {
     return ports[1].frame[0] == 0 &&
@@ -322,14 +317,8 @@ void SystemError(char c, long n) {
     ERRORF("SystemError('%c', 0x%X)", c, n);
 }
 
-/* The BIOS card directory search after firstfile's sector 0 check: 25.8k
- * clocks, 6.2k more when it returns an entry, and 13.7k for a nextfile
- * (DuckStation, SCPH-1001 BIOS). */
-enum {
-    BIOS_CARD_FIRSTFILE_CYCLES = 25800,
-    BIOS_CARD_ENTRY_CYCLES = 6200,
-    BIOS_CARD_NEXTFILE_CYCLES = 13700,
-};
+/* The BIOS card directory search after firstfile's sector 0 check, more
+ * when it returns an entry, and a nextfile (BIOS_CARD_*, timing_profile.h). */
 static int card_search; // the last firstfile searched a card
 
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry);
@@ -373,13 +362,8 @@ int psyz_get_errno(void) {
     return 0;
 }
 
-/* BIOS A(28h)/A(2Ah)/A(2Bh), with the time of the ROM byte loops (system.h). */
-enum {
-    BIOS_FILL_CYCLES = 328,
-    BIOS_FILL_BYTE_CYCLES = 132,
-    BIOS_COPY_CYCLES = 258,
-    BIOS_COPY_BYTE_CYCLES = 204,
-};
+/* BIOS A(28h)/A(2Ah)/A(2Bh), with the time of the ROM byte loops (system.h,
+ * BIOS_FILL_* and BIOS_COPY_* in timing_profile.h). */
 
 static void BiosByteLoopTime(unsigned base, unsigned per_byte, int len) {
     uint64_t cycles = base + (len > 0 ? (uint64_t)len * per_byte : 0);

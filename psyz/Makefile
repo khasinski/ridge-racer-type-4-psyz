@@ -18,6 +18,16 @@ build/%/libpsyz.a: CMakeLists.txt cmake/%.cmake $(shell find src include -type f
 UNAME_S := $(shell uname)
 
 ZTEST_RUN := python3 ../ztest/zrunner.py
+# The suite's one run mode (README.md, as CI runs it): the SDL GPU renderer
+# in a hidden window (Linux offscreen), no audio device, and none of the
+# caller's PsyZ timing or card knobs (a game's PSYZ_AUDIO_CLOCK=video would
+# put the kernel on the offline clock).
+TEST_ENV := env -u PSYZ_AUDIO_CLOCK -u PSYZ_SPU_TIMING -u PSYZ_CD_TIMING \
+	-u PSYZ_CARD_TIMING -u PSYZ_CARD_UNPLUG -u PSYZ_CARD_UNFORMATTED \
+	PSYZ_HEADLESS=gpu SDL_AUDIODRIVER=dummy
+ifeq ($(UNAME_S),Linux)
+TEST_ENV += SDL_VIDEODRIVER=offscreen
+endif
 # Extra zrunner options, e.g. RUNNER_ARGS="--emulator-path=... --bios=..."
 RUNNER_ARGS ?=
 
@@ -25,21 +35,13 @@ test:
 	@mkdir -p tests/build/sdl3-gpu-hw
 	cmake -G$(CMAKE_GEN) --log-level=WARNING -DGTE_USE_HW_SQRT=ON -DCMAKE_BUILD_TYPE=Debug -S tests/ -B tests/build/sdl3-gpu-hw
 	cmake --build tests/build/sdl3-gpu-hw
-ifeq ($(UNAME_S),Linux)
-	SDL_VIDEODRIVER=offscreen $(ZTEST_RUN) native --exe tests/build/sdl3-gpu-hw/psyz_tests --workdir tests $(RUNNER_ARGS)
-else
-	$(ZTEST_RUN) native --exe tests/build/sdl3-gpu-hw/psyz_tests --workdir tests $(RUNNER_ARGS)
-endif
+	$(TEST_ENV) $(ZTEST_RUN) native --exe tests/build/sdl3-gpu-hw/psyz_tests --workdir tests $(RUNNER_ARGS)
 
 ifneq ($(UNAME_S),Darwin)
 	@mkdir -p tests/build/sdl3-gl-sw
 	cmake -G$(CMAKE_GEN) --log-level=WARNING -DPSYZ_RENDERER=sdl3_gl -DGTE_USE_HW_SQRT=OFF -DCMAKE_BUILD_TYPE=Debug -S tests/ -B tests/build/sdl3-gl-sw
 	cmake --build tests/build/sdl3-gl-sw
-ifeq ($(UNAME_S),Linux)
-	SDL_VIDEODRIVER=offscreen $(ZTEST_RUN) native --exe tests/build/sdl3-gl-sw/psyz_tests --workdir tests --filter='gpu::*' $(RUNNER_ARGS)
-else
-	$(ZTEST_RUN) native --exe tests/build/sdl3-gl-sw/psyz_tests --workdir tests --filter='gpu::*' $(RUNNER_ARGS)
-endif
+	$(TEST_ENV) $(ZTEST_RUN) native --exe tests/build/sdl3-gl-sw/psyz_tests --workdir tests --filter='gpu::*' $(RUNNER_ARGS)
 endif
 
 test-linux32:

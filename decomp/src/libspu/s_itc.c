@@ -1,5 +1,8 @@
 #include "libspu_private.h"
 #include "libapi.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+#endif
 
 long SpuIsTransferCompleted(long immediateFlag) {
 #ifdef __psyz
@@ -13,7 +16,7 @@ long SpuIsTransferCompleted(long immediateFlag) {
     if (immediateFlag == 1) {
         Psyz_SpuDmaWait();
     } else if (Psyz_SpuDmaBusy()) {
-        Psyz_SpendTime(1000); // the PS1 time of a poll
+        Psyz_SpendTime(SPU_TRANSFER_POLL_NS); // the PS1 time of a poll
         return 0;
     }
     _spu_inTransfer = 1;

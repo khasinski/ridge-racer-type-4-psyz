@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include "os.h"
 #include "../internal.h"
+#include "../timing_profile.h"
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -221,7 +222,7 @@ void Psyz_KernelInterruptCycles(unsigned cycles) {
 unsigned Psyz_KernelTakeInterruptCycles(void) { return TakeInterruptDebt(); }
 
 static int OwnsKernel(void);
-static void SpendNs(unsigned ns);
+static void SpendNs(uint64_t ns);
 
 void Psyz_SpendTime(unsigned ns) {
     // a span measured on the PS1 includes the interrupts within it
@@ -235,7 +236,8 @@ void Psyz_SpendTime(unsigned ns) {
 
 static uint64_t spend_carry_ns;
 static uint64_t spend_deadline_ns;
-static void SpendNs(unsigned ns) {
+static uint64_t spend_cycle_carry; // clocks * 1e9 not yet spent, below one ns
+static void SpendNs(uint64_t ns) {
     if (UsesAudioClock()) {
         spend_carry_ns += ns;
         if (spend_carry_ns >= 1000) {
@@ -261,7 +263,6 @@ static void SpendNs(unsigned ns) {
  * handler. Offline clock only: on a real-time clock the native work takes
  * host time of its own and a busy wait would only lower the frame rate. */
 void Psyz_SpendCycles(unsigned cycles) {
-    static uint64_t carry; // clocks * 1e9 not yet spent, below one ns
     if (!UsesAudioClock()) {
         return; // the host's own time stands for it on a real-time clock
     }
@@ -270,9 +271,10 @@ void Psyz_SpendCycles(unsigned cycles) {
         return;
     }
     do {
-        uint64_t scaled = (uint64_t)cycles * 1000000000u + carry;
-        carry = scaled % SYSTEM_CLOCK_HZ;
-        SpendNs((unsigned)(scaled / SYSTEM_CLOCK_HZ));
+        uint64_t scaled = (uint64_t)cycles * 1000000000u + spend_cycle_carry;
+        spend_cycle_carry = scaled % SYSTEM_CLOCK_HZ;
+        // 64-bit: UINT32_MAX clocks are 126.8 s (BiosByteLoopTime)
+        SpendNs(scaled / SYSTEM_CLOCK_HZ);
     } while ((cycles = TakeInterruptDebt()) != 0);
 }
 
@@ -336,8 +338,7 @@ static void DeliverLocked(unsigned int desc, unsigned int spec) {
 }
 
 /* The BIOS exception handler and libetc's dispatcher around a callback
- * (DuckStation: 2.9k clocks for an RCnt interrupt with an empty callback). */
-enum { KERNEL_IRQ_CYCLES = 2850 };
+ * take KERNEL_IRQ_CYCLES (timing_profile.h). */
 
 static void ServiceLine(int line) {
     irq_latched &= ~(1u << line);
@@ -629,9 +630,15 @@ static void CounterRestart(RootCounter* c, uint64_t now_us) {
     c->frac_acc = 0;
 }
 
-/* One-shot device completions on the emulated clock (an MDEC transfer),
- * fired as interrupts once their time comes, like the root counters. */
-#define TIMED_MAX 8
+/* One-shot device completions on the emulated clock (an MDEC transfer, an
+ * SPU DMA, a card frame, the CD drive's next interrupt), fired as interrupts
+ * once their time comes, like the root counters. Each callback has at most
+ * one pending deadline: posting a callback that is already queued moves its
+ * deadline (a device's new transfer replaces the old one's end), so a stale
+ * deadline can never end a later transfer early. The queue is sized for
+ * every completion callback PsyZ has; overflowing it is a bug that would
+ * hang the waiter, so it stops the program. */
+#define TIMED_MAX 16
 static struct {
     uint64_t at_us;
     void (*fn)(void);
@@ -642,16 +649,22 @@ static void StartIrqThread(void);
 void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void)) {
     StartIrqThread();
     KernelLock();
-    if (timed_len < TIMED_MAX) {
-        timed[timed_len].at_us = at_us;
-        timed[timed_len].fn = fn;
+    int slot = 0;
+    while (slot < timed_len && timed[slot].fn != fn) {
+        slot++;
+    }
+    if (slot == TIMED_MAX) {
+        ERRORF("timed interrupt queue full (%d callbacks)", TIMED_MAX);
+        abort();
+    }
+    if (slot == timed_len) {
         timed_len++;
-        uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
-        if (at_us < deadline) {
-            AtomicTimeStore(&poll_deadline_us, at_us);
-        }
-    } else {
-        WARNF("dropped a timed interrupt");
+    }
+    timed[slot].at_us = at_us;
+    timed[slot].fn = fn;
+    uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
+    if (at_us < deadline) {
+        AtomicTimeStore(&poll_deadline_us, at_us);
     }
     KernelUnlock();
     Psyz_OsBellRing(bell_irq);
@@ -659,11 +672,10 @@ void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void)) {
 
 void Psyz_KernelCancel(void (*fn)(void)) {
     KernelLock();
-    for (int i = 0; i < timed_len;) {
+    for (int i = 0; i < timed_len; i++) {
         if (timed[i].fn == fn) {
             timed[i] = timed[--timed_len];
-        } else {
-            i++;
+            break; // one slot per callback
         }
     }
     KernelUnlock();
@@ -996,6 +1008,11 @@ int ResetCallback(void) {
     }
     memset(irq_callbacks, 0, sizeof(irq_callbacks));
     memset(vsync_callbacks, 0, sizeof(vsync_callbacks));
+    // the fractions of time carried between spends start again (D10 list in
+    // internal.h)
+    spend_carry_ns = 0;
+    spend_deadline_ns = 0;
+    spend_cycle_carry = 0;
     irq_callbacks[IRQ_VBLANK] = VSyncDispatch;
     irq_mask = 1u << IRQ_VBLANK;
     irq_latched = 0;

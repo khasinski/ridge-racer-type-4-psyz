@@ -228,6 +228,10 @@ static int VramTransferPieces(const RECT* rect, VramPiece* piece) {
 }
 
 static void VramTransfer(RECT* rect, u_long* data, int store) {
+    // A wrapped transfer goes piece by piece through one scratch image (a
+    // piece is at most the whole VRAM), so it never allocates or stops half
+    // done. Like the Draw_ calls it makes, it is not reentrant.
+    static u16 part[VRAM_W * VRAM_H];
     VramPiece piece[4];
     int n = VramTransferPieces(rect, piece);
     if (n == 1) {
@@ -242,11 +246,8 @@ static void VramTransfer(RECT* rect, u_long* data, int store) {
     }
     for (int i = 0; i < n; i++) {
         u16* image = (u16*)data;
-        u16* part = malloc((size_t)piece[i].w * piece[i].h * sizeof(u16));
         RECT r = {(short)piece[i].x, (short)piece[i].y, (short)piece[i].w,
                   (short)piece[i].h};
-        if (!part)
-            return;
         if (!store)
             for (int j = 0; j < piece[i].h; j++)
                 memcpy(part + (size_t)j * piece[i].w,
@@ -262,7 +263,6 @@ static void VramTransfer(RECT* rect, u_long* data, int store) {
             VramCopyLoad(&r, (u_long*)part);
             Draw_LoadImage(&r, (u_long*)part);
         }
-        free(part);
     }
 }
 

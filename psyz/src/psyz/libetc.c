@@ -3,6 +3,7 @@
 
 #include "libapi.h"
 #include "../internal.h"
+#include "../timing_profile.h"
 
 #include <psyz/log.h>
 
@@ -12,8 +13,8 @@
  * 0x24040001 with the SCPH-1001 BIOS (as on DuckStation), so a game that
  * never seeds draws the same numbers as there. */
 static uint32_t biosRandomState = UINT32_C(0x24040001);
-/* The ROM routines with the A0 stub, in system clocks (DuckStation). */
-enum { BIOS_RAND_CYCLES = 433, BIOS_SRAND_CYCLES = 119 };
+/* The ROM routines with the A0 stub take BIOS_RAND_CYCLES and
+ * BIOS_SRAND_CYCLES (timing_profile.h). */
 int Psyz_Rand(void) {
     biosRandomState = biosRandomState * UINT32_C(0x41c64e6d) + UINT32_C(0x3039);
     Psyz_SpendCycles(BIOS_RAND_CYCLES);
@@ -187,8 +188,7 @@ static int PadDirectState(int port) {
 }
 
 /* PSY-Q libpad clears its driver state (a 0x1E0-byte BIOS bzero) and sets
- * up the exchange: 73.3k system clocks, PadStartCom 1.6k (DuckStation). */
-enum { PAD_INIT_DIRECT_CYCLES = 73316, PAD_START_COM_CYCLES = 1589 };
+ * up the exchange (PAD_INIT_DIRECT_CYCLES, PAD_START_COM_CYCLES). */
 
 void PadInitDirect(u_char* pad1, u_char* pad2) {
     Psyz_SpendCycles(PAD_INIT_DIRECT_CYCLES);

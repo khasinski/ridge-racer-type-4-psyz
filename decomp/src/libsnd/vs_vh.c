@@ -1,4 +1,7 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+#endif
 
 short SsVabOpenHeadWithMode(
     u_char* addr, short vabid, short mode, u_long sbaddr);
@@ -33,10 +36,9 @@ short SsVabOpenHeadWithMode(
     vab_id = NUM_VAB;
 #ifdef __psyz
     {
-        /* PS1 time of the header parse (DuckStation, a Ridge Racer Type 4
-         * menu bank: 4.5k system clocks). */
+        // PS1 time of the header parse (timing_profile.h)
         void Psyz_SpendCycles(unsigned cycles);
-        Psyz_SpendCycles(4514);
+        Psyz_SpendCycles(SS_VAB_OPEN_HEAD_CYCLES);
     }
 #endif
 #ifndef __psyz

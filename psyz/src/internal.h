@@ -54,8 +54,26 @@ void Psyz_KernelPost(void (*fn)(void));
 
 // Runs fn as an interrupt once the emulated clock reaches at_us (a device
 // completing after its PS1 time); Psyz_KernelCancel drops a pending one.
+// A callback has one deadline: posting it again moves it.
 void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
 void Psyz_KernelCancel(void (*fn)(void));
+
+/* Host-side state the SDK's initialisation resets, besides the PS1 state the
+ * library itself clears:
+ *   ResetCallback (with no callbacks running: at boot, after StopCallback):
+ *     the fractions of time carried between spends (kernel.c)
+ *   SpuInit: a running SPU DMA ends and its posted end is dropped (spu.c)
+ *   CdInit: the StGetNext poll's clock fraction (libcd.c)
+ *   InitCARD/StartCARD: the card driver's requests and posted frame ends
+ *   DecDCTReset: a pending MDEC output transfer
+ * The environment knobs are read once, at their first use, and keep that
+ * value for the process: PSYZ_AUDIO_CLOCK (kernel.c; sdl3_audio.c reads it
+ * again at each Psyz_AudioInit, so set it before the first PsyZ call and do
+ * not change it), PSYZ_SPU_TIMING, PSYZ_CD_TIMING, PSYZ_CARD_TIMING (until
+ * the Psyz_*SetInstantTiming setter), PSYZ_CD_TRACE, PSYZ_CARD_TRACE,
+ * PSYZ_SPU_KEY_TRACE, PSYZ_SPU_REG_TRACE, PSYZ_CARD_UNPLUG and
+ * PSYZ_CARD_UNFORMATTED (once per slot, until Psyz_CardSetSlotState), and
+ * the renderer's (README.md). */
 
 // Completes a native synchronous DMA transfer without recursive callbacks.
 void Psyz_DmaComplete(unsigned channel);
