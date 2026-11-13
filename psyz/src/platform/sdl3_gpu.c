@@ -234,7 +234,62 @@ static SDL_GPUBuffer* vbuf = NULL;
 static SDL_GPUBuffer* ibuf = NULL;
 static SDL_GPUBuffer* clear_vbuf = NULL;
 static SDL_GPUTransferBuffer* vtx_transfer = NULL;
+/* Batches are uploaded one after another into vbuf/ibuf and vtx_transfer
+ * (indices after MAX_VERTEX_COUNT vertices in the transfer buffer). Only a
+ * batch that does not fit starts again at 0 and cycles the buffers, so SDL
+ * allocates a new full-size buffer only when the previous one is still in use
+ * at a wrap. Cycling on every batch made SDL keep one full-size buffer per
+ * batch in flight; those pools never shrink (100+ GB with small batches). */
+static Uint32 ring_vertex_pos, ring_index_pos;
+static bool ring_restart = true;
+static void RingWrapThrottle(void);
+/* vbuf/ibuf still to cycle: a wrap reserved only transfer space (a fill's
+ * quad goes to clear_vbuf), so the next batch upload cycles them */
+static bool ring_cycle_buffers;
+/* Space for a batch in the ring; true when the transfer buffer is to be
+ * cycled (mapped with cycle). RingCycleBuffers then says whether the
+ * batch's vbuf/ibuf uploads cycle. Index positions stay even: copies of
+ * 16-bit indices start at multiples of 4 bytes (Metal). */
+static bool RingReserve(Uint32 vertices, Uint32 indices, Uint32* vertex_at, Uint32* index_at) {
+    indices += indices & 1u;
+    const bool cycle = ring_restart || ring_vertex_pos + vertices > MAX_VERTEX_COUNT ||
+                       ring_index_pos + indices > MAX_INDEX_COUNT;
+    if (cycle) {
+        RingWrapThrottle();
+        ring_vertex_pos = ring_index_pos = 0;
+        ring_restart = false;
+        ring_cycle_buffers = true;
+    }
+    *vertex_at = ring_vertex_pos;
+    *index_at = ring_index_pos;
+    ring_vertex_pos += vertices;
+    ring_index_pos += indices;
+    return cycle;
+}
+static bool RingCycleBuffers(void) {
+    const bool cycle = ring_cycle_buffers;
+    ring_cycle_buffers = false;
+    return cycle;
+}
 static SDL_GPUTransferBuffer* tex_upload_transfer = NULL;
+/* VRAM uploads (LoadImage, a 24-bit display, a state restore) go one after
+ * another into tex_upload_transfer, which is cycled only when one does not
+ * fit: cycling it on every upload made SDL keep a VRAM-sized buffer per
+ * upload in flight (a boot's or a movie's uploads ahead of the GPU took
+ * gigabytes, and the pool never shrinks). */
+static Uint32 upload_ring_pos;
+static bool upload_ring_restart = true;
+static u8* UploadMap(Uint32 bytes, Uint32* offset) {
+    const Uint32 at = (upload_ring_pos + 511u) & ~511u;
+    const bool cycle = upload_ring_restart || at + bytes > VRAM_BYTES;
+    if (cycle)
+        RingWrapThrottle();
+    *offset = cycle ? 0 : at;
+    upload_ring_pos = *offset + bytes;
+    upload_ring_restart = false;
+    u8* map = SDL_MapGPUTransferBuffer(device, tex_upload_transfer, cycle);
+    return map ? map + *offset : NULL;
+}
 static SDL_GPUTransferBuffer* tex_download_transfer = NULL;
 static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
 /* Semi-transparent primitives read their destination pixel in the fragment
@@ -1665,6 +1720,28 @@ static SDL_GPUCommandBuffer* AcquireCmd(void) {
     return pending_cmd;
 }
 
+/* Fences waited for are released after the next submit. SDL's Metal
+ * backend frees a submitted command buffer (and drops its references to the
+ * buffers and textures it used) in a later submit, once its fence is not
+ * busy; a fence released earlier went back to the pool and that submit took
+ * it for its own command buffer, so the old one looked busy and was never
+ * freed. Each fenced submit (frames, ring wraps) leaked one, and with it
+ * every vertex buffer SDL had cycled in (gigabytes). */
+#define FENCES_TO_RELEASE 16
+static SDL_GPUFence* fences_to_release[FENCES_TO_RELEASE];
+static unsigned n_fences_to_release;
+static void ReleaseFenceAfterSubmit(SDL_GPUFence* fence) {
+    if (n_fences_to_release == FENCES_TO_RELEASE)
+        SDL_ReleaseGPUFence(device, fence);
+    else
+        fences_to_release[n_fences_to_release++] = fence;
+}
+/* After a submit (or at a retirement): the waited-for fences go. */
+static void ReleaseWaitedFences(void) {
+    for (unsigned i = 0; i < n_fences_to_release; ++i)
+        SDL_ReleaseGPUFence(device, fences_to_release[i]);
+    n_fences_to_release = 0;
+}
 static bool SubmitCmd(void) {
     if (gpu_failed) return false;
     if (pending_cmd) {
@@ -1674,9 +1751,54 @@ static bool SubmitCmd(void) {
             quarantined_cmd = cmd; /* evidence only; never dereference */
             present_commit_pending=false;return GpuFail("SDL_SubmitGPUCommandBuffer", true);
         }
+        ReleaseWaitedFences();
         RecordPresentedCommit();
     }
     return true;
+}
+/* A ring wrap (RingReserve, UploadMap) submits the work recorded so far
+ * with a fence and first waits for the fence of the wrap RING_WRAPS_IN_FLIGHT
+ * wraps before. SDL cycles a ring's buffers at a wrap while the GPU still
+ * reads them and keeps every buffer it cycled in; presents are fenced
+ * (SubmitFrame), and this bounds those buffers also while a game draws or
+ * loads without presenting. */
+#define RING_WRAPS_IN_FLIGHT 3
+static SDL_GPUFence* ring_wrap_fences[RING_WRAPS_IN_FLIGHT];
+static unsigned ring_wrap_index;
+static void RingWrapThrottle(void) {
+    if (gpu_failed || !device)
+        return;
+    SDL_GPUFence** fence = &ring_wrap_fences[ring_wrap_index];
+    if (*fence) {
+        if (!SDL_WaitForGPUFences(device, true, fence, 1)) {
+            GpuFail("ring SDL_WaitForGPUFences", true);
+            return;
+        }
+        ReleaseFenceAfterSubmit(*fence);
+        *fence = NULL;
+    }
+    if (pending_cmd) {
+        SDL_GPUCommandBuffer* cmd = pending_cmd;
+        pending_cmd = NULL;
+        *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        if (!*fence) {
+            quarantined_cmd = cmd;
+            present_commit_pending = false;
+            GpuFail("ring submit/fence", true);
+            return;
+        }
+        ReleaseWaitedFences();
+        RecordPresentedCommit();
+    }
+    ring_wrap_index = (ring_wrap_index + 1) % RING_WRAPS_IN_FLIGHT;
+}
+static void ReleaseRingFences(void) {
+    for (int i = 0; i < RING_WRAPS_IN_FLIGHT; i++) {
+        if (ring_wrap_fences[i]) {
+            SDL_ReleaseGPUFence(device, ring_wrap_fences[i]);
+            ring_wrap_fences[i] = NULL;
+        }
+    }
 }
 static bool RetireGpu(void) {
     if (gpu_retirement_uncertain) return false;
@@ -1911,12 +2033,14 @@ static void SubmitFrame(void) {
         if (!SDL_WaitForGPUFences(device, true, fence, 1)) {
             GpuFail("frame SDL_WaitForGPUFences", true); return;
         }
-        SDL_ReleaseGPUFence(device, *fence);
+        ReleaseFenceAfterSubmit(*fence);
+        *fence = NULL;
     }
     SDL_GPUCommandBuffer *cmd = pending_cmd;
     pending_cmd = NULL;
     *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!*fence) { quarantined_cmd = cmd; GpuFail("frame submit/fence", true); return; }
+    ReleaseWaitedFences();
     RecordPresentedCommit();
     frame_fence_idx = (frame_fence_idx + 1) % MAX_FRAMES_IN_FLIGHT;
 }
@@ -1938,11 +2062,12 @@ static bool SubmitCmdAndWait(void) {
     pending_cmd = NULL;
     SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence) { quarantined_cmd = cmd; return GpuFail("submit/fence", true); }
+    ReleaseWaitedFences();
     if (!SDL_WaitForGPUFences(device, true, &fence, 1)) {
         quarantined_fence = fence;
         return GpuFail("SDL_WaitForGPUFences", true);
     }
-    SDL_ReleaseGPUFence(device, fence);
+    ReleaseFenceAfterSubmit(fence);
     RecordPresentedCommit();
     return true;
 }
@@ -2255,11 +2380,13 @@ static bool CreateGpuResources(void) {
             MAX_VERTEX_COUNT * sizeof(Vertex) + MAX_INDEX_COUNT * sizeof(u16),
     };
     vtx_transfer = SDL_CreateGPUTransferBuffer(device, &vtx_transfer_info);
+    ring_restart = true;
     const SDL_GPUTransferBufferCreateInfo upload_info = {
         .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
         .size = VRAM_BYTES,
     };
     tex_upload_transfer = SDL_CreateGPUTransferBuffer(device, &upload_info);
+    upload_ring_restart = true;
     const SDL_GPUTransferBufferCreateInfo download_info = {
         .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
         .size = VRAM_BYTES,
@@ -2462,8 +2589,12 @@ bool InitPlatform() {
         return false;
     }
     INFOF("SDL_GPU with driver %s", SDL_GetGPUDeviceDriver(device));
-    command_descriptor_limit =
-        !strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") ? 1024u : 0u;
+    /* Every backend submits the frame's command buffer every 256
+     * descriptors: D3D12 needs a limit for its descriptor heaps, and on Metal
+     * one command buffer holds the memory of each of its passes until it
+     * completes (a 2x race frame of 1500 forced 16-primitive batches peaked
+     * at 1.5 GB in one command buffer a frame, 0.9 GB at 256). */
+    command_descriptor_limit = 256u;
     /* Exercise the same command boundaries with other backends in headless
      * tests. */
     const char* descriptor_limit =
@@ -2998,9 +3129,10 @@ static SDL_GPUTexture* PrepareRgb24Display(void) {
             .num_levels = 1};
         rgb24_display = SDL_CreateGPUTexture(device, &info);
     }
+    Uint32 upload_at = 0;
     u8* mapped =
         rgb24_display
-            ? SDL_MapGPUTransferBuffer(device, tex_upload_transfer, true)
+            ? UploadMap((Uint32)(display_size.x * display_size.y * 4), &upload_at)
             : NULL;
     if (!mapped) {
         free(rgb);
@@ -3017,6 +3149,7 @@ static SDL_GPUTexture* PrepareRgb24Display(void) {
         return NULL;
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureTransferInfo src = {.transfer_buffer = tex_upload_transfer,
+                                      .offset = upload_at,
                                       .pixels_per_row = display_size.x,
                                       .rows_per_layer = display_size.y};
     SDL_GPUTextureRegion dst = {.texture = rgb24_display,
@@ -3710,6 +3843,8 @@ static void QuitPlatform(void) {
     }
     if (device) {
         ReleaseFrameFences(); /* global idle already established */
+        ReleaseRingFences();
+        ReleaseWaitedFences();
 #ifdef PE_PS5_GPU_NATIVE
         Fsr1Destroy();
         MovieCleanupDestroy();
@@ -3795,6 +3930,7 @@ static void QuitPlatform(void) {
         if (vtx_transfer) {
             SDL_ReleaseGPUTransferBuffer(device, vtx_transfer);
             vtx_transfer = NULL;
+            ring_restart = true;
         }
         if (tex_upload_transfer) {
             SDL_ReleaseGPUTransferBuffer(device, tex_upload_transfer);
@@ -5803,19 +5939,22 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
         quad[i].a = 0;
     }
 
-    Vertex* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, true);
+    Uint32 clear_at, clear_index_at;
+    const bool clear_cycle = RingReserve(4, 0, &clear_at, &clear_index_at);
+    Vertex* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, clear_cycle);
     if (!map) {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
         return;
     }
-    memcpy(map, quad, sizeof(quad));
+    memcpy(map + clear_at, quad, sizeof(quad));
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
 
     cmd = ReserveDrawDescriptors(1);
     if (!cmd)
         return;
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-    const SDL_GPUTransferBufferLocation src = {.transfer_buffer = vtx_transfer};
+    const SDL_GPUTransferBufferLocation src = {
+        .transfer_buffer = vtx_transfer, .offset = clear_at * (Uint32)sizeof(Vertex)};
     const SDL_GPUBufferRegion dst = {
         .buffer = clear_vbuf, .size = sizeof(quad)};
     SDL_UploadToGPUBuffer(copy, &src, &dst, true);
@@ -5902,13 +6041,16 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
 
 /* Writes native RGB555 pixels into the GPU VRAM (and the scaled target). */
 static void UploadVram(PS1_RECT* rect, const u16* p) {
-    SDL_GPUCommandBuffer* cmd = AcquireCmd();
-    if (!cmd) {
-        return;
-    }
-    u8* map = SDL_MapGPUTransferBuffer(device, tex_upload_transfer, true);
+    /* (a wrap submits the command buffer: mapped before acquiring one) */
+    Uint32 upload_at;
+    u8* map = UploadMap((Uint32)(rect->w * rect->h * 4), &upload_at);
     if (!map) {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
+        return;
+    }
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    if (!cmd) {
+        SDL_UnmapGPUTransferBuffer(device, tex_upload_transfer);
         return;
     }
     ConvertRgb5551ToRgba8888(p, map, (size_t)rect->w * rect->h);
@@ -5917,6 +6059,7 @@ static void UploadVram(PS1_RECT* rect, const u16* p) {
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     const SDL_GPUTextureTransferInfo src = {
         .transfer_buffer = tex_upload_transfer,
+        .offset = upload_at,
         .pixels_per_row = rect->w,
         .rows_per_layer = rect->h,
     };
@@ -6344,6 +6487,9 @@ void Draw_FlushBuffer(void) {
         Draw_ResetBuffer();
         return;
     }
+    /* (a wrap submits the command buffer: reserved before acquiring one) */
+    Uint32 vertex_at, index_at;
+    const bool cycle = RingReserve((Uint32)n_vertices, (Uint32)n_indices, &vertex_at, &index_at);
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
 #ifdef PE_PS5_GPU_NATIVE
@@ -6353,7 +6499,7 @@ void Draw_FlushBuffer(void) {
         return;
     }
 
-    u8* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, true);
+    u8* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, cycle);
     if (!map) {
         ERRORF("SDL_MapGPUTransferBuffer: %s", SDL_GetError());
 #ifdef PE_PS5_GPU_NATIVE
@@ -6364,20 +6510,25 @@ void Draw_FlushBuffer(void) {
     }
     const Uint32 vtx_size = (Uint32)(sizeof(Vertex) * n_vertices);
     const Uint32 idx_size = (Uint32)(sizeof(*index_buf) * n_indices);
-    const Uint32 idx_offset = MAX_VERTEX_COUNT * sizeof(Vertex);
-    memcpy(map, vertex_buf, vtx_size);
+    const Uint32 vtx_offset = vertex_at * (Uint32)sizeof(Vertex);
+    const Uint32 ibuf_offset = index_at * (Uint32)sizeof(*index_buf);
+    const Uint32 idx_offset = MAX_VERTEX_COUNT * (Uint32)sizeof(Vertex) + ibuf_offset;
+    memcpy(map + vtx_offset, vertex_buf, vtx_size);
     memcpy(map + idx_offset, index_buf, idx_size);
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
 
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     const SDL_GPUTransferBufferLocation vtx_src = {
-        .transfer_buffer = vtx_transfer};
-    const SDL_GPUBufferRegion vtx_dst = {.buffer = vbuf, .size = vtx_size};
-    SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, true);
+        .transfer_buffer = vtx_transfer, .offset = vtx_offset};
+    const SDL_GPUBufferRegion vtx_dst = {.buffer = vbuf, .offset = vtx_offset, .size = vtx_size};
+    const bool buffers_cycle = RingCycleBuffers();
+    SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, buffers_cycle);
     const SDL_GPUTransferBufferLocation idx_src = {
         .transfer_buffer = vtx_transfer, .offset = idx_offset};
-    const SDL_GPUBufferRegion idx_dst = {.buffer = ibuf, .size = idx_size};
-    SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, true);
+    const SDL_GPUBufferRegion idx_dst = {.buffer = ibuf, .offset = ibuf_offset, .size = idx_size};
+    SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, buffers_cycle);
+    /* the vertices the target being drawn reads (the midpoint's own) */
+    Uint32 target_vtx_offset = vtx_offset;
     if (batch_has_texture && vram_dirty.w > 0 && vram_dirty.h > 0) {
         const SDL_GPUTextureLocation vram_src = {.texture = vram_render,
                                                  .x = (Uint32)vram_dirty.x,
@@ -6409,13 +6560,17 @@ void Draw_FlushBuffer(void) {
         bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
         SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
         if(midpoint){
-            u8 *mid_map=SDL_MapGPUTransferBuffer(device,vtx_transfer,true);
+            Uint32 mid_at,mid_index_at;const bool mid_cycle=RingReserve((Uint32)n_vertices,0,&mid_at,&mid_index_at);
+            u8 *mid_map=SDL_MapGPUTransferBuffer(device,vtx_transfer,mid_cycle);
             if(!mid_map){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation transfer map",false);goto abort_flush;}
-            memcpy(mid_map,interpolated_vertices,vtx_size);SDL_UnmapGPUTransferBuffer(device,vtx_transfer);
+            target_vtx_offset=mid_at*(Uint32)sizeof(Vertex);
+            memcpy(mid_map+target_vtx_offset,interpolated_vertices,vtx_size);SDL_UnmapGPUTransferBuffer(device,vtx_transfer);
             cmd=AcquireCmd();if(!cmd){interp_pair_ready=false;interp_matches=0;goto abort_flush;}
             SDL_GPUCopyPass *mid_copy=SDL_BeginGPUCopyPass(cmd);
             if(!mid_copy){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation copy pass",false);goto abort_flush;}
-            SDL_UploadToGPUBuffer(mid_copy,&vtx_src,&vtx_dst,true);SDL_EndGPUCopyPass(mid_copy);
+            const SDL_GPUTransferBufferLocation mid_src={.transfer_buffer=vtx_transfer,.offset=target_vtx_offset};
+            const SDL_GPUBufferRegion mid_dst={.buffer=vbuf,.offset=target_vtx_offset,.size=vtx_size};
+            SDL_UploadToGPUBuffer(mid_copy,&mid_src,&mid_dst,RingCycleBuffers());SDL_EndGPUCopyPass(mid_copy);
         }
         unsigned target_scale = target_index ? internal_res : 1;
         for (int k = 0; k < n_marks; ++k) {
@@ -6533,9 +6688,9 @@ void Draw_FlushBuffer(void) {
             ++frame_stats_batches;
             SDL_GPURenderPass* pass =
                 SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
-            const SDL_GPUBufferBinding vb = {.buffer = vbuf};
+            const SDL_GPUBufferBinding vb = {.buffer = vbuf, .offset = target_vtx_offset};
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
-            const SDL_GPUBufferBinding ib = {.buffer = ibuf};
+            const SDL_GPUBufferBinding ib = {.buffer = ibuf, .offset = ibuf_offset};
             SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
             const SDL_GPUTextureSamplerBinding sampler_binding[4] = {
                 {.texture=vram_sample,.sampler=vram_sampler},
@@ -6635,11 +6790,11 @@ int Psyz_StateGpuRestore(const unsigned char *in,size_t bytes){
      * if a subsequent transfer fails, so rollback cannot show old midpoint pixels. */
     Psyz_GpuResetInterpolation();
     clut_cache_reg=0xFFFFFFFFu;clut_cache_8bit=false; /* the restored VRAM's CLUTs */
-    u8 *map=SDL_MapGPUTransferBuffer(device,tex_upload_transfer,true);if(!map)return 0;
+    Uint32 upload_at;u8 *map=UploadMap((Uint32)bytes,&upload_at);if(!map)return 0;
     memcpy(map,in,bytes);SDL_UnmapGPUTransferBuffer(device,tex_upload_transfer);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();if(!cmd)return 0;
     SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);if(!copy)return 0;
-    const SDL_GPUTextureTransferInfo src={.transfer_buffer=tex_upload_transfer,.pixels_per_row=VRAM_W,.rows_per_layer=VRAM_H};
+    const SDL_GPUTextureTransferInfo src={.transfer_buffer=tex_upload_transfer,.offset=upload_at,.pixels_per_row=VRAM_W,.rows_per_layer=VRAM_H};
     const SDL_GPUTextureRegion dst={.texture=vram_render,.w=VRAM_W,.h=VRAM_H,.d=1};
     SDL_UploadToGPUTexture(copy,&src,&dst,false);SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){0,0,VRAM_W,VRAM_H});
