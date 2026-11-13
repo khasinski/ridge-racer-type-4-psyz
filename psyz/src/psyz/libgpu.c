@@ -1,8 +1,5 @@
 #include <psyz/gpu.h>
 #include <psyz.h>
-#ifdef PE_PS5_GPU_NATIVE
-#include <psyz/video.h>
-#endif
 #include <libgpu.h>
 #include <psyz/gte.h>
 #include <psyz/gpu.h>
@@ -400,15 +397,8 @@ int Psyz_GpuExeque() {
         DispatchPackets(queue_buf, queue_len);
         Draw_FlushBuffer();
     }
-    int sync_result=Draw_ExequeSync();
+    Draw_ExequeSync();
     queue_len = 0;
-#ifdef PE_PS5_GPU_NATIVE
-    /* Original OT admission may already have drained complete chunks.
-     * Even an empty remaining queue is now fully consumed, never a GPU fence. */
-    Psyz_VideoMovieQueueConsumed(sync_result==0);
-#else
-    (void)sync_result;
-#endif
     return queue_len;
 }
 

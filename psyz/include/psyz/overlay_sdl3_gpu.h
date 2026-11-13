@@ -15,11 +15,6 @@ const char *Psyz_GpuFirstError(void);
 int Psyz_GpuRetirementUncertain(void);
 /* One bounded diagnostic on the next prepared viewport; no rendering policy change. */
 void Psyz_GpuTraceAspectOnce(const char *phase);
-/* Optional native FSR1, default off. Strength stops0(strong)..2(soft).
- * Status0 off,1 bypassed,2 EASU+RCAS recorded,3 original fallback. */
-void Psyz_VideoSetFsr1(int enabled,int sharpness);
-int Psyz_VideoGetFsr1Status(void);
-void Psyz_VideoSetMovieBlur(int enabled);
 
 // Called once after SDL3/SDL_GPU initialization completes.
 // Use this to initialize overlay backends (e.g., ImGui_ImplSDLGPU3_Init).

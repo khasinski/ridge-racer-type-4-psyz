@@ -532,27 +532,6 @@ unsigned char* Psyz_VideoAllocVramDump(int* w, int* h);
  */
 unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h);
 
-/* Native application-owned teardown runs after GPU retirement, before SDL teardown. */
-#ifdef PE_PS5_GPU_NATIVE
-void Psyz_VideoSetShutdownCallback(void (*callback)(void));
-void Psyz_VideoShutdown(void);
-#endif
-
-/* Native movie policy:0Stretch16:9,1Aspect+blur,2Originalbars. */
-void Psyz_VideoSetMoviePresentation(int mode);
-/* Native final gameplay presentation only; does not change scene geometry. */
-void Psyz_VideoSetGameplayFill(int enabled);
-/* Explicit original video-player lifecycle: RGB15 and RGB24 movies. */
-void Psyz_VideoSetMovieActive(int active);
-#ifdef PE_PS5_GPU_NATIVE
-/* Restore is complete only after actual display-env + accepted/consumed source OT. */
-void Psyz_VideoMovieRestoreReady(void);
-void Psyz_VideoMovieDisplayEnvSubmitted(void);
-void Psyz_VideoMovieFrameQueued(int accepted);
-void Psyz_VideoMovieQueueConsumed(int success);
-#endif
-/* Optional native spatial cleanup:0Original,1Gentle,2Stronger. */
-void Psyz_VideoSetMovieCleanup(int mode);
 /* Optional original 2D SPRT palette filtering; no replacement art. */
 int Psyz_VideoSetSpriteFiltering(int enabled);
 int Psyz_VideoGetSpriteFiltering(void);

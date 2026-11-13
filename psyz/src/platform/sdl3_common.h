@@ -226,10 +226,6 @@ int Psyz_VideoSetAspectMode(PsyzAspectMode mode) {
     if (mode != PSYZ_ASPECT_DISPLAY && mode != PSYZ_ASPECT_SQUARE) {
         return -1;
     }
-#ifdef PE_PS5_GPU_NATIVE
-    /* Finish queued vertices with their old aspect-dependent draw contract. */
-    if(aspect_mode!=mode)Draw_FlushBuffer();
-#endif
     aspect_mode = mode;
     return 0;
 }
@@ -1114,10 +1110,6 @@ int Psyz_SetGamepadBinding_SDL3(unsigned button, int binding) {
 static unsigned int PadRead_Gamepad(struct Gamepad* g) {
     if (!g || !g->dev)
         return 0;
-#ifdef PE_PS5_PLUGINS
-    extern int pe_ps5_mods_capture_pad(SDL_Gamepad *);
-    if (pe_ps5_mods_capture_pad(g->dev)) return 0;
-#endif
     unsigned int result = 0;
     for (unsigned i = 0; i < 16; ++i) {
         int binding = gamepad_p1[i];
@@ -1235,10 +1227,6 @@ static void BuildPadFrame(int port, PsyzControllerKind kind, char* buf) {
         in.buttons = SinglePadRead(port);
         if (gamepads[port].dev) {
             SDL_Gamepad* d = gamepads[port].dev;
-#ifdef PE_PS5_PLUGINS
-            extern int pe_ps5_mods_capture_pad(SDL_Gamepad *);
-            if (!pe_ps5_mods_capture_pad(d)) {
-#endif
             short lx = SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFTX);
             in.right_x = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTX));
             in.right_y = AxisToByte(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHTY));
@@ -1249,9 +1237,6 @@ static void BuildPadFrame(int port, PsyzControllerKind kind, char* buf) {
             in.steering = AxisToUnit(lx);
             in.pedal[0] = AxisToUnit(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
             in.pedal[1] = AxisToUnit(SDL_GetGamepadAxis(d, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
-#ifdef PE_PS5_PLUGINS
-            }
-#endif
         }
         Psyz_PadsBuildFrame(port, kind, &in, buf);
         UpdateRumble(port);
@@ -1475,15 +1460,7 @@ static void PollEvents(void) {
         }
     }
 #ifndef PLATFORM_IOS
-    if (Psyz_QuitRequested()
-#ifdef PE_PS5_GPU_NATIVE
-        && !native_quit_in_progress
-#endif
-    ) {
-#ifdef PE_PS5_GPU_NATIVE
-        native_quit_in_progress=true;
-        SDL_Log("[Native quit] stage=event-request");
-#endif
+    if (Psyz_QuitRequested()) {
         QuitPlatform();
         exit(0);
     }
