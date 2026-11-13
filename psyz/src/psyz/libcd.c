@@ -1062,6 +1062,40 @@ static int read_raw_sector(int sector, u_char* out) {
     return result;
 }
 
+int Psyz_CdReadImageSector(const char* cue_path, int lba, void* out) {
+    // The image is parsed into the drive's track table, which is restored
+    // afterwards; the audio lock keeps the mixer off it meanwhile.
+    static TrackEntry saved_tracks[MAX_TRACKS];
+    static char saved_base[MAX_PATH_LEN];
+    int saved_count, result = -1;
+    FILE* saved_file;
+    const TrackEntry* saved_file_track;
+
+    if (!cue_path || !out || lba < 0) {
+        return -1;
+    }
+    Psyz_AudioLock();
+    memcpy(saved_tracks, g_tracks, sizeof(g_tracks));
+    memcpy(saved_base, g_cue_base_path, sizeof(g_cue_base_path));
+    saved_count = g_track_count;
+    saved_file = track_file;
+    saved_file_track = track_file_track;
+    track_file = NULL;
+    track_file_track = NULL;
+    memset(g_tracks, 0, sizeof(g_tracks));
+    if (parse_cue_file(cue_path) == 0) {
+        result = read_sector_unlocked(lba, out);
+    }
+    close_track_file();
+    memcpy(g_tracks, saved_tracks, sizeof(g_tracks));
+    memcpy(g_cue_base_path, saved_base, sizeof(g_cue_base_path));
+    g_track_count = saved_count;
+    track_file = saved_file;
+    track_file_track = saved_file_track;
+    Psyz_AudioUnlock();
+    return result;
+}
+
 static int read_data_sector_into(int sector, u_char* out);
 static uint64_t drive_start_us; // sector n (from 1) arrives n periods later
 static uint64_t drive_delivered;

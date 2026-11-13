@@ -321,17 +321,11 @@ long _card_load(long chan) {
 }
 
 void _bu_init(void) {
-#ifdef PE_PS5
+    // The card directories, where the host keeps them (Psyz_AdjustPathCB;
+    // by default bu00 and bu10 in the working directory), are created here.
     char path[4096];
     Psyz_AdjustPath(path, "bu00:*", sizeof(path));
     Psyz_AdjustPath(path, "bu10:*", sizeof(path));
-#elif defined(_WIN32)
-    _mkdir("bu00");
-    _mkdir("bu10");
-#else
-    mkdir("bu00", 0755);
-    mkdir("bu10", 0755);
-#endif
     if (card_is_instant() || !card_drv.running) {
         return;
     }

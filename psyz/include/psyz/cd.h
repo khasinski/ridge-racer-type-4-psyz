@@ -37,6 +37,23 @@ typedef int (*PsyzCdReadCB)(struct PsyzCdRead* read);
 int Psyz_CdSetDiskPath(const char* diskPath);
 
 /**
+ * @brief Read one raw sector of a CUE image without mounting it
+ *
+ * Parses the CUE sheet and reads the 2352-byte sector at the absolute
+ * sector number lba (0 is the first sector of track 1; ISO 9660's volume
+ * descriptor is at 16). The mounted disc, the drive's position and its
+ * timing are left as they were, so a host can check an image (its
+ * SYSTEM.CNF, say) before or while another one is in the drive.
+ *
+ * @param cue_path Path to the CUE file (UTF-8)
+ * @param lba Absolute sector number
+ * @param out Receives the 2352 bytes of the sector
+ * @return 0 on success, -1 if the CUE does not parse or the sector cannot be
+ *         read
+ */
+int Psyz_CdReadImageSector(const char* cue_path, int lba, void* out);
+
+/**
  * @brief Simulate CD-ROM drive shell (lid) opening or closing
  *
  * @param is_open Non-zero to open the shell, zero to close it
