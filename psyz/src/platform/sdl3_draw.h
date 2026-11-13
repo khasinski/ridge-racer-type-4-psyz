@@ -64,7 +64,9 @@ static void InterpEnqueued(void);
     SET_TC(p, t, c)                                                            \
     SET_TC(&(p)[1], t, c) SET_TC(&(p)[2], t, c) SET_TC(&(p)[3], t, c)
 
+#ifndef MAX_VERTEX_COUNT
 #define MAX_VERTEX_COUNT 4096
+#endif
 #define MAX_INDEX_COUNT (MAX_VERTEX_COUNT / 4 * 6)
 
 #define SEMITRANSP 0x02

@@ -33,6 +33,11 @@ static const void *interpolation_packet_current;
  * offset) are recorded as marks instead of flushing (Draw_FlushBuffer). */
 #define DRAW_STATE_MARKS 1
 static void DrawStateChanging(void);
+/* A batch holds a race frame's geometry: a midpoint vertex placed by its
+ * neighbours (InterpFinishPending, InterpFinishLines, InterpSnapJunctions)
+ * sees only those queued before the flush (a ghost tile's neighbour queued
+ * after it left a crack), and a line's pixel runs take four vertices each. */
+#define MAX_VERTEX_COUNT 65532
 #include "sdl3_draw.h"
 
 #if defined(_WIN32)
@@ -342,6 +347,7 @@ static unsigned short interp_ghost_cover[VRAM_H/INTERP_COVER_CELL][VRAM_W/INTERP
 static const unsigned short *interp_capture_index;
 static unsigned interp_capture_indices;
 static bool InterpGhostCovers(float (*pos)[3],unsigned count);
+static bool InterpGhostCoversLine(float (*pos)[3],int count);
 static void InterpStore(InterpPair *p,unsigned pair,const Vertex *v,unsigned count);
 static void InterpBuildGhosts(void);
 /* The triangles (bits) of the polygon being queued that the GPU skips for
@@ -362,7 +368,7 @@ static int InterpOffsetY(void);
  * not know how the view moved this frame, and a new identity's pose in
  * this frame is not where its neighbours are in the midpoint. Entries are
  * hashed by cells of their pose. */
-#define INTERP_FIELD 16384u
+#define INTERP_FIELD 65536u
 #define INTERP_FIELD_CELL 16
 #define INTERP_FIELD_REACH 24.0f
 #define INTERP_FIELD_CELLS 4096u
@@ -376,14 +382,16 @@ static unsigned InterpFieldCell(int cx,int cy,int ox,int oy) {
     uint32_t h=(uint32_t)cx*0x9E3779B1u^(uint32_t)cy*0x85EBCA77u^(uint32_t)(ox*977+oy)*0xC2B2AE3Du;
     return (h^h>>16)&(INTERP_FIELD_CELLS-1);
 }
-static void InterpFieldAdd(unsigned which,const float *from,float depth,int ox,int oy,const float *to) {
+/* Returns the entry (1-based), 0 for none. */
+static unsigned InterpFieldAdd(unsigned which,const float *from,float depth,int ox,int oy,const float *to) {
     InterpField *f=&interp_field[which];
     if(f->frame!=interp_frame){f->frame=interp_frame;f->len=0;}
-    if(f->len>=INTERP_FIELD||!(SDL_fabsf(from[0])<2048.0f&&SDL_fabsf(from[1])<2048.0f))return;
+    if(f->len>=INTERP_FIELD||!(SDL_fabsf(from[0])<2048.0f&&SDL_fabsf(from[1])<2048.0f))return 0;
     const unsigned c=InterpFieldCell((int)SDL_floorf(from[0]/INTERP_FIELD_CELL),(int)SDL_floorf(from[1]/INTERP_FIELD_CELL),ox,oy);
     if(f->stamp[c]!=interp_frame){f->stamp[c]=interp_frame;f->head[c]=0;}
     f->entry[f->len]=(InterpFieldEntry){from[0],from[1],depth,to[0]-from[0],to[1]-from[1],(short)ox,(short)oy,f->head[c]};
     f->head[c]=++f->len;
+    return f->len;
 }
 /* The motion of the nearest entry within reach at a like depth (depth 0:
  * any), its squared distance at *distance; false for none. */
@@ -409,7 +417,7 @@ static void InterpExposeViewNow(InterpExposeView *view);
 /* Ghosts (field 0) and new identities (field 1) queued since the last
  * flush: their midpoint pose is final once the primitives queued with them
  * are (Draw_FlushBuffer). from: the pose they move from. */
-#define INTERP_PENDING 2048u
+#define INTERP_PENDING 16384u
 typedef struct {
     unsigned pair, base;
     unsigned char which, count, indices, index[6];
@@ -431,6 +439,42 @@ static bool InterpPend(unsigned which,unsigned pair,unsigned base,unsigned count
     return true;
 }
 static void InterpFinishPending(void);
+/* T-junctions: a vertex of one paired primitive that lies on an edge of
+ * another (inside it, not at its ends) in both frames, a piece of a finer
+ * subdivision meeting a coarser one. Each frame keeps it on that edge (up
+ * to the GTE's rounding), but the view-space midpoints of the vertex and of
+ * the edge's ends need not stay collinear (the depth weighting of a vertex
+ * near the view, a midpoint-only pose nearer than the projection plane),
+ * and the crack shows what lies behind. The edges of this frame's paired
+ * primitives are kept by their pose in the frame before (cells of it); at
+ * each flush the queued paired vertices that lie on one in both frames, to
+ * the projection's precision (INTERP_JUNCTION_PRECISE with PGXP, else
+ * _PIXELS; with a pose in the frame before only, plus _SLOPE of the
+ * edge's length), go onto its midpoint
+ * (InterpSnapJunctions), by at most INTERP_JUNCTION_MOVE pixels. */
+#define INTERP_EDGES 65536u
+#define INTERP_EDGE_REFS 262144u
+#define INTERP_EDGE_CELL 16
+#define INTERP_EDGE_CELLS 4096u
+#define INTERP_JUNCTION_REACH 2.0f
+#define INTERP_JUNCTION_PRECISE 0.25f
+#define INTERP_JUNCTION_PIXELS 0.75f
+#define INTERP_JUNCTION_SLOPE 0.004f
+#define INTERP_JUNCTION_MOVE 6.0f
+typedef struct { float a0[2], b0[2], a1[2], b1[2], am[2], bm[2], da, db; unsigned pair; short ox, oy; bool posed; } InterpEdge;
+typedef struct { unsigned edge, next; } InterpEdgeRef;
+static InterpEdge interp_edges[INTERP_EDGES];
+static InterpEdgeRef interp_edge_refs[INTERP_EDGE_REFS];
+static unsigned interp_edges_len,interp_edge_refs_len,interp_edges_frame;
+static unsigned interp_edge_head[INTERP_EDGE_CELLS],interp_edge_stamp[INTERP_EDGE_CELLS];
+/* the paired primitives queued since the last flush */
+#define INTERP_JUNCTION_PRIMS 16384u
+typedef struct { unsigned pair, base, field[2][6]; unsigned char count; short ox, oy; bool posed; float p0[6][2], p1[6][2], d0[6]; } InterpJunctionPrim;
+static InterpJunctionPrim interp_junction_prims[INTERP_JUNCTION_PRIMS];
+static unsigned interp_junction_prims_len;
+static void InterpSnapJunctions(void);
+static void InterpAddEdge(const float *a0,const float *b0,const float *a1,const float *b1,const float *am,const float *bm,
+                          float da,float db,unsigned pair,int ox,int oy,bool posed);
 /* Exposure: what the midpoint shows where both frames show something
  * nearer. Each frame's opaque primitives and the midpoint's are rasterized
  * at cell centres into depth grids (the nearest view depth, 0 for 2D),
@@ -739,6 +783,26 @@ void Psyz_GpuPrepareInterpolatedBlank(int next_y) {
 /* Drawing the runs of a line (Draw_PushPrim): see InterpCapture. */
 static int interp_line_mode;
 #define INTERP_LINE_POINTS 6
+/* Outlines (lines along a tile's edges) are drawn at whole pixels next to
+ * the projection of the polygons they outline, and behind them, so those
+ * are queued after the line. A tagged line is drawn into the midpoint as a
+ * quad per segment and placed at the flush (InterpFinishLines): its points
+ * go where the polygon vertices they lie at (within INTERP_LINE_REACH
+ * pixels) went, found by the frame before's pose for a paired line and by
+ * this frame's for a new one (an outline's identity counts its place in
+ * the tile, which shifts as outlines are left out). */
+#define INTERP_LINE_REACH 2.0f
+#define INTERP_LINE_PENDING 4096u
+typedef struct {
+    unsigned start, end;
+    unsigned char which, count;
+    short ox, oy;
+    float from[INTERP_LINE_POINTS][2], want[INTERP_LINE_POINTS][2], at[INTERP_LINE_POINTS][2];
+} InterpLinePending;
+static InterpLinePending interp_line_pending[INTERP_LINE_PENDING];
+static unsigned interp_line_pending_len;
+/* the entry of the line being drawn, or -1 */
+static int interp_line_pend = -1;
 /* A line packet tagged for interpolation: records its points and, when the
  * previous frame drew the same identity with as many points, returns the
  * midpoint points (VRAM pixels relative to the drawing offset). A midpoint-
@@ -773,11 +837,29 @@ static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int
     if(!*own&&(p->midpoint_pose||(e->flags&PSYZ_INTERP_NO_POSE)))valid=false;
     const bool extrapolated=!valid&&!*own&&p->frame&&p->frame+1==interp_frame&&p->count==points&&
         !p->midpoint_pose&&p->motion_frame==p->frame;
+    /* a new line where ghosts go: the outline of the other representation
+     * of what the ghost draws (InterpGhostCovers) */
+    if(!valid&&!extrapolated&&*own&&!(p->frame&&p->frame+1==interp_frame)&&InterpGhostCoversLine(position,count))*own_only=true;
+    /* a new line (or one whose points changed) is placed as its neighbours
+     * are, from this frame's pose (InterpFinishLines) */
+    const bool newcomer=!valid&&!extrapolated&&*own&&!*own_only;
+    interp_line_pend=-1;
+    if((valid||newcomer)&&interp_line_pending_len<INTERP_LINE_PENDING){
+        InterpLinePending *q=&interp_line_pending[interp_line_pending_len];
+        q->which=valid?0:1;q->count=(unsigned char)count;q->ox=(short)InterpOffsetX();q->oy=(short)InterpOffsetY();q->start=q->end=0;
+        for(int i=0;i<count;i++){
+            q->from[i][0]=valid?p->position[i][0]:position[i][0];q->from[i][1]=valid?p->position[i][1]:position[i][1];
+            q->want[i][0]=valid?(position[i][0]+p->position[i][0])*0.5f:position[i][0];
+            q->want[i][1]=valid?(position[i][1]+p->position[i][1])*0.5f:position[i][1];}
+        interp_line_pend=(int)interp_line_pending_len;
+    }
     for(int i=0;i<count;i++){
         if(valid){mid_x[i]=(int)SDL_floorf((position[i][0]+p->position[i][0])*0.5f+0.5f);
                   mid_y[i]=(int)SDL_floorf((position[i][1]+p->position[i][1])*0.5f+0.5f);}
         else if(extrapolated){mid_x[i]=(int)SDL_floorf(p->position[i][0]+p->motion[i][0]*0.5f+0.5f);
                   mid_y[i]=(int)SDL_floorf(p->position[i][1]+p->motion[i][1]*0.5f+0.5f);}
+        else{mid_x[i]=(int)position[i][0];mid_y[i]=(int)position[i][1];}
+        if(interp_line_pend>=0){interp_line_pending[interp_line_pend].at[i][0]=(float)mid_x[i];interp_line_pending[interp_line_pend].at[i][1]=(float)mid_y[i];}
     }
     if(valid&&*own){for(int i=0;i<count;i++){p->motion[i][0]=position[i][0]-p->position[i][0];p->motion[i][1]=position[i][1]-p->position[i][1];}
         p->motion_frame=interp_frame;}
@@ -785,7 +867,7 @@ static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int
     memcpy(p->position,position,(size_t)count*sizeof(position[0]));p->frame=interp_frame;p->count=points;p->signature=0;
     p->midpoint_pose=!*own;
     if(valid||extrapolated){++interp_stat[2];++interp_matches;}
-    return (valid||extrapolated)&&!*own_only;
+    return (valid||extrapolated||newcomer)&&!*own_only;
 }
 static void InterpProbe(const void *packet,const Vertex *v,const Vertex *mid,unsigned count,const char *what);
 static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count);
@@ -940,9 +1022,26 @@ static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
         else if(extrapolated||(valid&&p->depth[i]>0.0f))interp_mid_depth[offset+i]=p->depth[i];
         if(valid||extrapolated){p->out[i][0]=out->pgxp_pos[0];p->out[i][1]=out->pgxp_pos[1];p->out[i][2]=out->pgxp_pos[2];p->out_mode=1;}
     }
+    unsigned field[2][6]={{0}};
     if(valid&&!frame_only)for(unsigned i=0;i<count;++i){
-        InterpFieldAdd(0,p->position[i],p->depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);
-        InterpFieldAdd(1,position[i],depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);}
+        field[0][i]=InterpFieldAdd(0,p->position[i],p->depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);
+        field[1][i]=InterpFieldAdd(1,position[i],depth[i],InterpOffsetX(),InterpOffsetY(),interpolated_vertices[offset+i].pgxp_pos);}
+    /* T-junction edges and vertices (InterpSnapJunctions) */
+    if(valid&&!frame_only&&(count==3||count==6)){
+        const int ox=InterpOffsetX(),oy=InterpOffsetY();
+        /* the polygon's triangles (t: vertices 3t..3t+2), also one the GPU
+         * skips for its size (its indices are collapsed) */
+        for(unsigned t=0;t<count;t+=3)for(unsigned k=0;k<3;++k){
+            const unsigned a=t+k,b=t+(k+1)%3;
+            InterpAddEdge(p->position[a],p->position[b],position[a],position[b],interpolated_vertices[offset+a].pgxp_pos,
+                          interpolated_vertices[offset+b].pgxp_pos,p->depth[a],p->depth[b],e->pair,ox,oy,!midpoint_only);
+        }
+        if(interp_junction_prims_len<INTERP_JUNCTION_PRIMS){InterpJunctionPrim *q=&interp_junction_prims[interp_junction_prims_len++];
+            q->pair=e->pair;q->base=offset;q->count=(unsigned char)count;q->ox=(short)ox;q->oy=(short)oy;q->posed=!midpoint_only;
+            for(unsigned i=0;i<count;++i){q->p0[i][0]=p->position[i][0];q->p0[i][1]=p->position[i][1];
+                q->p1[i][0]=position[i][0];q->p1[i][1]=position[i][1];q->d0[i]=p->depth[i];
+                q->field[0][i]=field[0][i];q->field[1][i]=field[1][i];}}
+    }
     /* A new identity, and one whose pose this frame is none (it continues
      * its last motion): placed as their neighbours are in the midpoint
      * (InterpFinishPending), from this frame's pose or the last one. */
@@ -1076,6 +1175,24 @@ static bool InterpGhostCovers(float (*pos)[3],unsigned count) {
             ++samples;
             if(x>=0&&y>=0&&x<VRAM_W/INTERP_COVER_CELL&&y<VRAM_H/INTERP_COVER_CELL&&interp_ghost_cover[y][x]==stamp)++covered;
         }
+    }
+    return covered*4>=samples*3;
+}
+/* Most of a line's points and segment middles lie where ghosts go. */
+static bool InterpGhostCoversLine(float (*pos)[3],int count) {
+    if(!InterpGhostEnabled()||interp_ghost_cut||count<2)return false;
+    const unsigned short stamp=InterpCoverStamp();
+    unsigned samples=0,covered=0;
+    for(int i=0;i<count;++i)for(unsigned h=0;h<(i+1<count?2u:1u);++h){
+        const float x=h?(pos[i][0]+pos[i+1][0])*0.5f:pos[i][0],y=h?(pos[i][1]+pos[i+1][1])*0.5f:pos[i][1];
+        const int cx=(int)SDL_floorf((x+draw_offset.x-draw_area_start.x)/INTERP_COVER_CELL);
+        const int cy=(int)SDL_floorf((y+draw_offset.y-draw_area_start.y)/INTERP_COVER_CELL);
+        ++samples;
+        /* an outline lies on the ghost's edge: a cell next to it counts */
+        bool near=false;
+        for(int dy=-1;dy<=1&&!near;++dy)for(int dx=-1;dx<=1&&!near;++dx){const int u=cx+dx,w=cy+dy;
+            near=u>=0&&w>=0&&u<VRAM_W/INTERP_COVER_CELL&&w<VRAM_H/INTERP_COVER_CELL&&interp_ghost_cover[w][u]==stamp;}
+        covered+=near;
     }
     return covered*4>=samples*3;
 }
@@ -4566,6 +4683,84 @@ static void InterpInjectGhosts(unsigned h) {
         if(probe){interp_probe_pair=(unsigned)(g-interp_pairs);interp_probe_flags=0;InterpProbe(NULL,&vertex_buf[base],&interpolated_vertices[base],n,"ghost");}
     }
 }
+static unsigned InterpEdgeCell(int cx,int cy,int ox,int oy) {
+    uint32_t h=(uint32_t)cx*0x9E3779B1u^(uint32_t)cy*0x85EBCA77u^(uint32_t)(ox*977+oy)*0xC2B2AE3Du;
+    return (h^h>>16)&(INTERP_EDGE_CELLS-1);
+}
+static void InterpAddEdge(const float *a0,const float *b0,const float *a1,const float *b1,const float *am,const float *bm,
+                          float da,float db,unsigned pair,int ox,int oy,bool posed) {
+    if(interp_edges_frame!=interp_frame){interp_edges_frame=interp_frame;interp_edges_len=interp_edge_refs_len=0;}
+    const float lx=SDL_min(a0[0],b0[0]),hx=SDL_max(a0[0],b0[0]),ly=SDL_min(a0[1],b0[1]),hy=SDL_max(a0[1],b0[1]);
+    if(interp_edges_len>=INTERP_EDGES||!(lx>-2048.0f&&hx<2048.0f&&ly>-2048.0f&&hy<2048.0f))return;
+    const int x0=(int)SDL_floorf((lx-INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL),x1=(int)SDL_floorf((hx+INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL);
+    const int y0=(int)SDL_floorf((ly-INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL),y1=(int)SDL_floorf((hy+INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL);
+    if((x1-x0+1)*(y1-y0+1)>96||interp_edge_refs_len+(unsigned)((x1-x0+1)*(y1-y0+1))>INTERP_EDGE_REFS)return;
+    const unsigned e=interp_edges_len++;
+    InterpEdge *g=&interp_edges[e];
+    memcpy(g->a0,a0,sizeof(g->a0));memcpy(g->b0,b0,sizeof(g->b0));memcpy(g->a1,a1,sizeof(g->a1));memcpy(g->b1,b1,sizeof(g->b1));
+    memcpy(g->am,am,sizeof(g->am));memcpy(g->bm,bm,sizeof(g->bm));g->da=da;g->db=db;g->pair=pair;g->ox=(short)ox;g->oy=(short)oy;g->posed=posed;
+    for(int y=y0;y<=y1;++y)for(int x=x0;x<=x1;++x){const unsigned c=InterpEdgeCell(x,y,ox,oy);
+        if(interp_edge_stamp[c]!=interp_frame){interp_edge_stamp[c]=interp_frame;interp_edge_head[c]=0;}
+        interp_edge_refs[interp_edge_refs_len]=(InterpEdgeRef){e,interp_edge_head[c]};interp_edge_head[c]=++interp_edge_refs_len;}
+}
+/* Where p lies along segment a-b (0..1) and how far from its line. */
+static float InterpAlong(const float *p,const float *a,const float *b,float *distance) {
+    const float dx=b[0]-a[0],dy=b[1]-a[1],l2=dx*dx+dy*dy;
+    if(!(l2>1.0f)){*distance=1e9f;return -1.0f;}
+    const float t=((p[0]-a[0])*dx+(p[1]-a[1])*dy)/l2;
+    *distance=SDL_fabsf((p[0]-a[0])*dy-(p[1]-a[1])*dx)/SDL_sqrtf(l2);
+    return t;
+}
+/* Draw_FlushBuffer: queued paired vertices that lie on another paired
+ * primitive's edge in both frames go onto the edge's midpoint. */
+static void InterpSnapJunctions(void) {
+    const unsigned n=interp_junction_prims_len;interp_junction_prims_len=0;
+    static int snap=-1;
+    if(snap<0){const char *e=SDL_getenv("PSYZ_INTERP_JUNCTIONS");snap=!(e&&*e=='0');}
+    if(!snap||interp_edges_frame!=interp_frame)return;
+    /* how far off the edge a vertex on it lies: the projection's precision
+     * (PGXP, or whole pixels); a vertex farther off belongs to another
+     * surface next to the edge (the faces of a thin beam) */
+    const float reach=(geometry_correction||effect_geometry_correction)&&internal_res>1?INTERP_JUNCTION_PRECISE:INTERP_JUNCTION_PIXELS;
+    for(unsigned k=0;k<n;++k){const InterpJunctionPrim *q=&interp_junction_prims[k];
+        for(unsigned i=0;i<q->count;++i){
+            const float *v0=q->p0[i],*v1=q->p1[i];
+            const int cx=(int)SDL_floorf(v0[0]/INTERP_EDGE_CELL),cy=(int)SDL_floorf(v0[1]/INTERP_EDGE_CELL);
+            const unsigned c=InterpEdgeCell(cx,cy,q->ox,q->oy);
+            if(interp_edge_stamp[c]!=interp_frame)continue;
+            float best=1e9f;const InterpEdge *on=NULL;
+            for(unsigned r=interp_edge_head[c];r;r=interp_edge_refs[r-1].next){const InterpEdge *g=&interp_edges[interp_edge_refs[r-1].edge];
+                if(g->pair==q->pair||g->ox!=q->ox||g->oy!=q->oy)continue;
+                float d0,d1;const float t0=InterpAlong(v0,g->a0,g->b0,&d0),t1=InterpAlong(v1,g->a1,g->b1,&d1);
+                /* a midpoint-only pose in this frame (nearer than the
+                 * projection plane) is no projection to test */
+                const bool both=q->posed&&g->posed;
+                /* with one pose to test (geometry passing the view, often a
+                 * long edge) the direction of a long edge counts less */
+                const float l0=SDL_sqrtf((g->b0[0]-g->a0[0])*(g->b0[0]-g->a0[0])+(g->b0[1]-g->a0[1])*(g->b0[1]-g->a0[1]));
+                if(!(t0>0.0f&&t0<1.0f&&d0<reach+(both?0.0f:l0*INTERP_JUNCTION_SLOPE)&&(!both||(t1>0.0f&&t1<1.0f&&d1<reach))))continue;
+                /* not one of its ends (a shared vertex is joined already) */
+                if(t0*l0<0.5f||(1.0f-t0)*l0<0.5f)continue;
+                /* at the edge's depth there (not something in front or behind) */
+                if(q->d0[i]>0.0f&&g->da>0.0f&&g->db>0.0f){
+                    const float z=1.0f/((1.0f-t0)/g->da+t0/g->db);
+                    if(SDL_fabsf(z-q->d0[i])>0.1f*SDL_max(z,q->d0[i]))continue;}
+                if(d0+(both?d1:d0)<best){best=d0+(both?d1:d0);on=g;}
+            }
+            if(!on)continue;
+            Vertex *out=&interpolated_vertices[q->base+i];
+            if(!(out->pgxp_pos[2]>0.0f))continue;
+            float d;const float t=InterpAlong(out->pgxp_pos,on->am,on->bm,&d);
+            if(!(t>0.0f&&t<1.0f)||d>INTERP_JUNCTION_MOVE)continue;
+            out->pgxp_pos[0]=on->am[0]+(on->bm[0]-on->am[0])*t;out->pgxp_pos[1]=on->am[1]+(on->bm[1]-on->am[1])*t;
+            /* what moves with the vertex (a ghost or a new identity sharing
+             * it, InterpFinishPending) goes there too */
+            for(unsigned w=0;w<2;++w)if(q->field[w][i]&&interp_field[w].frame==interp_frame&&q->field[w][i]<=interp_field[w].len){
+                InterpFieldEntry *f=&interp_field[w].entry[q->field[w][i]-1];
+                f->dx=out->pgxp_pos[0]-f->x;f->dy=out->pgxp_pos[1]-f->y;}
+        }
+    }
+}
 /* Draw_FlushBuffer: the ghosts and new identities queued since the last
  * flush move as the primitives next to them did (InterpFieldMotion), in the
  * order queued, so one next to another follows it; vertices with none in
@@ -4963,6 +5158,8 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
     UniteRect(&batch_drawn, area);
 }
 
+static void DrawLineQuad(int x0, int y0, int r0, int g0, int b0, int x1, int y1,
+                         int r1, int g1, int b1, bool semi, u16 tpage);
 /* A run of pixels of one line on one row, [x, x + n) at row y in VRAM
  * coordinates, drawn as an untextured rectangle of one colour. */
 static void DrawLineRun(int x, int y, int n, int r, int g, int b, bool semi,
@@ -5377,6 +5574,12 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         const bool mid_line = InterpLine(packets, count, isGouraud, mid_x, mid_y, &own_line, &own_only);
         for (int pass = own_line ? 0 : 1; pass < (mid_line ? 2 : own_line ? 1 : 0); pass++) {
         interp_line_mode = mid_line || own_only ? 1 + pass : 3;
+        const bool placed = pass == 1 && interp_line_pend >= 0;
+        if (placed) {
+            /* its quads stay in one batch (InterpFinishLines) */
+            Draw_EnsureBufferWillNotOverflow(4 * (count - 1), 6 * (count - 1));
+            interp_line_pending[interp_line_pend].start = n_vertices;
+        }
         int x0 = 0, y0 = 0, r0 = v->r, g0 = v->g, b0 = v->b;
         int at = 0;
         for (int i = 0; i < count; i++) {
@@ -5390,12 +5593,22 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             const int x1 = pass ? mid_x[i] : s11(((short*)&packets[at])[0]);
             const int y1 = pass ? mid_y[i] : s11(((short*)&packets[at])[1]);
             at++;
-            if (i)
+            if (i && placed)
+                DrawLineQuad(x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi, lt);
+            else if (i)
                 DrawLinePixels(x0, y0, r0, g0, b0, x1, y1, r1, g1, b1, semi, lt);
             x0 = x1, y0 = y1, r0 = r1, g0 = g1, b0 = b1;
         }
+        if (placed) {
+            InterpLinePending* q = &interp_line_pending[interp_line_pend];
+            if (q->start <= n_vertices) {
+                q->end = n_vertices;
+                ++interp_line_pending_len;
+            }
+        }
         }
         interp_line_mode = 0;
+        interp_line_pend = -1;
         packets += length - 1;
         len -= length - 1;
     } else if (isTile) {
@@ -5895,6 +6108,8 @@ void Draw_ResetBuffer(void) {
     n_vertices = 0;
     n_indices = 0;
     interp_pending_len = 0;
+    interp_junction_prims_len = 0;
+    interp_line_pending_len = 0;
     vertex_cur = vertex_buf;
     index_cur = index_buf;
     batch_has_texture = false;
@@ -6058,8 +6273,65 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     view->mask_check = mask_check_bit;
 }
 
+/* Draw_FlushBuffer: the points of the lines queued since the last flush go
+ * where the polygon vertices they lie at went (within INTERP_LINE_REACH
+ * pixels): a paired line's by at most a pixel and a half from the midpoint
+ * of their own poses (not to another surface at the same place), a new
+ * line's only when every point lies at one. The others keep the line's own
+ * placement (a paired line the midpoint of its poses, a new one this
+ * frame's pose). Each segment is a quad (DrawLineQuad), its first two
+ * vertices at the segment's first point. */
+static void InterpFinishLines(void) {
+    const unsigned n=interp_line_pending_len;interp_line_pending_len=0;
+    for(unsigned k=0;k<n;++k){const InterpLinePending *q=&interp_line_pending[k];
+        if(q->end<=q->start||q->end>n_vertices||q->end-q->start!=4u*(q->count-1u))continue;
+        float to[INTERP_LINE_POINTS][2];unsigned found=0;
+        for(unsigned i=0;i<q->count;++i){float m[2],d;
+            to[i][0]=q->want[i][0];to[i][1]=q->want[i][1];
+            if(!InterpFieldMotion(q->which,q->from[i],0.0f,q->ox,q->oy,m,&d)||d>INTERP_LINE_REACH*INTERP_LINE_REACH)continue;
+            const float x=q->from[i][0]+m[0],y=q->from[i][1]+m[1];
+            if(q->which==0&&(SDL_fabsf(x-q->want[i][0])>1.5f||SDL_fabsf(y-q->want[i][1])>1.5f))continue;
+            to[i][0]=x;to[i][1]=y;++found;}
+        if(q->which==1&&found<q->count)for(unsigned i=0;i<q->count;++i){to[i][0]=q->want[i][0];to[i][1]=q->want[i][1];}
+        /* at 1x at whole pixels, as the line is drawn */
+        if(internal_res<=1)for(unsigned i=0;i<q->count;++i){to[i][0]=SDL_floorf(to[i][0]+0.5f);to[i][1]=SDL_floorf(to[i][1]+0.5f);}
+        for(unsigned v=q->start;v<q->end;++v){Vertex *out=&interpolated_vertices[v];
+            const unsigned i=(v-q->start)/4u+((v-q->start)%4u>=2u);
+            out->pgxp_pos[0]=(float)out->x-q->at[i][0]+to[i][0];out->pgxp_pos[1]=(float)out->y-q->at[i][1]+to[i][1];out->pgxp_pos[2]=1.0f;}
+    }
+}
+/* A line segment drawn into the midpoint as one quad over the pixels the
+ * GPU's stepping covers (both ends included), moved at the flush. */
+static void DrawLineQuad(int x0, int y0, int r0, int g0, int b0, int x1, int y1,
+                         int r1, int g1, int b1, bool semi, u16 tpage) {
+    Draw_EnsureBufferWillNotOverflow(4, 6);
+    Vertex* q = vertex_cur;
+    memset(q, 0, 4 * sizeof(*q));
+    const bool across = abs(x1 - x0) >= abs(y1 - y0);
+    const int e0 = across ? (x1 >= x0 ? 0 : 1) : (y1 >= y0 ? 0 : 1);
+    const int x[4] = {x0 + (across ? e0 : 0), x0 + (across ? e0 : 1), x1 + (across ? 1 - e0 : 0), x1 + (across ? 1 - e0 : 1)};
+    const int y[4] = {y0 + (across ? 0 : e0), y0 + (across ? 1 : e0), y1 + (across ? 0 : 1 - e0), y1 + (across ? 1 : 1 - e0)};
+    for (int k = 0; k < 4; k++) {
+        q[k].x = (short)x[k];
+        q[k].y = (short)y[k];
+        q[k].r = (unsigned char)(k < 2 ? r0 : r1);
+        q[k].g = (unsigned char)(k < 2 ? g0 : g1);
+        q[k].b = (unsigned char)(k < 2 ? b0 : b1);
+        q[k].a = semi ? 0x80 : 0xFF;
+        q[k].pgxp_pos[0] = (float)q[k].x;
+        q[k].pgxp_pos[1] = (float)q[k].y;
+        q[k].pgxp_pos[2] = -1.0f;
+        SET_TC(&q[k], tpage, -1);
+    }
+    static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
+    for (int k = 0; k < 6; k++)
+        index_cur[k] = (unsigned short)(n_vertices + order[k]);
+    Draw_EnqueueBuffer(4, 6);
+}
 void Draw_FlushBuffer(void) {
+    InterpSnapJunctions();
     InterpFinishPending();
+    InterpFinishLines();
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
         return;
