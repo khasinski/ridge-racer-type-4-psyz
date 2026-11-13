@@ -61,6 +61,16 @@ enum {
     /* libsio's AddSIO: AddDevice and the driver's setup, in the game's
      * SystemInit. [rec] boot (interpreter: 66.1k, 50487e6) */
     ADD_SIO_DEVICE_CYCLES = 65704,
+    /* One pass of libsio's busy waits for the serial port (the status read,
+     * the wait callback's load and call, a three to six instruction compare
+     * in the game, and the branch back): about 22 instructions from the
+     * I-cache with two main RAM loads and the SIO1 status read. The game's
+     * callbacks count these passes, so they are its link timeouts: 25000
+     * (the race, ~24 ms) and 99999 (the menus, ~94 ms). Unlike the other
+     * costs here it also applies on a real-time clock (libcomb.c paces the
+     * passes). DuckStation's SIO1 has no link cable, so its loops never
+     * wait there. [unrecorded] estimated from the instruction stream */
+    SIO_POLL_CYCLES = 32,
 };
 
 /* ---- Interrupts (kernel.c, libapi.c) ---- */

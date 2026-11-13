@@ -65,6 +65,7 @@ set(PSYZ_SOURCES
     ../decomp/src/libcd/type.c
     src/psyz/libcard.c
     src/psyz/libcomb.c
+    src/psyz/link_net.c
     ../decomp/src/libspu/s_cb.c
     ../decomp/src/libspu/s_crwa.c
     ../decomp/src/libspu/s_dcb.c
