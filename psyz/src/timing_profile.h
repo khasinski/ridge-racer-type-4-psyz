@@ -11,11 +11,21 @@
  *
  * Each entry names how it was fitted and the PsyZ commit that has the run:
  *
- *   [call]   entry-to-return ticks of the call on DuckStation, measured with
- *            GDB breakpoints at the call and its return. Any breakpoint
- *            slows DuckStation's CPU by about 1%, so these may read up to
- *            about 1% high; refit them from field timing without
- *            breakpoints when one decides a field.
+ *   [rec]    entry-to-return clocks of the call on DuckStation's
+ *            recompiler, the CPU mode of the reference runs, measured
+ *            without breakpoints by a timing stub patched into RAM (the
+ *            game's tools/port/ds_calltime.py); the median of the calls in
+ *            the context named, the stub's own ~10 clocks included.
+ *   [rec ratio] a breakpoint value of a cost the call's context varies
+ *            (or that leaves out part of the call), scaled by the recompiler
+ *            / interpreter clocks of the whole call in one context (the
+ *            tool's DUMMYBP=1 run).
+ *   [call]   entry-to-return ticks measured with GDB breakpoints at the
+ *            call and its return. A breakpoint (and single-stepping) runs
+ *            DuckStation's interpreter, whose clocks differ from the
+ *            recompiler's by -45% to +20% per routine; kept where the
+ *            recompiler agrees (BIOS ROM loops) or cannot measure it
+ *            (interrupt handlers, calls of a few clocks, card events).
  *   [field]  fitted so that the port's mode entries, FrameCounter and rand
  *            land on DuckStation's fields, in runs without breakpoints.
  *   [model]  taken from DuckStation's device model (its source), not
@@ -36,7 +46,9 @@ enum {
     BIOS_SRAND_CYCLES = 119,
     /* A(28h) bzero and A(2Bh) memset: 328 + 132 a byte; A(2Ah) memcpy:
      * 258 + 204 a byte (the uncached 8-bit ROM). bzero(0x620) = 207300,
-     * memcpy(0x5C) = 19019, memset(8) = 1384. [call] 686859c */
+     * memcpy(0x5C) = 19019, memset(8) = 1384. [call] 686859c; the
+     * recompiler gives the same within 3 clocks (bzero 6, 48 and 480
+     * bytes, memcpy 8 bytes) */
     BIOS_FILL_CYCLES = 328,
     BIOS_FILL_BYTE_CYCLES = 132,
     BIOS_COPY_CYCLES = 258,
@@ -47,8 +59,8 @@ enum {
     BIOS_CARD_ENTRY_CYCLES = 6200,
     BIOS_CARD_NEXTFILE_CYCLES = 13700,
     /* libsio's AddSIO: AddDevice and the driver's setup, in the game's
-     * SystemInit. [call] 50487e6 */
-    ADD_SIO_DEVICE_CYCLES = 66100,
+     * SystemInit. [rec] boot (interpreter: 66.1k, 50487e6) */
+    ADD_SIO_DEVICE_CYCLES = 65704,
 };
 
 /* ---- Interrupts (kernel.c, libapi.c) ---- */
@@ -70,9 +82,11 @@ enum {
 /* ---- libpad (libetc.c) ---- */
 enum {
     /* PadInitDirect clears its driver state (a 0x1E0-byte BIOS bzero) and
-     * sets up the exchange; PadStartCom. [call] 50487e6 */
-    PAD_INIT_DIRECT_CYCLES = 73316,
-    PAD_START_COM_CYCLES = 1589,
+     * sets up the exchange; PadStartCom. [rec] boot (the breakpoint value
+     * 73.3k of 50487e6 had an interrupt inside; the interpreter gives 64.1k
+     * and 1.6k) */
+    PAD_INIT_DIRECT_CYCLES = 63992,
+    PAD_START_COM_CYCLES = 1317,
 };
 
 /* ---- libgpu (decomp libgpu/sys.c, prim.c) ---- */
@@ -81,11 +95,14 @@ enum {
      * environment (BIOS_COPY_*: DRAWENV 0x5C, DISPENV 0x14 bytes) and the
      * DMA the CPU waits for (17 clocks per 16 words: the ordering table
      * clear and an image upload, which the next DrawSync(0) finishes).
-     * [call] 686859c */
-    PUT_DRAW_ENV_CYCLES = 1165,
-    PUT_DISP_ENV_CYCLES = 396, // unchanged display ranges
+     * [call] 686859c, but PutDrawEnv, PutDispEnv and DrawOTag [rec] in a
+     * Time Attack run (DS fields 283-3700: 19816 and 4941 with the memcpy,
+     * the display start changing at every call, and 468 for a table that
+     * starts with a packet). The recompiler confirms DrawSync (249). */
+    PUT_DRAW_ENV_CYCLES = 790,
+    PUT_DISP_ENV_CYCLES = 603,
     GET_ENV_CYCLES = 40,
-    DRAW_OTAG_CYCLES = 483,
+    DRAW_OTAG_CYCLES = 468,
     CLEAR_OTAG_R_CYCLES = 330,
     LOAD_IMAGE_CYCLES = 830,
     DRAW_SYNC_CYCLES = 246, // an idle GPU queue
@@ -111,7 +128,9 @@ enum {
     SPU_DMA_CLOCKS_PER_BYTE = 8,
     /* SpuClearReverbWorkArea: the setup of each 1 KiB chunk (_spu_t's
      * waits, the DMA event) besides its DMA: 97 chunks took 1.27M clocks
-     * in SsInit. [call] 686859c */
+     * in SsInit. [call] 686859c (the recompiler takes 22% less than the
+     * interpreter for the whole call at boot, 170.5k / 219.7k, but not per
+     * chunk) */
     SPU_CLEAR_CHUNK_CYCLES = 3070,
     /* SpuIsTransferCompleted(SPU_TRANSFER_PEEK) while the DMA runs, and
      * Psyz_SpuDmaWait's step: a poll's time in ns. [unrecorded] dd07ccc */
@@ -122,16 +141,19 @@ enum {
 /* ---- libsnd (decomp libsnd) ---- */
 enum {
     /* A sequencer tick (SsSeqCalledTbyT), mostly _SsVmFlush's pass over the
-     * 24 voices, with no sequence playing. [call] 686859c */
-    SS_TICK_CYCLES = 6335,
-    /* SsUtAllKeyOff: a SpuSetVoiceAttr per voice, 22.8k for 24 voices.
-     * [call] f8ddd9d; the menu sound bank loads after the title then end on
-     * DuckStation's field [field]. */
-    SS_UT_ALL_KEY_OFF_VOICE_CYCLES = 951,
-    /* SsVabOpenHeadWithMode's header parse (a menu bank) and
-     * SsVabTransBody before its DMA. [call] 7ffeed0 */
-    SS_VAB_OPEN_HEAD_CYCLES = 4514,
-    SS_VAB_TRANS_BODY_CYCLES = 991,
+     * 24 voices, with no sequence playing: the breakpoint value of 686859c
+     * scaled by the recompiler / interpreter clocks of the attract cycle's
+     * ticks (5923 / 6340) [rec ratio]. */
+    SS_TICK_CYCLES = 5895,
+    /* SsUtAllKeyOff: a SpuSetVoiceAttr per voice, 21.8k for 24 voices [rec]
+     * in a Time Attack run's menus (interpreter: 22.8k, f8ddd9d); the menu
+     * sound bank loads after the title end on DuckStation's field [field]. */
+    SS_UT_ALL_KEY_OFF_VOICE_CYCLES = 909,
+    /* SsVabOpenHeadWithMode's header parse (the menu banks: 4.3k-5.4k,
+     * the breakpoint value of 7ffeed0 scaled by 4668 / 4919 [rec ratio]) and
+     * SsVabTransBody before its DMA [rec] (interpreter: 1.0k). */
+    SS_VAB_OPEN_HEAD_CYCLES = 4284,
+    SS_VAB_TRANS_BODY_CYCLES = 675,
 };
 
 /* ---- Memory card (libcard.c) ---- */
