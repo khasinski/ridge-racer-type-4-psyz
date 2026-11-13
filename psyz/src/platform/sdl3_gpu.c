@@ -1360,10 +1360,10 @@ static bool CreateGpuResources(void) {
             SDL_ReleaseGPUShader(device, fetch_fs);
         }
         destination_fetch = pipe_direct_fetch != NULL;
-        INFOF("SDL_GPU semi-transparency: %s",
-              destination_fetch ? "framebuffer fetch" : "target copies");
     }
 #endif
+    INFOF("SDL_GPU semi-transparency: %s",
+          destination_fetch ? "framebuffer fetch" : "target copies");
     SDL_GPUShader* clear_fs = CreateShader(
         clear_frag, clear_frag_len, SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0);
     bool shaders_ok = psx_vs && psx_fs && clear_vs && clear_fs;
