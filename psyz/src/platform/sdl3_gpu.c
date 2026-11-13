@@ -33,11 +33,23 @@ static const void *interpolation_packet_current;
  * offset) are recorded as marks instead of flushing (Draw_FlushBuffer). */
 #define DRAW_STATE_MARKS 1
 static void DrawStateChanging(void);
-/* A batch holds a race frame's geometry: a midpoint vertex placed by its
- * neighbours (InterpFinishPending, InterpFinishLines, InterpSnapJunctions)
- * sees only those queued before the flush (a ghost tile's neighbour queued
- * after it left a crack), and a line's pixel runs take four vertices each. */
-#define MAX_VERTEX_COUNT 65532
+/* Why a batch is drawn (PSYZ_INTERP_STATS, PSYZ_FRAME_STATS): it is full
+ * (vertices or indices, drawing-state marks, CLUT cache rows), a primitive
+ * reads what the batch draws, the drawing state or VRAM changes, or a
+ * present. */
+enum { DRAW_FLUSH_STATE, DRAW_FLUSH_OVERFLOW, DRAW_FLUSH_MARKS, DRAW_FLUSH_CLUT,
+       DRAW_FLUSH_FEEDBACK, DRAW_FLUSH_PRESENT, DRAW_FLUSH_REASONS };
+static unsigned draw_flush_reason;
+#define DRAW_FLUSH_FOR(reason) (draw_flush_reason = (reason), Draw_FlushBuffer())
+static bool InterpBatchFull(unsigned vertices, unsigned indices);
+#define DRAW_BATCH_FULL(vertices, indices) InterpBatchFull(vertices, indices)
+/* A batch holds a race frame's geometry: a race, GP or Extra Trial replay
+ * frame queues up to about 89000 vertices (PSYZ_INTERP_STATS), VS split
+ * screen up to 115000, the attract sweep and Time Attack replays up to
+ * 146000-165000 in a few frames, which then take two batches. The midpoint does not depend on
+ * the batches: its geometry is kept for the whole frame (interp_mid_store)
+ * and placed and drawn once the frame is complete (InterpMidpointSync). */
+#define MAX_VERTEX_COUNT 131072
 #include "sdl3_draw.h"
 
 #if defined(_WIN32)
@@ -175,8 +187,10 @@ static SDL_GPUTexture* vram_sample = NULL;
 static SDL_GPUTexture* blend_sample = NULL;
 /* The GPU's CLUT cache (Draw_ClearCache): each load copies the palette from
  * the VRAM, in command order, into the next row of this ring; vertices name
- * the row their primitive reads (Vertex.exact[4][3]). */
-enum { CLUT_CACHE_ROWS = 512 };
+ * the row their primitive reads (Vertex.exact[4][3]). It holds the loads
+ * of a frame (a race frame at 8x loads up to about 700), which the
+ * midpoint reads when the frame is complete (InterpMidpointSync). */
+enum { CLUT_CACHE_ROWS = 2048 };
 static SDL_GPUTexture* clut_cache = NULL;
 static u32 clut_cache_reg = 0xFFFFFFFFu;
 static bool clut_cache_8bit;
@@ -248,10 +262,8 @@ static void RingWrapThrottle(void);
 static bool ring_cycle_buffers;
 /* Space for a batch in the ring; true when the transfer buffer is to be
  * cycled (mapped with cycle). RingCycleBuffers then says whether the
- * batch's vbuf/ibuf uploads cycle. Index positions stay even: copies of
- * 16-bit indices start at multiples of 4 bytes (Metal). */
+ * batch's vbuf/ibuf uploads cycle. */
 static bool RingReserve(Uint32 vertices, Uint32 indices, Uint32* vertex_at, Uint32* index_at) {
-    indices += indices & 1u;
     const bool cycle = ring_restart || ring_vertex_pos + vertices > MAX_VERTEX_COUNT ||
                        ring_index_pos + indices > MAX_INDEX_COUNT;
     if (cycle) {
@@ -368,7 +380,84 @@ static SDL_GPUTexture *interpolated_vram;
 /* Failed submission/wait is not a completion witness. Retain until idle. */
 static SDL_GPUTexture *interp_unwitnessed;
 static unsigned interpolated_scale;
-static Vertex interpolated_vertices[MAX_VERTEX_COUNT];
+/* The midpoint's vertices of the frame: of the batches drawn into the
+ * frame's targets since the last InterpMidpointSync (interp_mid_len of
+ * them), then of the batch being queued, which interpolated_vertices (and
+ * interp_mid_depth) index as vertex_buf does. Ghosts, new identities, lines
+ * and T-junctions are placed from the neighbours of the whole frame, then
+ * the midpoint is drawn (InterpMidpointSync); before that only what would
+ * change what it draws makes it draw early (a split, PSYZ_INTERP_STATS). */
+#define INTERP_MID_VERTICES 262144u
+#define INTERP_MID_INDICES (INTERP_MID_VERTICES / 4u * 6u)
+static Vertex interp_mid_store[INTERP_MID_VERTICES];
+static float interp_mid_depth_store[INTERP_MID_VERTICES];
+static u32 interp_mid_index[INTERP_MID_INDICES];
+static unsigned interp_mid_len, interp_mid_index_len;
+static Vertex *interpolated_vertices = interp_mid_store;
+static float *interp_mid_depth = interp_mid_depth_store;
+static void InterpMidpointSync(unsigned reason);
+static void InterpMidpointComplete(unsigned reason);
+static bool InterpMidpointDeferred(void);
+/* Why the midpoint is drawn: the frame is complete, or (a split) its
+ * store is full, a VRAM change reaches what it samples or draws over, a
+ * present or capture shows it, or its target or settings change. */
+enum { INTERP_SYNC_FRAME, INTERP_SYNC_FULL, INTERP_SYNC_TEXTURE, INTERP_SYNC_CLUT, INTERP_SYNC_TARGET,
+       INTERP_SYNC_PRESENT, INTERP_SYNC_SETTINGS, INTERP_SYNC_N };
+/* Entries the fixed interpolation tables drop or overwrite while live
+ * (PSYZ_INTERP_STATS; a warning the first time for each). */
+enum { IEVICT_ADDRESSES, IEVICT_TAGS, IEVICT_QUEUE, IEVICT_IDS, IEVICT_PAIRS, IEVICT_STORE, IEVICT_ORDER,
+       IEVICT_FIELD, IEVICT_EDGES, IEVICT_EDGE_REFS, IEVICT_PENDING, IEVICT_JUNCTIONS, IEVICT_LINES, IEVICT_N };
+static unsigned interp_evict[IEVICT_N];
+static void InterpEvict(unsigned table);
+/* Batches of the interpolation frame (PSYZ_INTERP_STATS) and of the
+ * present (PSYZ_FRAME_STATS): vertices and indices queued, the largest
+ * batch, flushes by reason, midpoint draws (syncs) by reason. */
+typedef struct {
+    unsigned vertices, indices, batch_vertices, batch_indices;
+    unsigned flushes[DRAW_FLUSH_REASONS], syncs[INTERP_SYNC_N], split_pending, clut_loads;
+} DrawFrameStats;
+static DrawFrameStats draw_frame_stats;
+/* primitives queued since the last flush (PSYZ_BATCH_PRIMITIVES) */
+static unsigned batch_primitives;
+/* 16x16-pixel cells of VRAM: what the midpoint kept so far samples
+ * (texture pages) and draws over (drawing areas), and what changed in the
+ * native VRAM since vram_sample was brought up to date (vram_dirty). */
+#define VRAM_TILE 16
+typedef struct { uint64_t row[VRAM_H / VRAM_TILE]; } VramTiles;
+static VramTiles interp_mid_texture_tiles, interp_mid_target_tiles, vram_dirty_tiles;
+static void VramTilesAdd(VramTiles *t, int x, int y, int w, int h) {
+    int x0 = SDL_max(x, 0), y0 = SDL_max(y, 0), x1 = SDL_min(x + w, VRAM_W), y1 = SDL_min(y + h, VRAM_H);
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    x0 /= VRAM_TILE, x1 = (x1 - 1) / VRAM_TILE, y0 /= VRAM_TILE, y1 = (y1 - 1) / VRAM_TILE;
+    const uint64_t bits = (x1 - x0 >= 63 ? ~0ull : ((1ull << (x1 - x0 + 1)) - 1)) << x0;
+    for (int r = y0; r <= y1; ++r)
+        t->row[r] |= bits;
+}
+static bool VramTilesHit(const VramTiles *a, const VramTiles *b) {
+    for (unsigned r = 0; r < VRAM_H / VRAM_TILE; ++r)
+        if (a->row[r] & b->row[r])
+            return true;
+    return false;
+}
+static bool VramTilesHitRect(const VramTiles *a, int x, int y, int w, int h) {
+    VramTiles t = {{0}};
+    VramTilesAdd(&t, x, y, w, h);
+    return VramTilesHit(a, &t);
+}
+/* CLUT cache rows loaded since the first batch the midpoint keeps */
+static unsigned interp_mid_clut_loads;
+static bool InterpMidpointCovers(int x, int y, int w, int h);
+static bool InterpMidpointSamplesRect(int x, int y, int w, int h);
+/* A texture page (tpage bits of Vertex.t): 64, 128 or 256 VRAM pixels by
+ * 256, wrapping at the VRAM's right edge. */
+static void VramTilesAddPage(VramTiles *t, unsigned tpage) {
+    const int x = (int)(tpage & 15) * 64, y = (int)((tpage >> 4) & 1) * 256;
+    const int depth = (int)((tpage >> 7) & 3), w = depth == 0 ? 64 : depth == 1 ? 128 : 256;
+    VramTilesAdd(t, x, y, w, 256);
+    if (x + w > VRAM_W)
+        VramTilesAdd(t, 0, y, x + w - VRAM_W, 256);
+}
 static unsigned long long interpolated_present_count;
 /* The screen area (pixels) of the frame's tagged primitives by what the
  * midpoint does with them (InterpMidpointUnsound); PSYZ_INTERP_STATS=1 logs
@@ -399,7 +488,7 @@ static int interp_ghosts=-1;
 static bool interp_ghost_cut;
 #define INTERP_COVER_CELL 8
 static unsigned short interp_ghost_cover[VRAM_H/INTERP_COVER_CELL][VRAM_W/INTERP_COVER_CELL];
-static const unsigned short *interp_capture_index;
+static const u32 *interp_capture_index;
 static unsigned interp_capture_indices;
 static bool InterpGhostCovers(float (*pos)[3],unsigned count);
 static bool InterpGhostCoversLine(float (*pos)[3],int count);
@@ -441,7 +530,8 @@ static unsigned InterpFieldCell(int cx,int cy,int ox,int oy) {
 static unsigned InterpFieldAdd(unsigned which,const float *from,float depth,int ox,int oy,const float *to) {
     InterpField *f=&interp_field[which];
     if(f->frame!=interp_frame){f->frame=interp_frame;f->len=0;}
-    if(f->len>=INTERP_FIELD||!(SDL_fabsf(from[0])<2048.0f&&SDL_fabsf(from[1])<2048.0f))return 0;
+    if(f->len>=INTERP_FIELD){InterpEvict(IEVICT_FIELD);return 0;}
+    if(!(SDL_fabsf(from[0])<2048.0f&&SDL_fabsf(from[1])<2048.0f))return 0;
     const unsigned c=InterpFieldCell((int)SDL_floorf(from[0]/INTERP_FIELD_CELL),(int)SDL_floorf(from[1]/INTERP_FIELD_CELL),ox,oy);
     if(f->stamp[c]!=interp_frame){f->stamp[c]=interp_frame;f->head[c]=0;}
     f->entry[f->len]=(InterpFieldEntry){from[0],from[1],depth,to[0]-from[0],to[1]-from[1],(short)ox,(short)oy,f->head[c]};
@@ -484,16 +574,18 @@ static InterpPending interp_pending[INTERP_PENDING];
 static unsigned interp_pending_len;
 static bool InterpPend(unsigned which,unsigned pair,unsigned base,unsigned count,const float (*from)[3],const float *depth,
                        const unsigned char *index,unsigned indices,int ox,int oy) {
-    if(interp_pending_len>=INTERP_PENDING||count>6||indices>6)return false;
+    if(count>6||indices>6)return false;
+    if(interp_pending_len>=INTERP_PENDING){InterpEvict(IEVICT_PENDING);return false;}
     InterpPending *q=&interp_pending[interp_pending_len++];
-    q->pair=pair;q->base=base;q->which=(unsigned char)which;q->count=(unsigned char)count;q->indices=(unsigned char)indices;
+    /* base: in the frame's midpoint store */
+    q->pair=pair;q->base=interp_mid_len+base;q->which=(unsigned char)which;q->count=(unsigned char)count;q->indices=(unsigned char)indices;
     q->ox=(short)ox;q->oy=(short)oy;
     for(unsigned i=0;i<count;++i){q->from[i][0]=from[i][0];q->from[i][1]=from[i][1];q->depth[i]=depth[i];}
     for(unsigned i=0;i<indices;++i)q->index[i]=index[i];
     InterpExposeViewNow(&q->view);
     return true;
 }
-static void InterpFinishPending(void);
+static void InterpFinishPending(unsigned pending);
 /* T-junctions: a vertex of one paired primitive that lies on an edge of
  * another (inside it, not at its ends) in both frames, a piece of a finer
  * subdivision meeting a coarser one. Each frame keeps it on that edge (up
@@ -527,7 +619,7 @@ static unsigned interp_edge_head[INTERP_EDGE_CELLS],interp_edge_stamp[INTERP_EDG
 typedef struct { unsigned pair, base, field[2][6]; unsigned char count; short ox, oy; bool posed; float p0[6][2], p1[6][2], d0[6]; } InterpJunctionPrim;
 static InterpJunctionPrim interp_junction_prims[INTERP_JUNCTION_PRIMS];
 static unsigned interp_junction_prims_len;
-static void InterpSnapJunctions(void);
+static void InterpSnapJunctions(unsigned n);
 static void InterpAddEdge(const float *a0,const float *b0,const float *a1,const float *b1,const float *am,const float *bm,
                           float da,float db,unsigned pair,int ox,int oy,bool posed);
 /* Exposure: what the midpoint shows where both frames show something
@@ -545,9 +637,8 @@ typedef struct { float depth; unsigned frame; } InterpExposeCell;
 /* [0], [1]: the frames by parity; [2]: the midpoint */
 static InterpExposeCell interp_expose[3][INTERP_EXPOSE_H][INTERP_EXPOSE_W];
 static struct { int x, y, w, h; unsigned frame; } interp_expose_rect[2];
-static float interp_mid_depth[MAX_VERTEX_COUNT];
 static void InterpExposeTriangle(unsigned grid,const float *a,const float *b,const float *c,float da,float db,float dc,const int clip[4]);
-static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const unsigned short *index,unsigned indices,unsigned base,bool precise);
+static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const u32 *index,unsigned indices,unsigned base,bool precise);
 static unsigned InterpExposed(void);
 static unsigned interp_exposed_holes;
 static bool present_commit_pending,present_commit_mid;
@@ -580,7 +671,12 @@ static InterpAddress *InterpFind(InterpAddress *map,const void *p) {
 }
 static void InterpMap(InterpAddress *map,const void *p,unsigned pair,unsigned serial) {
     unsigned h=InterpHash(p);InterpAddress *e=InterpFind(map,p);
-    if(!e){e=&map[h];for(unsigned i=0;i<4;++i)if(!map[(h+i)&(INTERP_MAP-1)].address){e=&map[(h+i)&(INTERP_MAP-1)];break;}}
+    if(!e){e=&map[h];bool free_slot=false;
+        for(unsigned i=0;i<4;++i)if(!map[(h+i)&(INTERP_MAP-1)].address){e=&map[(h+i)&(INTERP_MAP-1)];free_slot=true;break;}
+        /* another packet's entry goes: count it when its pair (for a tag,
+         * its frame) is still current */
+        if(!free_slot&&e->serial&&interp_pairs[e->pair].serial==e->serial&&(map!=interp_tags||e->frame>=interp_frame))
+            InterpEvict(map==interp_tags?IEVICT_TAGS:map==interp_queue?IEVICT_QUEUE:IEVICT_ADDRESSES);}
     *e=(InterpAddress){p,pair,serial};
 }
 /* Until the first pair the midpoint target is not drawn: it is refreshed
@@ -591,6 +687,7 @@ void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b) {
     if(!interp_serial)interp_target_stale=true;
     unsigned serial=++interp_serial;if(!serial)serial=++interp_serial;
     unsigned index=serial&(INTERP_PAIRS-1);
+    if(interp_pairs[index].serial&&interp_pairs[index].frame&&interp_pairs[index].frame+1>=interp_frame)InterpEvict(IEVICT_PAIRS);
     interp_pairs[index]=(InterpPair){.a=a,.b=b,.serial=serial};
     InterpMap(interp_addresses,a,index,serial);InterpMap(interp_addresses,b,index,serial);
 }
@@ -624,7 +721,7 @@ void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long i
         if(e->serial&&e->id==id)slot=e;
         else if(!free_slot&&(!e->serial||interp_pairs[e->pair].serial!=e->serial))free_slot=e;}
     if(!slot||interp_pairs[slot->pair].serial!=slot->serial){
-        if(!slot)slot=free_slot?free_slot:&interp_ids[h];
+        if(!slot){slot=free_slot?free_slot:&interp_ids[h];if(!free_slot)InterpEvict(IEVICT_IDS);}
         if(!interp_serial)interp_target_stale=true;
         /* a new identity takes the next pair that no identity drew in the
          * last two frames, so the live ones keep their history */
@@ -633,7 +730,8 @@ void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long i
             serial=++interp_serial;if(!serial)serial=++interp_serial;
             index=serial&(INTERP_PAIRS-1);
             const InterpPair *old=&interp_pairs[index];
-            if(tries>=64||!old->serial||!old->tagged||!old->frame||old->frame+1<interp_frame)break;
+            if(!old->serial||!old->tagged||!old->frame||old->frame+1<interp_frame)break;
+            if(tries>=64){InterpEvict(IEVICT_PAIRS);break;}
         }
         interp_pairs[index]=(InterpPair){.serial=serial,.tagged=true,.id=id};
         *slot=(InterpId){id,index,serial};
@@ -671,7 +769,7 @@ void Psyz_GpuClearInterpolationPackets(void) {
 int Psyz_GpuSetFrameInterpolation(int enabled) {
     interpolation_requested=enabled!=0;
     static int logged_requested=-1,logged_effective=-1;
-    if(interpolation_enabled!=(enabled!=0)){Draw_FlushBuffer();interpolation_enabled=enabled!=0;Psyz_GpuResetInterpolation();}
+    if(interpolation_enabled!=(enabled!=0)){Draw_FlushBuffer();InterpMidpointSync(INTERP_SYNC_SETTINGS);interpolation_enabled=enabled!=0;Psyz_GpuResetInterpolation();}
     if(interpolation_enabled&&device&&!InterpEnsureTarget()){
         interpolation_enabled=false;Psyz_GpuResetInterpolation();
         WARNF("60 Hz interpolation admission failed; staying at original cadence: %s",SDL_GetError());
@@ -698,6 +796,7 @@ unsigned long long Psyz_GpuGetInterpolatedPresentCount(void){return interpolated
 static bool InterpEnsureTarget(void) {
     if(!device||UseSoftwareBackend())return false;
     if(interpolated_vram&&interpolated_scale==internal_res)return true;
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
     if(!SubmitCmdAndWait()||!SDL_WaitForGPUIdle(device))return false;
     if(interp_unwitnessed){SDL_ReleaseGPUTexture(device,interp_unwitnessed);interp_unwitnessed=NULL;}
     const SDL_GPUTextureCreateInfo info={.type=SDL_GPU_TEXTURETYPE_2D,
@@ -725,20 +824,51 @@ void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigne
     if(tagged)*tagged=interp_stat_last[1];
     if(paired)*paired=interp_stat_last[2];
 }
+static const char *const interp_evict_names[IEVICT_N]={"addresses","tags","queue","ids","pairs","store","order",
+    "field","edges","edge-refs","pending","junctions","lines"};
+static void InterpEvict(unsigned table) {
+    static bool warned[IEVICT_N];
+    ++interp_evict[table];
+    if(!warned[table]){warned[table]=true;
+        WARNF("interpolation table %s full at frame %u: entries dropped (PSYZ_INTERP_STATS counts them per frame)",interp_evict_names[table],interp_frame);}
+}
+/* Batches, midpoint draws and table overflows of the frame (appended to
+ * the [interp-stats] line): vertices and indices queued, the largest batch,
+ * batches drawn because full (vertices, marks, CLUT rows), for feedback,
+ * for a state or VRAM change and at a present or frame end, midpoint draws
+ * and the splits among them that placed ghosts, new faces, T-junctions or
+ * outlines before the frame was complete, and entries dropped by table. */
+static void InterpStatsBatches(char *out,size_t size) {
+    const DrawFrameStats *d=&draw_frame_stats;
+    unsigned syncs=0,evicted=0;
+    for(unsigned i=0;i<INTERP_SYNC_N;++i)syncs+=d->syncs[i];
+    for(unsigned i=0;i<IEVICT_N;++i)evicted+=interp_evict[i];
+    int n=SDL_snprintf(out,size," vertices=%u indices=%u batch=%u/%u overflow=%u marks=%u clut=%u feedback=%u state=%u present=%u syncs=%u split=%u/%u/%u/%u/%u/%u splitplaced=%u clutloads=%u evicted=%u",
+        d->vertices,d->indices,d->batch_vertices,d->batch_indices,d->flushes[DRAW_FLUSH_OVERFLOW],d->flushes[DRAW_FLUSH_MARKS],
+        d->flushes[DRAW_FLUSH_CLUT],d->flushes[DRAW_FLUSH_FEEDBACK],d->flushes[DRAW_FLUSH_STATE],d->flushes[DRAW_FLUSH_PRESENT],syncs,
+        d->syncs[INTERP_SYNC_FULL],d->syncs[INTERP_SYNC_TEXTURE],d->syncs[INTERP_SYNC_CLUT],d->syncs[INTERP_SYNC_TARGET],
+        d->syncs[INTERP_SYNC_PRESENT],d->syncs[INTERP_SYNC_SETTINGS],d->split_pending,d->clut_loads,evicted);
+    for(unsigned i=0;i<IEVICT_N&&n>0&&(size_t)n<size;++i)
+        if(interp_evict[i])n+=SDL_snprintf(out+n,size-(size_t)n," %s=%u",interp_evict_names[i],interp_evict[i]);
+}
 static void InterpStatsFrame(void) {
     if(interp_stats_log<0){const char *e=SDL_getenv("PSYZ_INTERP_STATS");interp_stats_log=e&&*e&&*e!='0';}
-    if(interp_stats_log<=0||!interp_frame)return;
+    if(interp_stats_log<=0||!interp_frame){
+        memset(&draw_frame_stats,0,sizeof(draw_frame_stats));memset(interp_evict,0,sizeof(interp_evict));return;}
     /* identities drawn the frame before the last one and not in it */
     for(unsigned i=0;i<INTERP_PAIRS;++i){InterpPair *p=&interp_pairs[i];
         if(p->serial&&p->tagged&&p->frame+1==interp_frame&&!p->midpoint_pose){
             interp_area[ISTAT_VANISHED]+=InterpArea(p->position,p->count);++interp_count[ISTAT_VANISHED];}}
     const unsigned exposed=InterpExposed();
-    SDL_Log("[interp-stats] f=%u paired=%u/%.0f new=%u/%.0f mismatch=%u/%.0f frameonly=%u/%.0f midonly=%u/%.0f vanished=%u/%.0f ghost=%u/%.0f replaced=%u/%.0f cut=%d exposed=%u holes=%u",interp_frame,
+    char batches[512];InterpStatsBatches(batches,sizeof(batches));
+    SDL_Log("[interp-stats] f=%u paired=%u/%.0f new=%u/%.0f mismatch=%u/%.0f frameonly=%u/%.0f midonly=%u/%.0f vanished=%u/%.0f ghost=%u/%.0f replaced=%u/%.0f cut=%d exposed=%u holes=%u%s",interp_frame,
         interp_count[0],interp_area[0],interp_count[1],interp_area[1],interp_count[2],interp_area[2],interp_count[3],interp_area[3],
-        interp_count[4],interp_area[4],interp_count[5],interp_area[5],interp_count[6],interp_area[6],interp_count[7],interp_area[7],interp_ghost_cut,exposed,interp_exposed_holes);
+        interp_count[4],interp_area[4],interp_count[5],interp_area[5],interp_count[6],interp_area[6],interp_count[7],interp_area[7],interp_ghost_cut,exposed,interp_exposed_holes,batches);
     memset(interp_area,0,sizeof(interp_area));memset(interp_count,0,sizeof(interp_count));
+    memset(&draw_frame_stats,0,sizeof(draw_frame_stats));memset(interp_evict,0,sizeof(interp_evict));
 }
 void Psyz_GpuBeginInterpolationFrame(void) {
+    InterpMidpointComplete(INTERP_SYNC_FRAME);
     InterpStatsFrame();
     interp_matches=0;
     memcpy(interp_stat_last,interp_stat,sizeof(interp_stat));memset(interp_stat,0,sizeof(interp_stat));
@@ -767,6 +897,7 @@ void Psyz_GpuBeginInterpolationFrame(void) {
  * fill of its rows (the game's DrawEnv clear) is followed by the copy. */
 static struct { int x, src_y, dst_y, w, h; unsigned frame; } interp_backdrop;
 static void InterpBackdropCopy(int x,int y,int w,int h) {
+    if(InterpMidpointCovers(x,y,w,h))InterpMidpointSync(INTERP_SYNC_TARGET);
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
     SDL_GPUCopyPass *copy=cmd?SDL_BeginGPUCopyPass(cmd):NULL;
     if(!copy)return;
@@ -828,6 +959,8 @@ static bool InterpMidpointUnsound(void) {
     return unposed>picture*share||(posed+unposed>0&&posed<unposed);
 }
 void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
+    /* the frame is complete: its midpoint is placed and drawn */
+    InterpMidpointComplete(INTERP_SYNC_FRAME);
     interp_next_y=next_y;interp_phase=0;interp_blank_mid=false;
     interp_pair_ready=interpolation_enabled&&interpolated_vram&&interp_matches>0&&next_y>=0&&next_y<VRAM_H;
 }
@@ -899,6 +1032,7 @@ static bool InterpLine(const u_long *words,int count,bool gouraud,int *mid_x,int
      * are, from this frame's pose (InterpFinishLines) */
     const bool newcomer=!valid&&!extrapolated&&*own&&!*own_only;
     interp_line_pend=-1;
+    if((valid||newcomer)&&interp_line_pending_len>=INTERP_LINE_PENDING)InterpEvict(IEVICT_LINES);
     if((valid||newcomer)&&interp_line_pending_len<INTERP_LINE_PENDING){
         InterpLinePending *q=&interp_line_pending[interp_line_pending_len];
         q->which=valid?0:1;q->count=(unsigned char)count;q->ox=(short)InterpOffsetX();q->oy=(short)InterpOffsetY();q->start=q->end=0;
@@ -928,7 +1062,7 @@ static void InterpProbe(const void *packet,const Vertex *v,const Vertex *mid,uns
 static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count);
 static const char *interp_probe_what;
 static unsigned interp_probe_pair,interp_probe_flags;
-static void InterpCapture(const void *packet,Vertex *v,unsigned count,const unsigned short *index,unsigned indices) {
+static void InterpCapture(const void *packet,Vertex *v,unsigned count,const u32 *index,unsigned indices) {
     static int probe=-1;
     interp_capture_index=index;interp_capture_indices=indices;
     if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
@@ -1091,8 +1225,9 @@ static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
             InterpAddEdge(p->position[a],p->position[b],position[a],position[b],interpolated_vertices[offset+a].pgxp_pos,
                           interpolated_vertices[offset+b].pgxp_pos,p->depth[a],p->depth[b],e->pair,ox,oy,!midpoint_only);
         }
-        if(interp_junction_prims_len<INTERP_JUNCTION_PRIMS){InterpJunctionPrim *q=&interp_junction_prims[interp_junction_prims_len++];
-            q->pair=e->pair;q->base=offset;q->count=(unsigned char)count;q->ox=(short)ox;q->oy=(short)oy;q->posed=!midpoint_only;
+        if(interp_junction_prims_len>=INTERP_JUNCTION_PRIMS)InterpEvict(IEVICT_JUNCTIONS);
+        else{InterpJunctionPrim *q=&interp_junction_prims[interp_junction_prims_len++];
+            q->pair=e->pair;q->base=interp_mid_len+offset;q->count=(unsigned char)count;q->ox=(short)ox;q->oy=(short)oy;q->posed=!midpoint_only;
             for(unsigned i=0;i<count;++i){q->p0[i][0]=p->position[i][0];q->p0[i][1]=p->position[i][1];
                 q->p1[i][0]=position[i][0];q->p1[i][1]=position[i][1];q->d0[i]=p->depth[i];
                 q->field[0][i]=field[0][i];q->field[1][i]=field[1][i];}}
@@ -1140,7 +1275,7 @@ static void InterpCaptureDraw(const void *packet,Vertex *v,unsigned count) {
         v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
     for(unsigned t=0;t<2;++t)if(mid_only_triangles>>t&1)
         for(unsigned k=0;k<3;++k){const unsigned i=3*t+k;
-            index_cur[i]=(unsigned short)(offset+i);
+            index_cur[i]=(u32)(offset+i);
             v[i].x=v[i].y=-2048;v[i].pgxp_pos[0]=v[i].pgxp_pos[1]=-2048.0f;v[i].pgxp_pos[2]=-1.0f;}
 }
 
@@ -1257,8 +1392,9 @@ static void InterpStore(InterpPair *p,unsigned pair,const Vertex *v,unsigned cou
     if(p->store_frame==interp_frame||!InterpGhostEnabled())return;
     /* semi-transparent shapes (shadows, effects) blend: a ghost of one
      * shows as a patch where nothing was */
-    if(count<3||count>6||interp_capture_indices<3||interp_capture_indices>6||v[0].exact[0][3]||v[0].a!=0xFF||
-       interp_store_len[b]+count>INTERP_STORE||interp_order_len[b]>=INTERP_ORDER)return;
+    if(count<3||count>6||interp_capture_indices<3||interp_capture_indices>6||v[0].exact[0][3]||v[0].a!=0xFF)return;
+    if(interp_store_len[b]+count>INTERP_STORE){InterpEvict(IEVICT_STORE);return;}
+    if(interp_order_len[b]>=INTERP_ORDER){InterpEvict(IEVICT_ORDER);return;}
     /* a pose crossing the view plane (a vertex at the GTE's screen limit)
      * or moving faster than a ghost can follow is no pose to continue */
     for(unsigned i=0;i<count;++i){
@@ -1604,7 +1740,7 @@ static void InterpExposeViewNow(InterpExposeView *view) {
 }
 /* The opaque triangles of a queued primitive (vertices at base, their view
  * depths at depth) into the frame's grid (0) or the midpoint's (2). */
-static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const unsigned short *index,unsigned indices,unsigned base,bool precise) {
+static void InterpExposePrimitive(unsigned grid,const InterpExposeView *view,const Vertex *v,const float *depth,const u32 *index,unsigned indices,unsigned base,bool precise) {
     const unsigned slot=interp_frame&1;
     if(interp_expose_rect[slot].frame!=interp_frame||v[0].a!=0xFF||indices<3)return;
     for(unsigned t=0;t+3<=indices;t+=3){float q[3][2],d[3];bool hidden=false;
@@ -1819,7 +1955,7 @@ int Psyz_GpuGetSpriteAtlasesEnabled(void) {return sprite_atlases_enabled;}
 
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled) {
     if(sprite_atlases_enabled!=(enabled!=0)) {
-        if(device)Draw_FlushBuffer();
+        if(device){Draw_FlushBuffer();InterpMidpointSync(INTERP_SYNC_SETTINGS);}
         sprite_atlases_enabled=enabled!=0;
     }
 }
@@ -1833,6 +1969,7 @@ void Psyz_GpuResetSpriteAtlases(void) {
     /* A room transition may still have queued draws reading the old cells.
      * Retire those reads before another room uploads into the same storage. */
     Draw_FlushBuffer();
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
     if (!RetireGpu()) return; /* preserve all atlas keys/cells on uncertainty */
     DuckAtlasReset();
     sprite_atlas_count=0;
@@ -1867,6 +2004,8 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
     if (gpu_failed || !key || !filename || !device || UseSoftwareBackend()) return 0;
     for (unsigned i=0;i<sprite_atlas_count;++i)
         if (sprite_atlases[i].key==key) return 1;
+    /* the midpoint kept so far samples the atlas as it is */
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
     const char *extension=SDL_strrchr(filename,'.');
     SDL_Surface *source=LoadHdImage(filename);
     if(source && extension && !SDL_strcasecmp(extension,".webp")) {
@@ -2361,7 +2500,7 @@ static bool CreateGpuResources(void) {
     vbuf = SDL_CreateGPUBuffer(device, &vbuf_info);
     const SDL_GPUBufferCreateInfo ibuf_info = {
         .usage = SDL_GPU_BUFFERUSAGE_INDEX,
-        .size = MAX_INDEX_COUNT * sizeof(u16),
+        .size = MAX_INDEX_COUNT * sizeof(*index_buf),
     };
     ibuf = SDL_CreateGPUBuffer(device, &ibuf_info);
     const SDL_GPUBufferCreateInfo clear_vbuf_info = {
@@ -2377,7 +2516,7 @@ static bool CreateGpuResources(void) {
     const SDL_GPUTransferBufferCreateInfo vtx_transfer_info = {
         .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
         .size =
-            MAX_VERTEX_COUNT * sizeof(Vertex) + MAX_INDEX_COUNT * sizeof(u16),
+            MAX_VERTEX_COUNT * sizeof(Vertex) + MAX_INDEX_COUNT * sizeof(*index_buf),
     };
     vtx_transfer = SDL_CreateGPUTransferBuffer(device, &vtx_transfer_info);
     ring_restart = true;
@@ -2738,7 +2877,9 @@ static bool PlatformBackend_BlankPresentWanted(void) {
 static void PlatformBackend_SubmitDrawing(void) {
     if (gpu_failed || !device)
         return;
-    Draw_FlushBuffer();
+    DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    if (interp_pair_ready)
+        InterpMidpointSync(INTERP_SYNC_PRESENT);
     SubmitCmd();
 }
 
@@ -2762,6 +2903,7 @@ static void MarkVramDirty(SDL_Rect r) {
         return;
     }
     DialogueFontDirty((SDL_Rect){x0,y0,x1-x0,y1-y0});
+    VramTilesAdd(&vram_dirty_tiles, x0, y0, x1 - x0, y1 - y0);
     if (vram_dirty.w <= 0 || vram_dirty.h <= 0) {
         vram_dirty = (SDL_Rect){x0, y0, x1 - x0, y1 - y0};
         return;
@@ -2774,7 +2916,10 @@ static void MarkVramDirty(SDL_Rect r) {
         y1 > vram_dirty.y + vram_dirty.h ? y1 : vram_dirty.y + vram_dirty.h;
     vram_dirty = (SDL_Rect){ux0, uy0, ux1 - ux0, uy1 - uy0};
 }
-static void ResetVramDirty(void) { vram_dirty = (SDL_Rect){0, 0, 0, 0}; }
+static void ResetVramDirty(void) {
+    vram_dirty = (SDL_Rect){0, 0, 0, 0};
+    vram_dirty_tiles = (VramTiles){{0}};
+}
 
 // mirror a native VRAM region into the scaled render target
 static void InterpBackdropAfterFill(int x, int y, int w, int h);
@@ -2782,6 +2927,10 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     if ((!scaled_vram_render && !interpolated_vram) || w <= 0 || h <= 0) {
         return;
     }
+    /* the midpoint kept so far draws over it first */
+    if (interpolated_vram && interpolated_scale == internal_res &&
+        InterpMidpointCovers(x, y, w, h))
+        InterpMidpointSync(INTERP_SYNC_TARGET);
     SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(2);
     if (!cmd) {
         return;
@@ -2809,6 +2958,7 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
 
 static void ReleaseTransientDisplayTextures(void) {
     if (!device) return;
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
     if(interpolated_vram){
         if(!SubmitCmdAndWait()||!SDL_WaitForGPUIdle(device))return;
         SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;
@@ -2900,6 +3050,7 @@ static void ApplyPendingInternalRes(void) {
         return;
     }
     Draw_FlushBuffer(); // render pending prims with the old multiplier
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
     Psyz_GpuResetInterpolation();
     if (want_scaled && (n != internal_res || !have_scaled)) {
         bool created = CreateScaledVramTarget(n);
@@ -3498,7 +3649,10 @@ static void PlatformBackend_Present(void) {
         return;
     }
 
-    Draw_FlushBuffer();
+    DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    /* the midpoint may be shown: it is complete */
+    if (interp_pair_ready)
+        InterpMidpointSync(INTERP_SYNC_PRESENT);
     ApplyPendingInternalRes();
     if (native_rasterizer)
         PresentNativeVram();
@@ -4121,6 +4275,7 @@ unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h) {
 
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h);
 unsigned char* Psyz_VideoAllocMidpointFrame(int* w, int* h) {
+    InterpMidpointComplete(INTERP_SYNC_PRESENT);
     if (w)
         *w = 0;
     if (h)
@@ -4810,9 +4965,9 @@ static void InterpInjectGhosts(unsigned h) {
             vertex_cur[i]=src[i];vertex_cur[i].x=vertex_cur[i].y=-2048;
             vertex_cur[i].pgxp_pos[0]=vertex_cur[i].pgxp_pos[1]=-2048.0f;vertex_cur[i].pgxp_pos[2]=-1.0f;
         }
-        for(unsigned k=0;k<ni;++k)index_cur[k]=(unsigned short)(base+g->store_index[k]);
+        for(unsigned k=0;k<ni;++k)index_cur[k]=(u32)(base+g->store_index[k]);
         if(textured)batch_has_texture=true;
-        vertex_cur+=n;index_cur+=ni;n_vertices+=(unsigned short)n;n_indices+=(int)ni;
+        vertex_cur+=n;index_cur+=ni;n_vertices+=n;n_indices+=(int)ni;
         interp_area[ISTAT_GHOST]+=InterpArea(g->position,n);++interp_count[ISTAT_GHOST];
         static int probe=-1;
         if(probe<0)probe=SDL_getenv("PSYZ_INTERP_PROBE")!=NULL;
@@ -4827,10 +4982,12 @@ static void InterpAddEdge(const float *a0,const float *b0,const float *a1,const 
                           float da,float db,unsigned pair,int ox,int oy,bool posed) {
     if(interp_edges_frame!=interp_frame){interp_edges_frame=interp_frame;interp_edges_len=interp_edge_refs_len=0;}
     const float lx=SDL_min(a0[0],b0[0]),hx=SDL_max(a0[0],b0[0]),ly=SDL_min(a0[1],b0[1]),hy=SDL_max(a0[1],b0[1]);
-    if(interp_edges_len>=INTERP_EDGES||!(lx>-2048.0f&&hx<2048.0f&&ly>-2048.0f&&hy<2048.0f))return;
+    if(!(lx>-2048.0f&&hx<2048.0f&&ly>-2048.0f&&hy<2048.0f))return;
+    if(interp_edges_len>=INTERP_EDGES){InterpEvict(IEVICT_EDGES);return;}
     const int x0=(int)SDL_floorf((lx-INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL),x1=(int)SDL_floorf((hx+INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL);
     const int y0=(int)SDL_floorf((ly-INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL),y1=(int)SDL_floorf((hy+INTERP_JUNCTION_REACH)/INTERP_EDGE_CELL);
-    if((x1-x0+1)*(y1-y0+1)>96||interp_edge_refs_len+(unsigned)((x1-x0+1)*(y1-y0+1))>INTERP_EDGE_REFS)return;
+    if((x1-x0+1)*(y1-y0+1)>96)return;
+    if(interp_edge_refs_len+(unsigned)((x1-x0+1)*(y1-y0+1))>INTERP_EDGE_REFS){InterpEvict(IEVICT_EDGE_REFS);return;}
     const unsigned e=interp_edges_len++;
     InterpEdge *g=&interp_edges[e];
     memcpy(g->a0,a0,sizeof(g->a0));memcpy(g->b0,b0,sizeof(g->b0));memcpy(g->a1,a1,sizeof(g->a1));memcpy(g->b1,b1,sizeof(g->b1));
@@ -4847,10 +5004,10 @@ static float InterpAlong(const float *p,const float *a,const float *b,float *dis
     *distance=SDL_fabsf((p[0]-a[0])*dy-(p[1]-a[1])*dx)/SDL_sqrtf(l2);
     return t;
 }
-/* Draw_FlushBuffer: queued paired vertices that lie on another paired
- * primitive's edge in both frames go onto the edge's midpoint. */
-static void InterpSnapJunctions(void) {
-    const unsigned n=interp_junction_prims_len;interp_junction_prims_len=0;
+/* InterpMidpointSync: the first n queued paired primitives' vertices that
+ * lie on another paired primitive's edge in both frames go onto the edge's
+ * midpoint. */
+static void InterpSnapJunctions(unsigned n) {
     static int snap=-1;
     if(snap<0){const char *e=SDL_getenv("PSYZ_INTERP_JUNCTIONS");snap=!(e&&*e=='0');}
     if(!snap||interp_edges_frame!=interp_frame)return;
@@ -4884,7 +5041,7 @@ static void InterpSnapJunctions(void) {
                 if(d0+(both?d1:d0)<best){best=d0+(both?d1:d0);on=g;}
             }
             if(!on)continue;
-            Vertex *out=&interpolated_vertices[q->base+i];
+            Vertex *out=&interp_mid_store[q->base+i];
             if(!(out->pgxp_pos[2]>0.0f))continue;
             float d;const float t=InterpAlong(out->pgxp_pos,on->am,on->bm,&d);
             if(!(t>0.0f&&t<1.0f)||d>INTERP_JUNCTION_MOVE)continue;
@@ -4897,13 +5054,12 @@ static void InterpSnapJunctions(void) {
         }
     }
 }
-/* Draw_FlushBuffer: the ghosts and new identities queued since the last
- * flush move as the primitives next to them did (InterpFieldMotion), in the
- * order queued, so one next to another follows it; vertices with none in
- * reach move as the primitive's others, a primitive with none keeps its
- * pose (a ghost its continued motion, a new identity this frame's pose). */
-static void InterpFinishPending(void) {
-    const unsigned pending=interp_pending_len;interp_pending_len=0;
+/* InterpMidpointSync: the first pending ghosts and new identities move as
+ * the primitives next to them did (InterpFieldMotion), in the order queued,
+ * so one next to another follows it; vertices with none in reach move as
+ * the primitive's others, a primitive with none keeps its pose (a ghost its
+ * continued motion, a new identity this frame's pose). */
+static void InterpFinishPending(unsigned pending) {
     static int field=-1;
     if(field<0){const char *e=SDL_getenv("PSYZ_INTERP_FIELD");field=!(e&&*e=='0');}
     static int probe=-1;
@@ -4916,21 +5072,23 @@ static void InterpFinishPending(void) {
             if(!field||!InterpFieldMotion(q->which,q->from[i],q->depth[i],q->ox,q->oy,motion[i],&d))continue;
             const float w=1.0f/(1.0f+d);
             shift[0]+=motion[i][0]*w;shift[1]+=motion[i][1]*w;weight+=w;found|=1u<<i;}
-        for(unsigned i=0;i<n;++i){Vertex *out=&interpolated_vertices[base+i];
+        for(unsigned i=0;i<n;++i){Vertex *out=&interp_mid_store[base+i];
             /* a ghost's vertex with no neighbour keeps its continued
              * motion; a new identity's moves as its neighbours do */
             if((found>>i&1)||(found&&q->which==1)){const float *m=(found>>i&1)?motion[i]:(const float[2]){shift[0]/weight,shift[1]/weight};
                 out->pgxp_pos[0]=q->from[i][0]+m[0];out->pgxp_pos[1]=q->from[i][1]+m[1];
                 if(!(out->pgxp_pos[2]>0.0f))out->pgxp_pos[2]=1.0f;}
             InterpFieldAdd(q->which,q->from[i],q->depth[i],q->ox,q->oy,out->pgxp_pos);
-            interp_mid_depth[base+i]=q->depth[i];}
-        unsigned short index[6];for(unsigned i=0;i<q->indices;++i)index[i]=(unsigned short)(base+q->index[i]);
-        InterpExposePrimitive(2,&q->view,&interpolated_vertices[base],&interp_mid_depth[base],index,q->indices,base,true);
+            interp_mid_depth_store[base+i]=q->depth[i];}
+        u32 index[6];for(unsigned i=0;i<q->indices;++i)index[i]=base+q->index[i];
+        InterpExposePrimitive(2,&q->view,&interp_mid_store[base],&interp_mid_depth_store[base],index,q->indices,base,true);
+        /* (the frame's vertices are drawn: "own" is the midpoint pose too) */
         if(probe){interp_probe_pair=q->pair;interp_probe_flags=found;
-            InterpProbe(NULL,&vertex_buf[base],&interpolated_vertices[base],n,q->which?"new-final":"ghost-final");}
+            InterpProbe(NULL,&interp_mid_store[base],&interp_mid_store[base],n,q->which?"new-final":"ghost-final");}
     }
 }
 static void InterpEnqueued(void) {
+    ++batch_primitives;
     if(!interp_inject&&!interp_ghost_first)return;
     if(!interpolation_enabled||!interpolated_vram||interpolated_scale!=internal_res||interp_line_mode){interp_inject=0;return;}
     if(interp_ghost_first){const unsigned h=interp_ghost_first;interp_ghost_first=0;InterpInjectGhosts(h);}
@@ -5175,9 +5333,13 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     const int cx = (clut & 63) * 16, cy = (clut >> 6) & 511;
     const int cw = depth ? 256 : 16;
     const SDL_Rect row = {cx, cy, cw, 1}, wrapped = {0, cy, cx + cw - VRAM_W, 1};
-    if (RectsIntersect(row, batch_drawn) || RectsIntersect(wrapped, batch_drawn) ||
-        clut_cache_loads + 1 >= CLUT_CACHE_ROWS)
-        Draw_FlushBuffer();
+    if (RectsIntersect(row, batch_drawn) || RectsIntersect(wrapped, batch_drawn))
+        DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
+    else if (clut_cache_loads + 1 >= CLUT_CACHE_ROWS)
+        DRAW_FLUSH_FOR(DRAW_FLUSH_CLUT);
+    /* the rows the midpoint kept so far reads stay until it is drawn */
+    if (InterpMidpointDeferred() && interp_mid_clut_loads + 1 >= CLUT_CACHE_ROWS)
+        InterpMidpointSync(INTERP_SYNC_CLUT);
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
     if (!copy)
@@ -5186,6 +5348,8 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     clut_cache_8bit = depth == 1;
     clut_cache_row = (clut_cache_row + 1) % CLUT_CACHE_ROWS;
     clut_cache_loads++;
+    interp_mid_clut_loads++;
+    draw_frame_stats.clut_loads++;
     const int first = SDL_min(cw, VRAM_W - cx);
     const SDL_GPUTextureLocation src = {
         .texture = vram_render, .x = (Uint32)cx, .y = (Uint32)cy};
@@ -5276,7 +5440,7 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
         const int n = TextureFootprint(tpage, u0, u1, v0, v1, read);
         for (int i = 0; i < n; i++) {
             if (RectsIntersect(read[i], batch_drawn)) {
-                Draw_FlushBuffer();
+                DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
                 break;
             }
         }
@@ -5317,7 +5481,7 @@ static void DrawLineRun(int x, int y, int n, int r, int g, int b, bool semi,
     }
     static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
     for (int k = 0; k < 6; k++)
-        index_cur[k] = (unsigned short)(n_vertices + order[k]);
+        index_cur[k] = (u32)(n_vertices + order[k]);
     Draw_EnqueueBuffer(4, 6);
 }
 
@@ -5648,7 +5812,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                     if (culled[t])
                         continue;
                     if (t == 1 && split)
-                        Draw_FlushBuffer();
+                        DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
                     const int emitted = EmitExactTriangle(
                         &source[corner[t][0]], &source[corner[t][1]],
                         &source[corner[t][2]], vertex_cur);
@@ -5656,7 +5820,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                         static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
                         for (int k = 0; k < 6; ++k)
                             index_cur[q * 6 + k] =
-                                (unsigned short)(n_vertices + q * 4 + order[k]);
+                                (u32)(n_vertices + q * 4 + order[k]);
                     }
                     Draw_EnqueueBuffer(emitted, emitted / 4 * 6);
                     batch_has_texture |= isTextured;
@@ -5712,9 +5876,10 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         interp_line_mode = mid_line || own_only ? 1 + pass : 3;
         const bool placed = pass == 1 && interp_line_pend >= 0;
         if (placed) {
-            /* its quads stay in one batch (InterpFinishLines) */
+            /* its quads stay in one batch (InterpFinishLines); start and
+             * end are in the frame's midpoint store */
             Draw_EnsureBufferWillNotOverflow(4 * (count - 1), 6 * (count - 1));
-            interp_line_pending[interp_line_pend].start = n_vertices;
+            interp_line_pending[interp_line_pend].start = interp_mid_len + n_vertices;
         }
         int x0 = 0, y0 = 0, r0 = v->r, g0 = v->g, b0 = v->b;
         int at = 0;
@@ -5737,8 +5902,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         }
         if (placed) {
             InterpLinePending* q = &interp_line_pending[interp_line_pend];
-            if (q->start <= n_vertices) {
-                q->end = n_vertices;
+            if (q->start <= interp_mid_len + n_vertices) {
+                q->end = interp_mid_len + n_vertices;
                 ++interp_line_pending_len;
             }
         }
@@ -6161,6 +6326,10 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         return;
     }
 
+    /* the copy goes through vram_sample at the source (as its native
+     * pixels are now): the midpoint kept so far samples it first */
+    if (InterpMidpointSamplesRect(src_x, src_y, copy_w, copy_h))
+        InterpMidpointSync(INTERP_SYNC_TEXTURE);
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return;
@@ -6234,13 +6403,14 @@ static void DrawStateChanging(void) {
     if (n_draw_marks && draw_marks[n_draw_marks - 1].end == n_indices)
         return; /* no primitive has the state the last mark ended with */
     if (n_draw_marks == DRAW_MARKS_MAX) {
-        Draw_FlushBuffer();
+        DRAW_FLUSH_FOR(DRAW_FLUSH_MARKS);
         return;
     }
     draw_marks[n_draw_marks].end = n_indices;
     draw_marks[n_draw_marks++].state = CurrentDrawState();
 }
 
+static void InterpMidpointDropBatch(void);
 void Draw_ResetBuffer(void) {
     dialogue_font_batch=-1;
     n_draw_marks = 0;
@@ -6248,11 +6418,12 @@ void Draw_ResetBuffer(void) {
         software_rasterizer.reset_buffer();
         return;
     }
+    /* a batch the midpoint did not keep (InterpMidpointRecord) takes its
+     * pending placements with it */
+    InterpMidpointDropBatch();
     n_vertices = 0;
     n_indices = 0;
-    interp_pending_len = 0;
-    interp_junction_prims_len = 0;
-    interp_line_pending_len = 0;
+    batch_primitives = 0;
     vertex_cur = vertex_buf;
     index_cur = index_buf;
     batch_has_texture = false;
@@ -6274,7 +6445,8 @@ typedef struct DrawSegment {
 #define DRAW_SEGMENTS_MAX 32
 /* Runs in one pass when the shader fetches the destination (no copies). */
 #define DRAW_SEGMENTS_FETCH_MAX 512
-static bool PrimitiveBox(int start, int end, bool midpoint,
+static bool PrimitiveBox(const Vertex* vertices, const u32* indices,
+                         int start, int end, bool midpoint,
                          bool scaled_target, unsigned target_scale,
                          Posi offset, float sub_x, float sub_y, float target_centre,
                          float ws_squeeze, SDL_Rect clip, SemiBox* box) {
@@ -6283,8 +6455,7 @@ static bool PrimitiveBox(int start, int end, bool midpoint,
      * [min, max); anything else may round to one more pixel each side. */
     bool rectangle = true;
     for (int i = start; i < end; ++i) {
-        const Vertex* v = midpoint ? &interpolated_vertices[index_buf[i]]
-                                   : &vertex_buf[index_buf[i]];
+        const Vertex* v = &vertices[indices[i]];
         float bias =
             (v->t & TPAGE_POLYGON) ? 0.5f / (float)target_scale : 0.0f;
         bool use_pgxp =
@@ -6318,11 +6489,11 @@ static bool PrimitiveBox(int start, int end, bool midpoint,
     return x1 > x0 && y1 > y0;
 }
 
-static int SharedVertices(int a, int b) {
+static int SharedVertices(const u32* indices, int a, int b) {
     int shared = 0;
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
-            shared += index_buf[a + i] == index_buf[b + j];
+            shared += indices[a + i] == indices[b + j];
     return shared;
 }
 
@@ -6416,18 +6587,17 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     view->mask_check = mask_check_bit;
 }
 
-/* Draw_FlushBuffer: the points of the lines queued since the last flush go
- * where the polygon vertices they lie at went (within INTERP_LINE_REACH
+/* InterpMidpointSync: the points of the first n queued lines (in the
+ * store's first vertices) go where the polygon vertices they lie at went (within INTERP_LINE_REACH
  * pixels): a paired line's by at most a pixel and a half from the midpoint
  * of their own poses (not to another surface at the same place), a new
  * line's only when every point lies at one. The others keep the line's own
  * placement (a paired line the midpoint of its poses, a new one this
  * frame's pose). Each segment is a quad (DrawLineQuad), its first two
  * vertices at the segment's first point. */
-static void InterpFinishLines(void) {
-    const unsigned n=interp_line_pending_len;interp_line_pending_len=0;
+static void InterpFinishLines(unsigned n,unsigned vertices) {
     for(unsigned k=0;k<n;++k){const InterpLinePending *q=&interp_line_pending[k];
-        if(q->end<=q->start||q->end>n_vertices||q->end-q->start!=4u*(q->count-1u))continue;
+        if(q->end<=q->start||q->end>vertices||q->end-q->start!=4u*(q->count-1u))continue;
         float to[INTERP_LINE_POINTS][2];unsigned found=0;
         for(unsigned i=0;i<q->count;++i){float m[2],d;
             to[i][0]=q->want[i][0];to[i][1]=q->want[i][1];
@@ -6438,7 +6608,7 @@ static void InterpFinishLines(void) {
         if(q->which==1&&found<q->count)for(unsigned i=0;i<q->count;++i){to[i][0]=q->want[i][0];to[i][1]=q->want[i][1];}
         /* at 1x at whole pixels, as the line is drawn */
         if(internal_res<=1)for(unsigned i=0;i<q->count;++i){to[i][0]=SDL_floorf(to[i][0]+0.5f);to[i][1]=SDL_floorf(to[i][1]+0.5f);}
-        for(unsigned v=q->start;v<q->end;++v){Vertex *out=&interpolated_vertices[v];
+        for(unsigned v=q->start;v<q->end;++v){Vertex *out=&interp_mid_store[v];
             const unsigned i=(v-q->start)/4u+((v-q->start)%4u>=2u);
             out->pgxp_pos[0]=(float)out->x-q->at[i][0]+to[i][0];out->pgxp_pos[1]=(float)out->y-q->at[i][1]+to[i][1];out->pgxp_pos[2]=1.0f;}
     }
@@ -6468,13 +6638,453 @@ static void DrawLineQuad(int x0, int y0, int r0, int g0, int b0, int x1, int y1,
     }
     static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
     for (int k = 0; k < 6; k++)
-        index_cur[k] = (unsigned short)(n_vertices + order[k]);
+        index_cur[k] = (u32)(n_vertices + order[k]);
     Draw_EnqueueBuffer(4, 6);
 }
+/* What one target draws of a batch (DrawTargetRuns): vertices and indices,
+ * the end index and view of each drawing state, the texture bound third
+ * (dialogue font, sprite atlas or VRAM) and whether the draw grid is 1:1. */
+typedef struct DrawTargetBatch {
+    SDL_GPUTexture* target;
+    unsigned target_index, target_scale;
+    bool midpoint;
+    const Vertex* vertices;
+    const u32* indices;
+    int n_indices;
+    Uint32 vertex_offset, index_offset; /* bytes into vbuf, ibuf */
+    const int* mark_end;
+    const DrawView* views;
+    SDL_GPUTexture* extra_texture;
+    SDL_GPUSampler* extra_sampler;
+    bool grid_same;
+} DrawTargetBatch;
+
+/* Draws a batch into one target; false when the command buffer failed. */
+static bool DrawTargetRuns(const DrawTargetBatch* b) {
+    const Vertex* vb = b->vertices;
+    const u32* ix = b->indices;
+    const int n_indices = b->n_indices;
+    SDL_GPUTexture* render_target = b->target;
+    const unsigned target_index = b->target_index;
+    const unsigned target_scale = b->target_scale;
+    const bool midpoint = b->midpoint;
+    SDL_GPUTexture* destination_sample =
+        target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
+    int start = 0, mark = 0;
+    while (start < n_indices) {
+        /* A semi-transparent primitive blends with a copy of the VRAM
+         * made before it: one triangle, or one bounding box (two
+         * triangles that do not overlap) of an exact polygon. Each render
+         * pass loads and stores the whole target, so one pass draws a
+         * run of segments (consecutive opaque primitives, or one
+         * semi-transparent primitive) from one copy: a semi-transparent
+         * primitive joins it while its pixels miss those of every
+         * earlier segment of the run, so the copy still holds its
+         * destination. With destination_fetch the shader reads the
+         * destination from the target itself: a run of semi-transparent
+         * primitives is one draw and nothing breaks the pass. A segment
+         * keeps to one drawing state (mark); the pass sets each one's
+         * viewport, scissor and uniforms. */
+        DrawSegment segments[DRAW_SEGMENTS_FETCH_MAX];
+        SemiBox boxes[DRAW_SEGMENTS_FETCH_MAX];
+        const int max_segments = destination_fetch ? DRAW_SEGMENTS_FETCH_MAX
+                                                   : DRAW_SEGMENTS_MAX;
+        int n_segments = 0, n_draws = 0;
+        int end = start;
+        while (end < n_indices && n_segments < max_segments) {
+            while (b->mark_end[mark] <= end)
+                ++mark;
+            const int mark_end = b->mark_end[mark];
+            const DrawView* view = &b->views[mark];
+            if (!view->visible) {
+                end = mark_end; // an empty drawing area draws nothing
+                continue;
+            }
+            int seg_start = end;
+            bool semi = vb[ix[seg_start]].a != 0xFF;
+            int seg_end =
+                seg_start + (vb[ix[seg_start]].exact[0][3] ? 6 : 3);
+            /* The two triangles of one quad (two shared vertices) cover
+             * disjoint pixels: they read the same copy. */
+            if (semi && seg_end + 3 <= mark_end &&
+                !vb[ix[seg_start]].exact[0][3] &&
+                vb[ix[seg_end]].a != 0xFF &&
+                SharedVertices(ix, seg_start, seg_end) >= 2)
+                seg_end += 3;
+            if (!semi || destination_fetch) {
+                while (seg_end < mark_end &&
+                       (vb[ix[seg_end]].a != 0xFF) == semi)
+                    seg_end += 3;
+            }
+            if (seg_end > mark_end)
+                seg_end = mark_end;
+            SemiBox box;
+            bool visible = PrimitiveBox(
+                vb, ix, seg_start, seg_end, midpoint, target_index != 0,
+                target_scale, view->offset, view->sub_x, view->sub_y,
+                view->target_centre, view->ws_squeeze, view->clip, &box);
+            if (semi && n_segments && !destination_fetch) {
+                bool overlaps = false;
+                for (int i = 0; visible && i < n_segments; ++i)
+                    overlaps |= boxes[i].x1 > boxes[i].x0 &&
+                                box.x0 < boxes[i].x1 &&
+                                boxes[i].x0 < box.x1 &&
+                                box.y0 < boxes[i].y1 && boxes[i].y0 < box.y1;
+                if (overlaps)
+                    break;
+            }
+            end = seg_end;
+            if (semi && !visible)
+                continue; // outside the drawing area: draws nothing
+            if (!visible)
+                box.x0 = box.x1 = 0;
+            boxes[n_segments] = box;
+            segments[n_segments++] =
+                (DrawSegment){seg_start, seg_end, semi, mark};
+            n_draws += semi ? 1 : 2;
+        }
+        if (!n_segments) {
+            start = end;
+            continue;
+        }
+        /* Up to four sampled textures for each draw. Reserve both heaps'
+         * worst-case sampler use before any destination copy. */
+        SDL_GPUCommandBuffer* cmd = ReserveDrawDescriptors(4u * (unsigned)n_draws);
+        if (!cmd)
+            return false;
+        SDL_GPUCopyPass* blend_copy = NULL;
+        for (int i = 0; i < n_segments && !destination_fetch; ++i) {
+            if (!segments[i].semi)
+                continue;
+            if (!blend_copy)
+                blend_copy = SDL_BeginGPUCopyPass(cmd);
+            SDL_GPUTextureLocation from = {
+                .texture = render_target,
+                .x = (Uint32)boxes[i].x0,
+                .y = (Uint32)boxes[i].y0};
+            SDL_GPUTextureLocation to = from;
+            to.texture = destination_sample;
+            SDL_CopyGPUTextureToTexture(
+                blend_copy, &from, &to,
+                (Uint32)(boxes[i].x1 - boxes[i].x0),
+                (Uint32)(boxes[i].y1 - boxes[i].y0), 1, false);
+        }
+        if (blend_copy)
+            SDL_EndGPUCopyPass(blend_copy);
+        const SDL_GPUColorTargetInfo target = {
+            .texture = render_target,
+            .load_op = SDL_GPU_LOADOP_LOAD,
+            .store_op = SDL_GPU_STOREOP_STORE,
+        };
+        ++frame_stats_batches;
+        SDL_GPURenderPass* pass =
+            SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
+        const SDL_GPUBufferBinding vbind = {.buffer = vbuf, .offset = b->vertex_offset};
+        SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
+        const SDL_GPUBufferBinding ibind = {.buffer = ibuf, .offset = b->index_offset};
+        SDL_BindGPUIndexBuffer(pass, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        const SDL_GPUTextureSamplerBinding sampler_binding[4] = {
+            {.texture=vram_sample,.sampler=vram_sampler},
+            {.texture=destination_sample,.sampler=vram_sampler},
+            {.texture=b->extra_texture,.sampler=b->extra_sampler},
+            {.texture=clut_cache,.sampler=vram_sampler}};
+        SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,PSX_SHADERS_CURRENT ? 4 : 3);
+        int pass_mark = -1;
+        for (int s = 0; s < n_segments; ++s) {
+            const DrawView* view = &b->views[segments[s].mark];
+            if (segments[s].mark != pass_mark) {
+                pass_mark = segments[s].mark;
+                SDL_SetGPUViewport(pass, &view->viewport);
+                SDL_SetGPUScissor(pass, &view->scissor);
+                SDL_PushGPUVertexUniformData(
+                    cmd, 0, view->offset_ubo, sizeof(view->offset_ubo));
+            }
+            const u32 pass_flags = view->pass_flags;
+            const bool semi = segments[s].semi;
+            const Uint32 first = (Uint32)segments[s].start;
+            const Uint32 count = (Uint32)(segments[s].end - segments[s].start);
+            /* Opaque primitives under "check mask" overlap each other in
+             * one draw: pass 3 writes colour and mask bit together,
+             * blended by the destination's mask bit (alpha), so a pixel
+             * masked by an earlier primitive of the batch is kept. */
+            const bool checked = PSX_SHADERS_CURRENT && !semi && view->mask_check;
+            const u32 color_pass[4] = {
+                semi ? 2u : checked ? 3u : 0u, target_scale,
+                b->grid_same, pass_flags};
+            SDL_PushGPUFragmentUniformData(
+                cmd, 0, color_pass, sizeof(color_pass));
+
+            SDL_BindGPUGraphicsPipeline(
+                pass, semi && destination_fetch ? pipe_direct_fetch :
+                      pipe_tri[semi      ? BLEND_DIRECT
+                               : checked ? BLEND_CHECK
+                                         : BLEND_ADD]);
+            SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+            /* Blend factors use source alpha as an operation selector.
+             * Write the actual PS1 mask bit separately, without changing
+             * the color result. */
+            if (!semi && !checked) {
+                const u32 mask_pass[4] = {
+                    1, target_scale, b->grid_same, pass_flags};
+                SDL_PushGPUFragmentUniformData(
+                    cmd, 0, mask_pass, sizeof(mask_pass));
+                SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
+                SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+            }
+        }
+        SDL_EndGPURenderPass(pass);
+        start = end;
+    }
+    return true;
+}
+
+/* The batches the midpoint keeps until it is drawn (InterpMidpointSync):
+ * their vertices (interp_mid_store) and indices (interp_mid_index), and the
+ * view (for the midpoint target, as Draw_FlushBuffer computed it then) and
+ * end index of each drawing state. */
+/* (a frame of forced 16-primitive batches, PSYZ_BATCH_PRIMITIVES=16, is up
+ * to about 2300 batches in the attract sweep) */
+#define INTERP_MID_BATCHES 8192u
+#define INTERP_MID_MARKS 16384u
+typedef struct {
+    unsigned vertex, vertices, index, indices, mark;
+    SDL_GPUTexture* extra_texture;
+    SDL_GPUSampler* extra_sampler;
+    bool grid_same;
+} InterpMidBatch;
+static InterpMidBatch interp_mid_batches[INTERP_MID_BATCHES];
+static unsigned interp_mid_batches_len, interp_mid_marks_len;
+static int interp_mid_mark_end[INTERP_MID_MARKS];
+static DrawView interp_mid_views[INTERP_MID_MARKS];
+static bool InterpMidpointDeferred(void) { return interp_mid_batches_len != 0; }
+static bool InterpMidpointCovers(int x, int y, int w, int h) {
+    return interp_mid_batches_len && VramTilesHitRect(&interp_mid_target_tiles, x, y, w, h);
+}
+static bool InterpMidpointSamplesRect(int x, int y, int w, int h) {
+    return interp_mid_batches_len && VramTilesHitRect(&interp_mid_texture_tiles, x, y, w, h);
+}
+/* The midpoint target draws this frame's batches. */
+static bool InterpMidpointDrawn(void) {
+    return interpolation_enabled && interpolated_vram &&
+           interpolated_scale == internal_res && interp_serial;
+}
+/* Draw_ResetBuffer: the placements queued with a batch the midpoint did
+ * not keep (they follow those of the kept batches). */
+static void InterpMidpointDropBatch(void) {
+    const unsigned kept = interp_mid_len;
+    while (interp_pending_len && interp_pending[interp_pending_len - 1].base >= kept)
+        --interp_pending_len;
+    while (interp_junction_prims_len && interp_junction_prims[interp_junction_prims_len - 1].base >= kept)
+        --interp_junction_prims_len;
+    while (interp_line_pending_len && interp_line_pending[interp_line_pending_len - 1].start >= kept)
+        --interp_line_pending_len;
+}
+/* Draw_FlushBuffer, after the frame's targets: the midpoint keeps the
+ * batch (n_marks drawing states in draw_marks). */
+static void InterpMidpointRecord(int n_marks, SDL_GPUTexture* extra_texture,
+                                 SDL_GPUSampler* extra_sampler, bool grid_same) {
+    if (interp_mid_batches_len >= INTERP_MID_BATCHES ||
+        interp_mid_marks_len + (unsigned)n_marks > INTERP_MID_MARKS)
+        InterpMidpointSync(INTERP_SYNC_FULL);
+    if (!interp_mid_batches_len)
+        interp_mid_clut_loads = clut_cache_loads;
+    InterpMidBatch* b = &interp_mid_batches[interp_mid_batches_len++];
+    *b = (InterpMidBatch){interp_mid_len, n_vertices, interp_mid_index_len, (unsigned)n_indices,
+                          interp_mid_marks_len, extra_texture, extra_sampler, grid_same};
+    memcpy(&interp_mid_index[interp_mid_index_len], index_buf, sizeof(*index_buf) * (size_t)n_indices);
+    const unsigned target_index = scaled_vram_render ? 2u : 1u;
+    for (int k = 0; k < n_marks; ++k) {
+        ApplyDrawState(&draw_marks[k].state);
+        ComputeDrawView(&interp_mid_views[interp_mid_marks_len + k], target_index, true, internal_res);
+        interp_mid_mark_end[interp_mid_marks_len + k] = draw_marks[k].end;
+        const SDL_Rect area = draw_marks[k].state.scissor;
+        VramTilesAdd(&interp_mid_target_tiles, area.x, area.y, area.w, area.h);
+    }
+    unsigned last = 0xFFFFFFFFu;
+    for (unsigned i = 0; i < n_vertices; ++i) {
+        const unsigned t = vertex_buf[i].t;
+        if (t == last)
+            continue;
+        last = t;
+        if (!(t & TPAGE_NOTEXTURE))
+            VramTilesAddPage(&interp_mid_texture_tiles, t);
+    }
+    interp_mid_len += n_vertices;
+    interp_mid_index_len += (unsigned)n_indices;
+    interp_mid_marks_len += (unsigned)n_marks;
+    interpolated_vertices = interp_mid_store + interp_mid_len;
+    interp_mid_depth = interp_mid_depth_store + interp_mid_len;
+}
+/* Draws the kept batches into the midpoint target, each as the frame's
+ * batch was drawn (through the same vertex and index buffers). */
+static bool InterpMidpointDraw(void) {
+    if (!interpolation_enabled || !interpolated_vram || interpolated_scale != internal_res)
+        return true; /* no target to draw into */
+    const unsigned target_index = scaled_vram_render ? 2u : 1u;
+    for (unsigned k = 0; k < interp_mid_batches_len; ++k) {
+        const InterpMidBatch* b = &interp_mid_batches[k];
+        if (!b->indices)
+            continue;
+        Uint32 vertex_at, index_at;
+        const bool cycle = RingReserve(b->vertices, b->indices, &vertex_at, &index_at);
+        SDL_GPUCommandBuffer* cmd = AcquireCmd();
+        if (!cmd)
+            return false;
+        u8* map = SDL_MapGPUTransferBuffer(device, vtx_transfer, cycle);
+        if (!map) {
+            GpuFail("interpolation transfer map", false);
+            return false;
+        }
+        const Uint32 vtx_size = (Uint32)(sizeof(Vertex) * b->vertices);
+        const Uint32 idx_size = (Uint32)(sizeof(*interp_mid_index) * b->indices);
+        const Uint32 vtx_offset = vertex_at * (Uint32)sizeof(Vertex);
+        const Uint32 idx_offset = MAX_VERTEX_COUNT * (Uint32)sizeof(Vertex) +
+                                  index_at * (Uint32)sizeof(*interp_mid_index);
+        memcpy(map + vtx_offset, &interp_mid_store[b->vertex], vtx_size);
+        memcpy(map + idx_offset, &interp_mid_index[b->index], idx_size);
+        SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
+        SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+        if (!copy) {
+            GpuFail("interpolation copy pass", false);
+            return false;
+        }
+        const SDL_GPUTransferBufferLocation vtx_src = {.transfer_buffer = vtx_transfer, .offset = vtx_offset};
+        const SDL_GPUBufferRegion vtx_dst = {.buffer = vbuf, .offset = vtx_offset, .size = vtx_size};
+        const bool buffers_cycle = RingCycleBuffers();
+        SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, buffers_cycle);
+        const SDL_GPUTransferBufferLocation idx_src = {.transfer_buffer = vtx_transfer, .offset = idx_offset};
+        const SDL_GPUBufferRegion idx_dst = {.buffer = ibuf, .offset = index_at * (Uint32)sizeof(*interp_mid_index), .size = idx_size};
+        SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, buffers_cycle);
+        SDL_EndGPUCopyPass(copy);
+        const DrawTargetBatch target = {
+            interpolated_vram, target_index, internal_res, true,
+            &interp_mid_store[b->vertex], &interp_mid_index[b->index], (int)b->indices,
+            vtx_offset, index_at * (Uint32)sizeof(*interp_mid_index),
+            &interp_mid_mark_end[b->mark], &interp_mid_views[b->mark],
+            b->extra_texture, b->extra_sampler, b->grid_same};
+        if (!DrawTargetRuns(&target))
+            return false;
+    }
+    return true;
+}
+static const char* const interp_sync_names[INTERP_SYNC_N] = {
+    "frame", "full", "texture", "clut", "target", "present", "settings"};
+/* Places the kept batches' ghosts, new identities, T-junctions and
+ * outlines from the frame's neighbours so far (all of them at the end of
+ * the frame, INTERP_SYNC_FRAME), then draws them into the midpoint. The
+ * batch being queued, if any, stays: its vertices move to the store's
+ * start and its placements wait for the next sync. */
+static void InterpMidpointSync(unsigned reason) {
+    if (!interp_mid_batches_len)
+        return;
+    const unsigned drawn = interp_mid_len;
+    unsigned np = 0, nj = 0, nl = 0;
+    while (np < interp_pending_len && interp_pending[np].base < drawn)
+        ++np;
+    while (nj < interp_junction_prims_len && interp_junction_prims[nj].base < drawn)
+        ++nj;
+    while (nl < interp_line_pending_len && interp_line_pending[nl].start < drawn)
+        ++nl;
+    ++draw_frame_stats.syncs[reason];
+    if (reason != INTERP_SYNC_FRAME && np + nj + nl) {
+        ++draw_frame_stats.split_pending;
+        static bool warned[INTERP_SYNC_N];
+        if (!warned[reason]) {
+            warned[reason] = true;
+            WARNF("midpoint of frame %u placed before the frame was complete (%s): %u ghosts and new faces, %u T-junction primitives and %u outlines see only the neighbours queued so far",
+                  interp_frame, interp_sync_names[reason], np, nj, nl);
+        }
+    }
+    InterpSnapJunctions(nj);
+    InterpFinishPending(np);
+    InterpFinishLines(nl, drawn);
+    if (!InterpMidpointDraw()) {
+        interp_pair_ready = false;
+        interp_matches = 0;
+    }
+    /* what the batch being queued placed: relative to the store's start */
+    memmove(interp_pending, interp_pending + np, sizeof(*interp_pending) * (interp_pending_len - np));
+    interp_pending_len -= np;
+    for (unsigned k = 0; k < interp_pending_len; ++k)
+        interp_pending[k].base -= drawn;
+    memmove(interp_junction_prims, interp_junction_prims + nj,
+            sizeof(*interp_junction_prims) * (interp_junction_prims_len - nj));
+    interp_junction_prims_len -= nj;
+    for (unsigned k = 0; k < interp_junction_prims_len; ++k)
+        interp_junction_prims[k].base -= drawn;
+    const unsigned lines = interp_line_pending_len;
+    memmove(interp_line_pending, interp_line_pending + nl, sizeof(*interp_line_pending) * (lines - nl));
+    interp_line_pending_len -= nl;
+    for (unsigned k = 0; k < interp_line_pending_len; ++k)
+        interp_line_pending[k].start -= drawn, interp_line_pending[k].end -= drawn;
+    /* a line being drawn (InterpLine) has its entry after the others; its
+     * quads already drawn (before its start) leave it unplaced */
+    if (interp_line_pend >= 0 && (unsigned)interp_line_pend == lines) {
+        InterpLinePending* q = &interp_line_pending[lines];
+        q->start = q->start >= drawn ? q->start - drawn : 0xFFFFFFFFu;
+        interp_line_pending[interp_line_pending_len] = *q;
+        interp_line_pend = (int)interp_line_pending_len;
+    }
+    if (n_vertices) {
+        memmove(interp_mid_store, interp_mid_store + drawn, sizeof(Vertex) * n_vertices);
+        memmove(interp_mid_depth_store, interp_mid_depth_store + drawn, sizeof(float) * n_vertices);
+    }
+    interp_mid_len = interp_mid_index_len = 0;
+    interp_mid_batches_len = interp_mid_marks_len = 0;
+    interpolated_vertices = interp_mid_store;
+    interp_mid_depth = interp_mid_depth_store;
+    interp_mid_texture_tiles = interp_mid_target_tiles = (VramTiles){{0}};
+    interp_mid_clut_loads = clut_cache_loads;
+}
+/* The midpoint is to be complete: the batch being queued is drawn, then
+ * the midpoint. */
+static void InterpMidpointComplete(unsigned reason) {
+    if (n_vertices && InterpMidpointDrawn())
+        DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    InterpMidpointSync(reason);
+}
+/* Draw_EnsureBufferWillNotOverflow: the batch is full, or (forced for
+ * tests: PSYZ_BATCH_VERTICES=<vertices>, PSYZ_BATCH_PRIMITIVES=<primitives>)
+ * smaller. A midpoint store too full for the primitive draws the batch and
+ * the midpoint first. */
+static bool InterpBatchFull(unsigned vertices, unsigned indices) {
+    static int limit_vertices = -1, limit_primitives;
+    if (limit_vertices < 0) {
+        const char* e = SDL_getenv("PSYZ_BATCH_VERTICES");
+        limit_vertices = e ? SDL_max(SDL_atoi(e), 0) : 0;
+        e = SDL_getenv("PSYZ_BATCH_PRIMITIVES");
+        limit_primitives = e ? SDL_max(SDL_atoi(e), 0) : 0;
+    }
+    const unsigned most = limit_vertices > 0 && (unsigned)limit_vertices < MAX_VERTEX_COUNT
+                              ? (unsigned)limit_vertices : MAX_VERTEX_COUNT;
+    if (n_vertices + vertices > most || n_indices + (int)indices > MAX_INDEX_COUNT ||
+        (limit_primitives > 0 && batch_primitives >= (unsigned)limit_primitives))
+        return true;
+    if (!interpolation_enabled ||
+        (interp_mid_len + n_vertices + vertices <= INTERP_MID_VERTICES &&
+         interp_mid_index_len + (unsigned)n_indices + indices <= INTERP_MID_INDICES))
+        return false;
+    DRAW_FLUSH_FOR(DRAW_FLUSH_OVERFLOW);
+    InterpMidpointSync(INTERP_SYNC_FULL);
+    return false;
+}
+/* A batch is drawn (Draw_FlushBuffer): PSYZ_INTERP_STATS, PSYZ_FRAME_STATS. */
+static void DrawCountFlush(unsigned reason) {
+    DrawFrameStats* s = &draw_frame_stats;
+    s->vertices += n_vertices;
+    s->indices += (unsigned)n_indices;
+    s->batch_vertices = SDL_max(s->batch_vertices, n_vertices);
+    s->batch_indices = SDL_max(s->batch_indices, (unsigned)n_indices);
+    ++s->flushes[reason < DRAW_FLUSH_REASONS ? reason : DRAW_FLUSH_STATE];
+    frame_stats_vertices += n_vertices;
+    ++frame_stats_flushes;
+    if (reason == DRAW_FLUSH_OVERFLOW || reason == DRAW_FLUSH_MARKS || reason == DRAW_FLUSH_CLUT)
+        ++frame_stats_overflows;
+}
+
 void Draw_FlushBuffer(void) {
-    InterpSnapJunctions();
-    InterpFinishPending();
-    InterpFinishLines();
+    const unsigned reason = draw_flush_reason;
+    draw_flush_reason = DRAW_FLUSH_STATE;
     if (UseSoftwareBackend()) {
         software_rasterizer.flush_buffer();
         return;
@@ -6482,11 +7092,18 @@ void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
         return;
     }
+    DrawCountFlush(reason);
     if (!n_draw_marks && (scissor_rect.w <= 0 || scissor_rect.h <= 0)) {
         /* an empty drawing area (UpdateScissor) draws nothing */
         Draw_ResetBuffer();
         return;
     }
+    /* the texture copy below changes what the midpoint kept so far samples:
+     * it is drawn first */
+    if (batch_has_texture && vram_dirty.w > 0 && vram_dirty.h > 0 &&
+        InterpMidpointDeferred() &&
+        VramTilesHit(&interp_mid_texture_tiles, &vram_dirty_tiles))
+        InterpMidpointSync(INTERP_SYNC_TEXTURE);
     /* (a wrap submits the command buffer: reserved before acquiring one) */
     Uint32 vertex_at, index_at;
     const bool cycle = RingReserve((Uint32)n_vertices, (Uint32)n_indices, &vertex_at, &index_at);
@@ -6511,8 +7128,8 @@ void Draw_FlushBuffer(void) {
     const Uint32 vtx_size = (Uint32)(sizeof(Vertex) * n_vertices);
     const Uint32 idx_size = (Uint32)(sizeof(*index_buf) * n_indices);
     const Uint32 vtx_offset = vertex_at * (Uint32)sizeof(Vertex);
-    const Uint32 ibuf_offset = index_at * (Uint32)sizeof(*index_buf);
-    const Uint32 idx_offset = MAX_VERTEX_COUNT * (Uint32)sizeof(Vertex) + ibuf_offset;
+    const Uint32 idx_offset = MAX_VERTEX_COUNT * (Uint32)sizeof(Vertex) +
+                              index_at * (Uint32)sizeof(*index_buf);
     memcpy(map + vtx_offset, vertex_buf, vtx_size);
     memcpy(map + idx_offset, index_buf, idx_size);
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
@@ -6525,10 +7142,9 @@ void Draw_FlushBuffer(void) {
     SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, buffers_cycle);
     const SDL_GPUTransferBufferLocation idx_src = {
         .transfer_buffer = vtx_transfer, .offset = idx_offset};
-    const SDL_GPUBufferRegion idx_dst = {.buffer = ibuf, .offset = ibuf_offset, .size = idx_size};
+    const SDL_GPUBufferRegion idx_dst = {
+        .buffer = ibuf, .offset = index_at * (Uint32)sizeof(*index_buf), .size = idx_size};
     SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, buffers_cycle);
-    /* the vertices the target being drawn reads (the midpoint's own) */
-    Uint32 target_vtx_offset = vtx_offset;
     if (batch_has_texture && vram_dirty.w > 0 && vram_dirty.h > 0) {
         const SDL_GPUTextureLocation vram_src = {.texture = vram_render,
                                                  .x = (Uint32)vram_dirty.x,
@@ -6550,204 +7166,42 @@ void Draw_FlushBuffer(void) {
     draw_marks[n_draw_marks].state = current_state;
     const int n_marks = n_draw_marks + 1;
     static DrawView views[DRAW_MARKS_MAX + 1];
+    static int mark_end[DRAW_MARKS_MAX + 1];
+    for (int k = 0; k < n_marks; ++k)
+        mark_end[k] = draw_marks[k].end;
+    SDL_GPUTexture* extra_texture =
+        dialogue_font_batch >= 0 ? native_fonts[dialogue_font_batch].texture
+        : (sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_texture
+                                                         : vram_sample;
+    SDL_GPUSampler* extra_sampler =
+        dialogue_font_batch >= 0 ? native_fonts[dialogue_font_batch].sampler
+        : (sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_sampler
+                                                         : vram_sampler;
+    const bool grid_same = draw_grid_source_width == draw_grid_target_width;
 
     /* Native VRAM is independently rasterized: gameplay readback and texture
      * feedback must not depend on high-resolution sample positions. The
-     * midpoint target is drawn once the application registered packet pairs
-     * (without them no midpoint can be presented). */
+     * midpoint target draws the batch once the frame is complete
+     * (InterpMidpointRecord, InterpMidpointSync). */
     for (unsigned target_index = 0;
-         target_index < (scaled_vram_render ? 2u : 1u) + (interpolation_enabled && interpolated_vram && interpolated_scale==internal_res && interp_serial ? 1u : 0u); ++target_index) {
-        bool midpoint=interpolation_enabled&&interpolated_vram&&target_index==(scaled_vram_render?2u:1u);
-        SDL_GPUTexture *render_target=midpoint?interpolated_vram:(target_index?scaled_vram_render:vram_render);
-        if(midpoint){
-            Uint32 mid_at,mid_index_at;const bool mid_cycle=RingReserve((Uint32)n_vertices,0,&mid_at,&mid_index_at);
-            u8 *mid_map=SDL_MapGPUTransferBuffer(device,vtx_transfer,mid_cycle);
-            if(!mid_map){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation transfer map",false);goto abort_flush;}
-            target_vtx_offset=mid_at*(Uint32)sizeof(Vertex);
-            memcpy(mid_map+target_vtx_offset,interpolated_vertices,vtx_size);SDL_UnmapGPUTransferBuffer(device,vtx_transfer);
-            cmd=AcquireCmd();if(!cmd){interp_pair_ready=false;interp_matches=0;goto abort_flush;}
-            SDL_GPUCopyPass *mid_copy=SDL_BeginGPUCopyPass(cmd);
-            if(!mid_copy){interp_pair_ready=false;interp_matches=0;GpuFail("interpolation copy pass",false);goto abort_flush;}
-            const SDL_GPUTransferBufferLocation mid_src={.transfer_buffer=vtx_transfer,.offset=target_vtx_offset};
-            const SDL_GPUBufferRegion mid_dst={.buffer=vbuf,.offset=target_vtx_offset,.size=vtx_size};
-            SDL_UploadToGPUBuffer(mid_copy,&mid_src,&mid_dst,RingCycleBuffers());SDL_EndGPUCopyPass(mid_copy);
-        }
+         target_index < (scaled_vram_render ? 2u : 1u); ++target_index) {
+        SDL_GPUTexture* render_target =
+            target_index ? scaled_vram_render : vram_render;
         unsigned target_scale = target_index ? internal_res : 1;
         for (int k = 0; k < n_marks; ++k) {
             ApplyDrawState(&draw_marks[k].state);
-            ComputeDrawView(&views[k], target_index, midpoint, target_scale);
+            ComputeDrawView(&views[k], target_index, false, target_scale);
         }
-        SDL_GPUTexture* destination_sample =
-            target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
-        int start = 0, mark = 0;
-        while (start < n_indices) {
-            /* A semi-transparent primitive blends with a copy of the VRAM
-             * made before it: one triangle, or one bounding box (two
-             * triangles that do not overlap) of an exact polygon. Each render
-             * pass loads and stores the whole target, so one pass draws a
-             * run of segments (consecutive opaque primitives, or one
-             * semi-transparent primitive) from one copy: a semi-transparent
-             * primitive joins it while its pixels miss those of every
-             * earlier segment of the run, so the copy still holds its
-             * destination. With destination_fetch the shader reads the
-             * destination from the target itself: a run of semi-transparent
-             * primitives is one draw and nothing breaks the pass. A segment
-             * keeps to one drawing state (mark); the pass sets each one's
-             * viewport, scissor and uniforms. */
-            DrawSegment segments[DRAW_SEGMENTS_FETCH_MAX];
-            SemiBox boxes[DRAW_SEGMENTS_FETCH_MAX];
-            const int max_segments = destination_fetch ? DRAW_SEGMENTS_FETCH_MAX
-                                                       : DRAW_SEGMENTS_MAX;
-            int n_segments = 0, n_draws = 0;
-            int end = start;
-            while (end < n_indices && n_segments < max_segments) {
-                while (draw_marks[mark].end <= end)
-                    ++mark;
-                const int mark_end = draw_marks[mark].end;
-                const DrawView* view = &views[mark];
-                if (!view->visible) {
-                    end = mark_end; // an empty drawing area draws nothing
-                    continue;
-                }
-                int seg_start = end;
-                bool semi = vertex_buf[index_buf[seg_start]].a != 0xFF;
-                int seg_end =
-                    seg_start + (vertex_buf[index_buf[seg_start]].exact[0][3] ? 6 : 3);
-                /* The two triangles of one quad (two shared vertices) cover
-                 * disjoint pixels: they read the same copy. */
-                if (semi && seg_end + 3 <= mark_end &&
-                    !vertex_buf[index_buf[seg_start]].exact[0][3] &&
-                    vertex_buf[index_buf[seg_end]].a != 0xFF &&
-                    SharedVertices(seg_start, seg_end) >= 2)
-                    seg_end += 3;
-                if (!semi || destination_fetch) {
-                    while (seg_end < mark_end &&
-                           (vertex_buf[index_buf[seg_end]].a != 0xFF) == semi)
-                        seg_end += 3;
-                }
-                if (seg_end > mark_end)
-                    seg_end = mark_end;
-                SemiBox box;
-                bool visible = PrimitiveBox(
-                    seg_start, seg_end, midpoint, target_index != 0,
-                    target_scale, view->offset, view->sub_x, view->sub_y,
-                    view->target_centre, view->ws_squeeze, view->clip, &box);
-                if (semi && n_segments && !destination_fetch) {
-                    bool overlaps = false;
-                    for (int i = 0; visible && i < n_segments; ++i)
-                        overlaps |= boxes[i].x1 > boxes[i].x0 &&
-                                    box.x0 < boxes[i].x1 &&
-                                    boxes[i].x0 < box.x1 &&
-                                    box.y0 < boxes[i].y1 && boxes[i].y0 < box.y1;
-                    if (overlaps)
-                        break;
-                }
-                end = seg_end;
-                if (semi && !visible)
-                    continue; // outside the drawing area: draws nothing
-                if (!visible)
-                    box.x0 = box.x1 = 0;
-                boxes[n_segments] = box;
-                segments[n_segments++] =
-                    (DrawSegment){seg_start, seg_end, semi, mark};
-                n_draws += semi ? 1 : 2;
-            }
-            if (!n_segments) {
-                start = end;
-                continue;
-            }
-            /* Up to four sampled textures for each draw. Reserve both heaps'
-             * worst-case sampler use before any destination copy. */
-            cmd = ReserveDrawDescriptors(4u * (unsigned)n_draws);
-            if (!cmd)
-                goto abort_flush;
-            SDL_GPUCopyPass* blend_copy = NULL;
-            for (int i = 0; i < n_segments && !destination_fetch; ++i) {
-                if (!segments[i].semi)
-                    continue;
-                if (!blend_copy)
-                    blend_copy = SDL_BeginGPUCopyPass(cmd);
-                SDL_GPUTextureLocation from = {
-                    .texture = render_target,
-                    .x = (Uint32)boxes[i].x0,
-                    .y = (Uint32)boxes[i].y0};
-                SDL_GPUTextureLocation to = from;
-                to.texture = destination_sample;
-                SDL_CopyGPUTextureToTexture(
-                    blend_copy, &from, &to,
-                    (Uint32)(boxes[i].x1 - boxes[i].x0),
-                    (Uint32)(boxes[i].y1 - boxes[i].y0), 1, false);
-            }
-            if (blend_copy)
-                SDL_EndGPUCopyPass(blend_copy);
-            const SDL_GPUColorTargetInfo target = {
-                .texture = render_target,
-                .load_op = SDL_GPU_LOADOP_LOAD,
-                .store_op = SDL_GPU_STOREOP_STORE,
-            };
-            ++frame_stats_batches;
-            SDL_GPURenderPass* pass =
-                SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
-            const SDL_GPUBufferBinding vb = {.buffer = vbuf, .offset = target_vtx_offset};
-            SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
-            const SDL_GPUBufferBinding ib = {.buffer = ibuf, .offset = ibuf_offset};
-            SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
-            const SDL_GPUTextureSamplerBinding sampler_binding[4] = {
-                {.texture=vram_sample,.sampler=vram_sampler},
-                {.texture=destination_sample,.sampler=vram_sampler},
-                {.texture=dialogue_font_batch>=0?native_fonts[dialogue_font_batch].texture:(sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_texture : vram_sample,
-                 .sampler=dialogue_font_batch>=0?native_fonts[dialogue_font_batch].sampler:(sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_sampler : vram_sampler},
-                {.texture=clut_cache,.sampler=vram_sampler}};
-            SDL_BindGPUFragmentSamplers(pass,0,sampler_binding,PSX_SHADERS_CURRENT ? 4 : 3);
-            int pass_mark = -1;
-            for (int s = 0; s < n_segments; ++s) {
-                const DrawView* view = &views[segments[s].mark];
-                if (segments[s].mark != pass_mark) {
-                    pass_mark = segments[s].mark;
-                    SDL_SetGPUViewport(pass, &view->viewport);
-                    SDL_SetGPUScissor(pass, &view->scissor);
-                    SDL_PushGPUVertexUniformData(
-                        cmd, 0, view->offset_ubo, sizeof(view->offset_ubo));
-                }
-                const u32 pass_flags = view->pass_flags;
-                const bool semi = segments[s].semi;
-                const Uint32 first = (Uint32)segments[s].start;
-                const Uint32 count = (Uint32)(segments[s].end - segments[s].start);
-                /* Opaque primitives under "check mask" overlap each other in
-                 * one draw: pass 3 writes colour and mask bit together,
-                 * blended by the destination's mask bit (alpha), so a pixel
-                 * masked by an earlier primitive of the batch is kept. */
-                const bool checked = PSX_SHADERS_CURRENT && !semi && view->mask_check;
-                const u32 color_pass[4] = {
-                    semi ? 2u : checked ? 3u : 0u, target_scale,
-                    draw_grid_source_width == draw_grid_target_width, pass_flags};
-                SDL_PushGPUFragmentUniformData(
-                    cmd, 0, color_pass, sizeof(color_pass));
-
-                SDL_BindGPUGraphicsPipeline(
-                    pass, semi && destination_fetch ? pipe_direct_fetch :
-                          pipe_tri[semi      ? BLEND_DIRECT
-                                   : checked ? BLEND_CHECK
-                                             : BLEND_ADD]);
-                SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
-                /* Blend factors use source alpha as an operation selector.
-                 * Write the actual PS1 mask bit separately, without changing
-                 * the color result. */
-                if (!semi && !checked) {
-                    const u32 mask_pass[4] = {
-                        1, target_scale,
-                        draw_grid_source_width == draw_grid_target_width,
-                        pass_flags};
-                    SDL_PushGPUFragmentUniformData(
-                        cmd, 0, mask_pass, sizeof(mask_pass));
-                    SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
-                    SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
-                }
-            }
-            SDL_EndGPURenderPass(pass);
-            start = end;
-        }
+        const DrawTargetBatch target = {
+            render_target, target_index, target_scale, false,
+            vertex_buf, index_buf, n_indices,
+            vtx_offset, index_at * (Uint32)sizeof(*index_buf), mark_end, views,
+            extra_texture, extra_sampler, grid_same};
+        if (!DrawTargetRuns(&target))
+            goto abort_flush;
     }
+    if (InterpMidpointDrawn())
+        InterpMidpointRecord(n_marks, extra_texture, extra_sampler, grid_same);
     ApplyDrawState(&current_state);
     for (int k = 0; k < n_marks; ++k) {
         const SDL_Rect area = draw_marks[k].state.scissor;

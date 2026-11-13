@@ -47,7 +47,7 @@ typedef struct {
 } Vertex;
 
 #ifdef PSYZ_CAPTURE_INTERPOLATION
-static void InterpCapture(const void *packet,Vertex *v,unsigned count,const unsigned short *index,unsigned indices);
+static void InterpCapture(const void *packet,Vertex *v,unsigned count,const u32 *index,unsigned indices);
 static void InterpEnqueued(void);
 #endif
 
@@ -83,10 +83,11 @@ static Vertex vertex_buf[MAX_VERTEX_COUNT];
  * the midpoint interpolates in view space with it. */
 static float vertex_depth[MAX_VERTEX_COUNT];
 #endif
-static unsigned short index_buf[MAX_INDEX_COUNT];
+/* 32-bit indices: a batch may hold more than 65536 vertices. */
+static u32 index_buf[MAX_INDEX_COUNT];
 static Vertex* vertex_cur;
-static unsigned short* index_cur;
-static unsigned short n_vertices;
+static u32* index_cur;
+static unsigned n_vertices;
 static int n_indices;
 
 // represents a texture window as a 32-bit integer for fast aligned copies
@@ -95,11 +96,20 @@ static int n_indices;
      ((unsigned int)(or_x) << 16) | ((unsigned int)(or_y) << 24))
 static unsigned int cur_twin = TWIN_PACK(0xFF, 0xFF, 0x00, 0x00);
 
+/* A backend may limit a batch further (DRAW_BATCH_FULL) and record why it
+ * flushes (DRAW_FLUSH_FOR). */
+#ifndef DRAW_FLUSH_FOR
+#define DRAW_FLUSH_FOR(reason) Draw_FlushBuffer()
+#endif
 static void Draw_EnsureBufferWillNotOverflow(int vertices, int indices) {
+#ifdef DRAW_BATCH_FULL
+    bool bufferFull = DRAW_BATCH_FULL((unsigned)vertices, (unsigned)indices);
+#else
     bool bufferFull = n_vertices + vertices > MAX_VERTEX_COUNT ||
                       n_indices + indices > MAX_INDEX_COUNT;
+#endif
     if (bufferFull) {
-        Draw_FlushBuffer();
+        DRAW_FLUSH_FOR(DRAW_FLUSH_OVERFLOW);
     }
 }
 static void Draw_EnqueueBuffer(int vertices, int indices) {

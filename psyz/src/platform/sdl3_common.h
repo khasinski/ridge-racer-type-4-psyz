@@ -584,6 +584,13 @@ static float frame_stats_present[FRAME_STATS_WINDOW];
 /* Render passes the backend drew primitives in since the last present. */
 static unsigned frame_stats_batches;
 static float frame_stats_batch[FRAME_STATS_WINDOW];
+/* Vertices queued, batches drawn (flushes) and of them batches drawn
+ * because they were full (vertices, indices, drawing-state marks or CLUT
+ * cache rows) since the last present. */
+static unsigned frame_stats_vertices, frame_stats_flushes, frame_stats_overflows;
+static float frame_stats_vertex[FRAME_STATS_WINDOW];
+static float frame_stats_flush[FRAME_STATS_WINDOW];
+static float frame_stats_overflow[FRAME_STATS_WINDOW];
 
 static int FrameStatsCompare(const void* a, const void* b) {
     float x = *(const float*)a, y = *(const float*)b;
@@ -643,6 +650,9 @@ static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
             frame_stats_work[frame_stats_count] = work;
             frame_stats_present[frame_stats_count] = present;
             frame_stats_batch[frame_stats_count] = (float)frame_stats_batches;
+            frame_stats_vertex[frame_stats_count] = (float)frame_stats_vertices;
+            frame_stats_flush[frame_stats_count] = (float)frame_stats_flushes;
+            frame_stats_overflow[frame_stats_count] = (float)frame_stats_overflows;
             if (++frame_stats_count == frame_stats_window) {
                 INFOF("[Frame stats] %u presents, target %.3f ms, driver vsync %d",
                       frame_stats_count, target_frame_time_us / game_speed / 1000.0,
@@ -654,6 +664,12 @@ static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
                                   frame_stats_count);
                 FrameStatsSummary("passes", frame_stats_batch,
                                   frame_stats_count);
+                FrameStatsSummary("vertices", frame_stats_vertex,
+                                  frame_stats_count);
+                FrameStatsSummary("flushes", frame_stats_flush,
+                                  frame_stats_count);
+                FrameStatsSummary("overflows", frame_stats_overflow,
+                                  frame_stats_count);
                 frame_stats_count = 0;
             }
         }
@@ -661,6 +677,7 @@ static void FrameStatsRecord(Uint64 work_end, Uint64 present_start,
     frame_stats_last_present = present_start;
     frame_stats_last_return = wait_end;
     frame_stats_batches = 0;
+    frame_stats_vertices = frame_stats_flushes = frame_stats_overflows = 0;
 }
 
 /* Paced presentation (frame limiter): VSync(0) submits the frame's drawing

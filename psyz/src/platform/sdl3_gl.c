@@ -1243,7 +1243,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 }
 
                 Vertex* q = vertex_cur;
-                unsigned short base = n_vertices;
+                unsigned base = n_vertices;
                 q[0].x = x0;
                 q[0].y = y0;
                 q[1].x = (short)(x1 + ex);
@@ -1583,14 +1583,16 @@ static void SetBlendMode(BlendMode mode) {
 }
 
 static void DrawIndices(int start, int end) {
-    glDrawElements(GL_TRIANGLES, end - start, GL_UNSIGNED_SHORT,
-                   (const GLvoid*)((uintptr_t)start * sizeof(unsigned short)));
+    glDrawElements(GL_TRIANGLES, end - start, GL_UNSIGNED_INT,
+                   (const GLvoid*)((uintptr_t)start * sizeof(*index_buf)));
 }
 
 void Draw_FlushBuffer(void) {
     if (n_vertices == 0) {
         return;
     }
+    frame_stats_vertices += n_vertices;
+    ++frame_stats_flushes;
     if (VBO == -1) {
         Draw_InitBuffer();
     }
