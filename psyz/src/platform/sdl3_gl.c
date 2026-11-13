@@ -1681,6 +1681,16 @@ int Psyz_VideoGetDynamicLighting(void){return 0;}
 int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}
 
+/* Upscaling only: widescreen, interpolation, antialiasing, filtering and
+ * geometry correction are stubs here. */
+unsigned Psyz_VideoGetFeatures(void) { return PSYZ_VIDEO_FEATURE_UPSCALE; }
+const char* Psyz_VideoGetRendererName(void) { return "OpenGL"; }
+/* Failures here are logged; nothing calls back. */
+PsyzVideoFailureCB Psyz_VideoSetFailureCallback(PsyzVideoFailureCB cb) {
+    (void)cb;
+    return NULL;
+}
+
 /* The OpenGL backend has no CPU rasterizer route. */
 int Psyz_VideoSetNativeRasterizer(int enabled) { return enabled ? -1 : 0; }
 int Psyz_VideoGetNativeRasterizer(void) { return 0; }

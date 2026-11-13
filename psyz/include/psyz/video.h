@@ -232,6 +232,44 @@ int Psyz_VideoGetNativeRasterizer(void);
 /** @return 1 while the CPU rasterizer draws (native mode or headless) */
 int Psyz_VideoNativeRasterizerActive(void);
 
+/** Enhancements the active renderer can draw (Psyz_VideoGetFeatures). */
+enum {
+    PSYZ_VIDEO_FEATURE_UPSCALE = 1 << 0,       /**< internal resolution > 1 */
+    PSYZ_VIDEO_FEATURE_ANTIALIASING = 1 << 1,  /**< Psyz_VideoSetAntialiasing */
+    PSYZ_VIDEO_FEATURE_FILTERING = 1 << 2,     /**< model/sprite filtering */
+    PSYZ_VIDEO_FEATURE_GEOMETRY = 1 << 3,      /**< geometry correction */
+    PSYZ_VIDEO_FEATURE_WIDESCREEN = 1 << 4,    /**< Psyz_VideoSetWidescreen */
+    PSYZ_VIDEO_FEATURE_INTERPOLATION = 1 << 5, /**< frame interpolation */
+};
+
+/**
+ * @brief What the active renderer can do, for a settings menu.
+ *
+ * The SDL GPU renderer has every PSYZ_VIDEO_FEATURE_*. Without an SDL GPU
+ * device (no Vulkan or D3D12 driver, PSYZ_GPU=off) the SDL GPU backend
+ * falls back to the CPU rasterizer presented by an SDL renderer, which has
+ * none of them, nor has PSYZ_HEADLESS=1; the OpenGL backend upscales only.
+ * Starts the renderer if it is not running yet.
+ */
+unsigned Psyz_VideoGetFeatures(void);
+
+/** @return the active renderer, e.g. "SDL GPU (metal)", for logs and menus */
+const char* Psyz_VideoGetRendererName(void);
+
+/**
+ * @brief Nothing can draw: called once with a message for the player.
+ *
+ * At startup when neither an SDL GPU device nor an SDL renderer can be
+ * created (the SDL GPU backend falls back to the CPU rasterizer before
+ * giving up), and when the GPU fails during the run (Psyz_GpuFailed). The
+ * host shows the message and decides whether to quit; PsyZ itself only
+ * logs it.
+ *
+ * @return the previous callback
+ */
+typedef void (*PsyzVideoFailureCB)(const char* message);
+PsyzVideoFailureCB Psyz_VideoSetFailureCallback(PsyzVideoFailureCB cb);
+
 /**
  * @brief Enable or disable subpixel 3D geometry & perspective UV correction
  *

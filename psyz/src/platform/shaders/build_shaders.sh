@@ -5,9 +5,11 @@
 # SKIP_DXIL=1 regenerates only SPIR-V and MSL (the Windows SDK dxc is needed
 # for DXIL: the psyz-shaders workflow of Ridge Racer Type 4 PC runs this on a
 # Windows runner). Every header records the SHA-256 of the GLSL it was built
-# from (CR stripped); check_shaders.cmake fails the build of a platform
-# whose headers no longer match their GLSL, so SKIP_DXIL leaves the Windows
-# build broken until the DXIL headers are rebuilt.
+# from (CR stripped); check_shaders.cmake fails the configure on every
+# platform while any header (any format) no longer matches its GLSL, so
+# SKIP_DXIL leaves the build broken until the DXIL headers are rebuilt. The
+# CI shader jobs (pc.yml: shaders, shaders-dxil) rebuild all of them and
+# fail when the bytes differ from the committed ones.
 
 # DXIL/Windows requires signing. The best way to pre-compile the shader is
 # C:\Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/dxc.exe

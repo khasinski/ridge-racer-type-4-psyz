@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 /* Terminal GPU state: borrowed error string valid until process exit. No
- * retry/reinitialization or CPU fallback after failure. Main loop also receives
- * SDL_EVENT_QUIT; callers can distinguish it from an ordinary user Quit. */
+ * retry or reinitialization after a failure during the run; the host hears
+ * of it through Psyz_VideoSetFailureCallback (psyz/video.h). */
 int Psyz_GpuFailed(void);
 const char *Psyz_GpuFirstError(void);
 int Psyz_GpuRetirementUncertain(void);
@@ -19,6 +19,9 @@ void Psyz_GpuTraceAspectOnce(const char *phase);
 // Called once after SDL3/SDL_GPU initialization completes.
 // Use this to initialize overlay backends (e.g., ImGui_ImplSDLGPU3_Init).
 // Query swapchain texture format with SDL_GetGPUSwapchainTextureFormat.
+// device is NULL when there is no SDL GPU device and the CPU rasterizer is
+// presented by an SDL renderer (Psyz_VideoGetFeatures): the render callback
+// is then never called.
 typedef void (*PsyzOverlayInitCB_SDL3GPU)(
     SDL_Window* window, SDL_GPUDevice* device);
 

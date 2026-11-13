@@ -12,6 +12,25 @@
 
 #include "ztest.h"
 
+/* What the GPU tests draw with: the CPU rasterizer under PSYZ_HEADLESS=1 and
+ * when the SDL GPU backend fell back to it (no SDL GPU device, PSYZ_GPU=off),
+ * else the SDL GPU renderer (PSYZ_HEADLESS=gpu: in a hidden window). */
+static bool CpuRasterizerOnly(void) {
+    const char* headless = getenv("PSYZ_HEADLESS");
+    if (headless && !strcmp(headless, "1"))
+        return true;
+#if defined(__psyz) && !defined(__PSP__)
+    return !(Psyz_VideoGetFeatures() & PSYZ_VIDEO_FEATURE_UPSCALE);
+#else
+    return false;
+#endif
+}
+
+static bool SdlGpuHidden(void) {
+    const char* headless = getenv("PSYZ_HEADLESS");
+    return headless && !strcmp(headless, "gpu") && !CpuRasterizerOnly();
+}
+
 #include "res/4bpp.h"
 #include "res/16bpp.h"
 #include "res/uv4bpp.h"
@@ -151,7 +170,7 @@ ZTEST_TEARDOWN(gpu) { gpu_teardown(); }
  */
 ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char *backend=getenv("PSYZ_HEADLESS");if(backend&&!strcmp(backend,"1"))zskip("requires SDL GPU");
+    if(CpuRasterizerOnly())zskip("requires SDL GPU");
     extern bool InitPlatform(void);if(!InitPlatform())zskip("requires SDL GPU");
     const unsigned scales[]={2,8,2,2};
     for(unsigned test=0;test<4;++test){
@@ -203,8 +222,7 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 
 ZTEST(gpu, dithering_off_preserves_color_precision) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         zskip("requires SDL GPU");
     u16 white[256];
     for (unsigned i = 0; i < 256; ++i)
@@ -276,8 +294,7 @@ ZTEST(gpu, dithering_off_preserves_color_precision) {
 
 ZTEST(gpu, supersampling_at_max_resolution_preserves_requested_size) {
 #if defined(__psyz) && !defined(__PSP__)
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         return;
     DISPENV disp;
     SetDefDispEnv(&disp, 0, 224, 320, 224);
@@ -310,8 +327,7 @@ ZTEST(gpu, supersampling_at_max_resolution_preserves_requested_size) {
  * cover them too, and drawing elsewhere in VRAM is left alone. */
 ZTEST(gpu, widescreen_squeezes_display_buffer_drawing) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         zskip("requires the SDL GPU renderer");
     DISPENV disp;
     SetDefDispEnv(&disp, 0, 0, 320, 224);
@@ -493,8 +509,7 @@ ZTEST(gpu, widescreen_squeezes_display_buffer_drawing) {
  * margin of 68; each buffer keeps the squeeze it was marked with. */
 ZTEST(gpu, widescreen_fitted_squeeze_holds_the_whole_view) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         zskip("requires the SDL GPU renderer");
     const PsyzAspectMode aspect = Psyz_VideoGetAspectMode();
     const long video_mode = GetVideoMode();
@@ -571,8 +586,7 @@ ZTEST(gpu, widescreen_fitted_squeeze_holds_the_whole_view) {
  * without widescreen at the display aspect, as with widescreen off. */
 ZTEST(gpu, widescreen_native_frames_keep_their_aspect) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         zskip("requires the SDL GPU renderer");
     const PsyzAspectMode aspect = Psyz_VideoGetAspectMode();
     const long video_mode = GetVideoMode();
@@ -684,7 +698,7 @@ static int TestSpriteAtlasCommand(const u_long *words,int count,void *unused) {
 
 ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
 #if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    if(!SdlGpuHidden())return;
     unsigned char *reference=malloc(320*240*3),*native=malloc(320*240*3);
     zassert_ptr_ne(NULL,reference);zassert_ptr_ne(NULL,native);
     for(unsigned i=0;i<320*240;++i){reference[i*3]=10;reference[i*3+1]=20;reference[i*3+2]=30;}
@@ -719,7 +733,7 @@ ZTEST(gpu, rgb24_hd_backdrop_preserves_native_ui_and_vram) {
 
 ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 #if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");if(!backend || strcmp(backend,"gpu"))return;
+    if(!SdlGpuHidden())return;
     SDL_Surface *image=SDL_CreateSurface(68,136,SDL_PIXELFORMAT_RGBA32);zassert_ptr_ne(NULL,image);
     SDL_FillSurfaceRect(image,NULL,SDL_MapSurfaceRGB(image,240,80,40));
     SDL_Rect reference_half={0,68,68,68};
@@ -770,8 +784,7 @@ ZTEST(gpu, widescreen_hd_extension_is_display_only) {
 
 ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback) {
 #if defined(__psyz) && !defined(__PSP__)
-    const char *backend=getenv("PSYZ_HEADLESS");
-    if(!backend || strcmp(backend,"gpu"))return;
+    if(!SdlGpuHidden())return;
     SDL_Surface *bmp=SDL_CreateSurface(136,272,SDL_PIXELFORMAT_RGBA32);
     zassert_ptr_ne(NULL,bmp);
     for(int y=0;y<272;++y)for(int x=0;x<136;++x){
@@ -865,8 +878,7 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
 
 ZTEST(gpu, optional_model_filter_and_ssaa_preserve_native_vram_and_text) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         return;
     extern void Psyz_PgxpNextFrame(void);
     extern void Psyz_GteDataWrite(unsigned int, unsigned int);
@@ -995,8 +1007,7 @@ ZTEST(gpu, geometry_metadata_survives_present_before_submission) {
     extern void Psyz_GteCtrlWrite(unsigned int, unsigned int);
     extern void Psyz_GteCommand(unsigned int);
     extern void Psyz_GteStoreSxyTo(unsigned int, void*);
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         return;
     Psyz_VideoSetInternalResolution(2);
     Psyz_VideoSetGeometryCorrection(1);
@@ -1050,8 +1061,7 @@ ZTEST(gpu, geometry_metadata_follows_sxy_loads_and_library_stores) {
     extern void Psyz_GteStoreSxyTo(unsigned int, void*);
     extern void Psyz_GteLoadSxyFrom(unsigned int, const void*);
     extern void Psyz_GteSetPgxpLibraryStores(int);
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         return;
     Psyz_VideoSetInternalResolution(2);
     Psyz_VideoSetGeometryCorrection(1);
@@ -1116,8 +1126,7 @@ ZTEST(gpu, geometry_correction_precise_nclip_and_intpl) {
     extern void Psyz_GteStoreSxyTo(unsigned int, void*);
     extern void Psyz_GteSetPgxpNclip(int);
     extern void Psyz_GteSetPgxpIntpl(int);
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         return;
     Psyz_VideoSetInternalResolution(2);
     Psyz_VideoSetGeometryCorrection(1);
@@ -1306,8 +1315,7 @@ ZTEST(gpu, text_quad_is_stable_across_field_buffers) {
     RECT texture = {512, 0, 32, 16};
     LoadImage(&texture, (u_long*)texels);
     DrawSync(0);
-    const char* headless = getenv("PSYZ_HEADLESS");
-    unsigned count = headless && !strcmp(headless, "1") ? 1 : 4;
+    unsigned count = CpuRasterizerOnly() ? 1 : 4;
     for (unsigned si = 0; si < count; ++si) {
         unsigned scale = scales[si];
         Psyz_VideoSetInternalResolution(scale);
@@ -1494,8 +1502,7 @@ ZTEST(gpu, rendered_capture_contains_internal_detail) {
     zassert_s32_eq(0, h);
     zassert_ptr_eq(NULL, Psyz_VideoAllocRenderedFrame(&w, NULL));
     zassert_s32_eq(0, w);
-    const char* headless = getenv("PSYZ_HEADLESS");
-    unsigned count = headless && !strcmp(headless, "1") ? 1 : 4;
+    unsigned count = CpuRasterizerOnly() ? 1 : 4;
     const unsigned scales[4] = {1, 2, 3, 8};
     static u16 before[320 * 280], after[320 * 280];
     RECT check = {0, 0, 320, 280};
@@ -3648,8 +3655,7 @@ ZTEST(gpu, ps1_polygon_attribute_gradients) {
     DrawSync(0);
     unsigned scales = 1;
 #if defined(__psyz) && defined(PSYZ_HAS_INTERNAL_RESOLUTION_SCALE)
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (!headless || strcmp(headless, "1"))
+    if (!CpuRasterizerOnly())
         scales = PSYZ_INTERNAL_RES_MAX;
 #endif
     for (unsigned scale = 1; scale <= scales; ++scale) {
@@ -4050,8 +4056,7 @@ static int CountDifferences(const u16* a, const u16* b, int* first) {
  * VRAM it keeps for read-backs stays the 1x result. */
 ZTEST(gpu, sdl_gpu_rasterizer_matches_cpu_rasterizer_at_every_scale) {
 #ifdef PSYZ_TEST_SDL_GPU
-    const char* headless = getenv("PSYZ_HEADLESS");
-    if (headless && !strcmp(headless, "1"))
+    if (CpuRasterizerOnly())
         zskip("requires SDL GPU");
     static u16 cpu[1024 * 512], gpu[1024 * 512];
     for (u32 seed = 1; seed <= 3; seed++) {
