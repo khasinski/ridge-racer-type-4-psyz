@@ -87,6 +87,26 @@ enum {
      * whole handler) [call] f0e3704. */
     LIBPAD_VBLANK_CYCLES = 16084,
     LIBPAD_VBLANK_PORT2_CYCLES = 4790,
+    /* Each halfword of a controller's packet past the first: libpad's
+     * handler takes 22.0k clocks with a JogCon in port 1 (three halfwords)
+     * against 15.6k with a digital pad. [rec] ds_irqlog, menus */
+    LIBPAD_HALFWORD_CYCLES = 3200,
+    /* A vblank that arrives while another interrupt's exception runs
+     * (libapi.c Psyz_VSyncBlank): the BIOS priority chains test for it
+     * this long after that interrupt, libpad's verifier (_padIsVsync) and
+     * then the card driver's, and libetc's dispatcher last reads the
+     * interrupt status this long before the end of the exception as
+     * charged (KERNEL_IRQ_CYCLES and the callbacks'). On DuckStation
+     * (stubs logging root counter 2 at trapIntr, _padIntPad and
+     * SsSeqCalledTbyT, and a breakpoint for the 1118 clocks from a vblank
+     * to _padIntPad) libpad misses a blank 1056 to 2607 clocks after a
+     * sequencer interrupt that does not tick, or from 1056 clocks after one
+     * that does to 62 clocks after the tick returns; the card driver's
+     * handler misses those from 1197 clocks on. [field] VS menus, 20000
+     * attract fields */
+    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
+    BIOS_CHAIN_CARD_TEST_CLOCKS = 1197,
+    LIBETC_DISPATCH_EXIT_CLOCKS = 243,
 };
 
 /* ---- libpad (libetc.c) ---- */

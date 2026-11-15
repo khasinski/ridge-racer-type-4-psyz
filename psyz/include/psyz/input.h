@@ -89,6 +89,25 @@ void Psyz_PadsGet(int port, char* dst, int len);
  */
 void Psyz_PadsSet(int port, const char* src, int len);
 
+/** Callback that may replace the controller frames at a blank. */
+typedef void (*PsyzPadsInputCb)(void);
+
+/**
+ * @brief Register a callback fired at each blank after the host input is
+ * sampled, before the controllers answer the exchange.
+ *
+ * Frames it sets with Psyz_PadsSet are what the controllers send at this
+ * blank's exchange; libpad (PadInitDirect, PadStartCom) stores a port's
+ * bytes in its receive buffer when it next starts a transfer: port 1's at
+ * this vblank when port 2 has a pad, else at the next one, port 2's at the
+ * next one. Test input uses it to drive the controllers as a console's
+ * would be driven.
+ *
+ * @param cb Callback to register, or NULL to unregister
+ * @return Previously registered callback, or NULL if none was set
+ */
+PsyzPadsInputCb Psyz_SetPadsInputCb(PsyzPadsInputCb cb);
+
 /** Analog inputs that the host approximates with a stick or a trigger. */
 typedef enum {
     PSYZ_PAD_AXIS_STEERING = 0, /**< neGcon twist, JogCon dial */

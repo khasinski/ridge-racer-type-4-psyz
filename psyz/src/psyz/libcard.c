@@ -193,12 +193,16 @@ static void card_sector_done(int port) {
 static void card_sector_done0(void) { card_sector_done(0); }
 static void card_sector_done1(void) { card_sector_done(1); }
 
-// The BIOS card handler's work at one vblank.
-void Psyz_CardVBlank(void) {
+// The BIOS card handler's work at one vblank; a vblank it misses (turn 0)
+// leaves its state, and its port, as they are.
+void Psyz_CardVBlank(int turn) {
     if (!card_drv.running) {
         return;
     }
     card_drv.last_vblank_us = Psyz_KernelNowUs();
+    if (!turn) {
+        return;
+    }
     if (card_drv.raw_state == 2) {
         card_drv.raw_state = 3;
     }
@@ -268,7 +272,7 @@ static void card_spin(void) {
     // half a field of slack: a PAL field of the clock can end a spin late
     if (now == before ||
         now - card_drv.last_vblank_us > card_fields_us(1) * 3 / 2) {
-        Psyz_CardVBlank();
+        Psyz_CardVBlank(1);
         card_drv.last_vblank_us = now;
     }
 }

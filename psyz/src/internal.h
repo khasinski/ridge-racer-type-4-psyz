@@ -92,6 +92,9 @@ void Psyz_CdPollQuery(void);
 // native busy wait on a device that runs on that clock. Returns 0 (and does
 // nothing) on a real-time clock, where the time passes by itself.
 int Psyz_AudioWaitUs(uint64_t us);
+// Offline clock: how long after the latest blank's sample boundary the
+// console's blank came (its field lengths are not whole samples).
+uint64_t Psyz_AudioBlankLagNs(void);
 // A blank that came due during such a wait (offline clock, SDL platform):
 // counts it in VSync(-1) and runs its VSync work (Psyz_VSyncBlank).
 void Psyz_VideoWaitBlank(void);
@@ -122,6 +125,17 @@ void Psyz_VSyncBlank(void);
 // and clears it (a busy wait absorbs it).
 void Psyz_KernelInterruptCycles(unsigned cycles);
 unsigned Psyz_KernelTakeInterruptCycles(void);
+// Whether a blank at blank_ns came while the exception of another
+// interrupt was dispatched, after its BIOS chains tested for a vblank
+// (test_clocks after it began) and before libetc's dispatcher last read
+// the interrupt status (exit_clocks before its handlers end): libetc then
+// takes that vblank and the chain handlers miss it. Offline clock only.
+int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
+                               unsigned exit_clocks);
+// PSYZ_PAD_TRACE: clocks from the latest such exception to at_ns, and
+// its handlers' clocks; 0 when there was none before.
+int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
+                            unsigned* cycles);
 // libpad's controller driver runs at each vblank (PadStartCom, libetc.c).
 int Psyz_PadDriverRunning(void);
 // libpad's actuator data (PadSetAct / PadSetActAlign) and the exchange at
@@ -129,9 +143,13 @@ int Psyz_PadDriverRunning(void);
 void Psyz_PadsSetActuators(int port, const unsigned char* data, int len);
 void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align);
 void Psyz_PadsExchange(int port, const char* published);
+// What a port's receive buffer holds: libpad's buffer once PadStartCom ran,
+// else the latest frame (libapi.c).
+void Psyz_PadsReceived(int port, char* dst);
 
-// The BIOS memory card driver's work at a vblank (libcard.c).
-void Psyz_CardVBlank(void);
+// The BIOS memory card driver's work at a vblank (libcard.c); turn 0: a
+// vblank its handler misses.
+void Psyz_CardVBlank(int turn);
 // A BIOS file service that reads a card sector itself and waits for it
 // without raising events (firstfile reads sector 0).
 void Psyz_CardSyncTransfer(long chan);

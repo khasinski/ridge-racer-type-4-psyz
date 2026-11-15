@@ -342,7 +342,20 @@ static void DeliverLocked(unsigned int desc, unsigned int spec) {
 /* The BIOS exception handler and libetc's dispatcher around a callback
  * take KERNEL_IRQ_CYCLES (timing_profile.h). */
 
-static void ServiceLine(int line) {
+/* The latest exception for an interrupt other than the vblank: when it
+ * began on the emulated clock and the PS1 clocks of its handlers (offline
+ * clock only, where handlers are charged). libetc's dispatcher (trapIntr)
+ * runs after the BIOS's priority chains and rereads the interrupt status
+ * until nothing is pending, so a vblank that arrives after the chains
+ * tested for it and before that last read is handled and acknowledged
+ * there: the chain handlers (libpad's exchange, the BIOS card driver's
+ * turn) never see that blank (Psyz_KernelBlankInDispatch). */
+static uint64_t dispatch_ns;
+static unsigned dispatch_cycles;
+static int dispatch_seen;
+
+static void ServiceLine(int line, uint64_t at_ns) {
+    long debt = AtomicLoad(&interrupt_debt);
     irq_latched &= ~(1u << line);
     Psyz_KernelInterruptCycles(KERNEL_IRQ_CYCLES);
     switch (line) {
@@ -359,6 +372,32 @@ static void ServiceLine(int line) {
     if (irq_callbacks[line]) {
         irq_callbacks[line]();
     }
+    if (line != IRQ_VBLANK && UsesAudioClock()) {
+        dispatch_ns = at_ns;
+        dispatch_cycles = (unsigned)(AtomicLoad(&interrupt_debt) - debt);
+        dispatch_seen = 1;
+    }
+}
+
+int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
+                            unsigned* cycles) {
+    if (!dispatch_seen || at_ns < dispatch_ns) {
+        return 0;
+    }
+    uint64_t clocks = (at_ns - dispatch_ns) * SYSTEM_CLOCK_HZ / 1000000000u;
+    *since_clocks = clocks > UINT32_MAX ? UINT32_MAX : (unsigned)clocks;
+    *cycles = dispatch_cycles;
+    return 1;
+}
+
+int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
+                               unsigned exit_clocks) {
+    if (!dispatch_seen || !UsesAudioClock() || blank_ns < dispatch_ns ||
+        dispatch_cycles <= exit_clocks) {
+        return 0;
+    }
+    uint64_t clocks = (blank_ns - dispatch_ns) * SYSTEM_CLOCK_HZ / 1000000000u;
+    return clocks > test_clocks && clocks <= dispatch_cycles - exit_clocks;
 }
 
 static void DrainPosted(void) {
@@ -392,7 +431,7 @@ static void ServicePending(void) {
             while (!(ready & (1u << line))) {
                 line++;
             }
-            ServiceLine(line);
+            ServiceLine(line, KernelNowUs() * 1000);
         } else if (pending_len > 0) {
             PendingEvent ev = pending[0];
             pending_len--;
@@ -723,9 +762,12 @@ static int ServiceTimers(uint64_t* deadline_us) {
             CounterRestart(c, now);
         }
         while (IsDue(c->next_us, now)) {
+            // the exact due time, with the carried fraction of a microsecond
+            uint64_t due_ns =
+                c->next_us * 1000 + (uint64_t)c->frac_acc * 1000 / c->clock_hz;
             CounterStep(c);
             if (irq_mask & bit) {
-                ServiceLine(IRQ_RCNT0 + i);
+                ServiceLine(IRQ_RCNT0 + i, due_ns);
             } else {
                 irq_latched |= bit;
             }

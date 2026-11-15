@@ -241,6 +241,18 @@ int Psyz_AudioWaitForTimer(void) {
     return 1;
 }
 
+/* The blanks come on sample boundaries, the carried fraction of a sample
+ * before the console's: field_end_fraction / field_end_divisor samples for
+ * the current field, blank_fraction for the field the latest blank ended
+ * (Psyz_AudioBlankLagNs). */
+static unsigned field_end_fraction, blank_fraction;
+static unsigned field_end_divisor = 1, blank_divisor = 1;
+
+static void EndField(void) {
+    blank_fraction = field_end_fraction;
+    blank_divisor = field_end_divisor;
+}
+
 /* Length of the next field in samples, the fraction carried. */
 static unsigned NextFieldFrames(bool pal) {
     if (pal != video_pal)
@@ -250,7 +262,17 @@ static unsigned NextFieldFrames(bool pal) {
     video_remainder += pal ? FIELD_SAMPLES_PAL : FIELD_SAMPLES_NTSC;
     unsigned frames = video_remainder / divisor;
     video_remainder %= divisor;
+    field_end_fraction = video_remainder;
+    field_end_divisor = divisor;
     return frames;
+}
+
+uint64_t Psyz_AudioBlankLagNs(void) {
+    if (!is_audio_init || !video_clock) {
+        return 0;
+    }
+    return (uint64_t)blank_fraction * 1000000000u /
+           ((uint64_t)blank_divisor * PSYZ_SPU_SAMPLE_RATE);
 }
 
 /* A native busy wait spends emulated time as a PS1 spinning on a device
@@ -285,6 +307,7 @@ int Psyz_AudioWaitUs(uint64_t us) {
         frames -= batch;
         field_frames_left -= batch;
         if (!field_frames_left) {
+            EndField();
             field_frames_left = field_frames_total = NextFieldFrames(video_pal);
             Psyz_VideoWaitBlank();
         }
@@ -321,8 +344,10 @@ void Psyz_AudioDisplayRangeChanged(
     unsigned current = (unsigned)line;
     int was_blank = current < y1 || current >= y2;
     int is_blank = current < new_y1 || current >= new_y2;
-    if (!was_blank && is_blank)
+    if (!was_blank && is_blank) {
+        blank_fraction = 0; // the beam leaves the new range at once
         Psyz_VideoWaitBlank();
+    }
     double lines = new_y2 - line;
     if (lines <= 0)
         lines += total;
@@ -332,6 +357,7 @@ void Psyz_AudioDisplayRangeChanged(
     if (frames > FIELD_FRAMES_MAX)
         frames = FIELD_FRAMES_MAX;
     field_frames_left = field_frames_total = frames;
+    field_end_fraction = 0;
 }
 
 /* The display mode's PAL bit changed (GP1(08h), a GPU reset): fields from
@@ -355,6 +381,7 @@ void Sdl3Audio_VBlank(bool pal) {
         field_frames_left = field_frames_total = NextFieldFrames(pal);
     MixAndCapture(field_frames_left);
     field_frames_left = 0;
+    EndField();
 }
 
 

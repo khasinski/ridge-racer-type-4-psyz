@@ -364,6 +364,8 @@ void Psyz_PadsSetActuators(int port, const unsigned char* data, int len);
 void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align);
 void Psyz_PadsExchange(int port, const char* published);
 
+void Psyz_VSyncBlank(void);
+
 // Emulated controller frames (pad.c) and libpad's view of them (libetc.c).
 static const PsyzAxisResponse identity_response = {0.0f, 1.0f, 0.0f, 1.0f, 0xFF};
 
@@ -552,5 +554,65 @@ ZTEST(pad_frames, libpad_tables) {
     Psyz_PadsBuildFrame(0, PSYZ_CTRL_DISCONNECTED, &in, f);
     Psyz_PadsSet(0, f, sizeof(f));
     zexpect_s32_eq(0, PadGetState(0x00));
+}
+
+// The controllers' frames at the next blanks (Psyz_SetPadsInputCb).
+static char store_frames[2][PSYZ_PAD_BUF_LEN];
+static void store_input(void) {
+    Psyz_PadsSet(0, store_frames[0], PSYZ_PAD_BUF_LEN);
+    Psyz_PadsSet(1, store_frames[1], PSYZ_PAD_BUF_LEN);
+}
+
+static void store_set(int port, PsyzControllerKind kind, unsigned buttons) {
+    PsyzPadInput in = centred_input();
+    in.buttons = buttons;
+    Psyz_PadsBuildFrame(port, kind, &in, store_frames[port]);
+}
+
+// libpad stores a port's bytes when it next starts a transfer: port 1's at
+// the same vblank when port 2 has a pad, else at the next; port 2's at the
+// next; a port without a controller reads 0xFF 0x00 at once.
+ZTEST(pad_frames, libpad_store_order) {
+    // the later tests' VSyncs keep exchanging with these
+    static unsigned char buf[2][PSYZ_PAD_BUF_LEN];
+    PsyzPadsInputCb prev = Psyz_SetPadsInputCb(store_input);
+    Psyz_PadsSetKind(0, 0, PSYZ_CTRL_DIGITAL_PAD);
+    Psyz_PadsSetKind(1, 0, PSYZ_CTRL_DIGITAL_PAD);
+    PadInitDirect(buf[0], buf[1]);
+    zexpect_u8_eq(0xFF, buf[0][0]);
+    zexpect_u8_eq(0x00, buf[0][1]);
+    PadStartCom();
+    store_set(0, PSYZ_CTRL_DIGITAL_PAD, 0);
+    store_set(1, PSYZ_CTRL_DISCONNECTED, 0);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xFF, buf[0][0]); // received, not stored yet
+    zexpect_u8_eq(0xFF, buf[1][0]);
+    zexpect_u8_eq(0x00, buf[1][1]);
+    store_set(0, PSYZ_CTRL_DIGITAL_PAD, PADstart);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0x00, buf[0][0]);
+    zexpect_u8_eq(0x41, buf[0][1]);
+    zexpect_u8_eq(0xFF, buf[0][2]); // the first exchange's bytes
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xF7, buf[0][2]); // Start, one vblank after it was sent
+    // a pad in port 2: port 1's bytes at once, port 2's a vblank later
+    store_set(0, PSYZ_CTRL_DIGITAL_PAD, 0);
+    store_set(1, PSYZ_CTRL_DIGITAL_PAD, PADstart);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xFF, buf[0][2]); // this exchange, released
+    zexpect_u8_eq(0xFF, buf[1][0]);
+    store_set(0, PSYZ_CTRL_DIGITAL_PAD, PADstart);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xF7, buf[0][2]); // this exchange
+    zexpect_u8_eq(0x00, buf[1][0]);
+    zexpect_u8_eq(0xF7, buf[1][2]); // the exchange before
+    store_set(0, PSYZ_CTRL_DIGITAL_PAD, 0);
+    store_set(1, PSYZ_CTRL_DIGITAL_PAD, 0);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xFF, buf[0][2]);
+    zexpect_u8_eq(0xF7, buf[1][2]);
+    Psyz_VSyncBlank();
+    zexpect_u8_eq(0xFF, buf[1][2]);
+    Psyz_SetPadsInputCb(prev);
 }
 #endif

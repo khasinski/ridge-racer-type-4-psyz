@@ -165,7 +165,7 @@ static const PadExtendedInfo* PadDirectInfo(int port, int* p_out, char* frame) {
     if (p < 0) {
         return NULL;
     }
-    Psyz_PadsGet(p, frame, PSYZ_PAD_BUF_LEN);
+    Psyz_PadsReceived(p, frame);
     *p_out = p;
     if (frame[0] != 0 || (unsigned char)frame[1] == PSYZ_CTRL_DISCONNECTED) {
         return NULL;
@@ -203,13 +203,21 @@ void PadInitDirect(u_char* pad1, u_char* pad2) {
         Psyz_PadsSetActuatorAlign(p, NULL);
     }
     InitPAD((char*)pad1, PSYZ_PAD_BUF_LEN, (char*)pad2, PSYZ_PAD_BUF_LEN);
+    // no controller answered yet (PSY-Q's PadInitDirect)
+    for (int p = 0; p < 2; p++) {
+        u_char* buf = p ? pad2 : pad1;
+        if (buf) {
+            buf[0] = 0xFF;
+            buf[1] = 0;
+        }
+    }
 }
 
 static int pad_driver_running;
 int Psyz_PadDriverRunning(void) { return pad_driver_running; }
 
 void PadStartCom(void) {
-    // receive buffers are already refreshed on every VSync
+    // the exchange runs at every vblank from now on (libapi.c)
     Psyz_SpendCycles(PAD_START_COM_CYCLES);
     pad_driver_running = 1;
 }

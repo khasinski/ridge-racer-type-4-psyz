@@ -32,14 +32,96 @@ static ControllerPort ports[2] = {
      }},
 };
 
+void Psyz_PadsPoll(void); // implemented by the platform layer
 static int pads_sampled = 0; // avoid more than one input polling per frame
 static char* pad_buffers[2];
 static int pad_buffer_lens[2];
-static void ReadPadsOnVsync(void) {
-    for (int p = 0; p < LEN(ports); p++) {
-        Psyz_PadsExchange(p, ports[p].frame); // actuators of this exchange
+static PsyzPadsInputCb pads_input_cb;
+
+PsyzPadsInputCb Psyz_SetPadsInputCb(PsyzPadsInputCb cb) {
+    PsyzPadsInputCb prev = pads_input_cb;
+    pads_input_cb = cb;
+    return prev;
+}
+
+static int PortAnswers(int p) {
+    return ports[p].frame[0] == 0 &&
+           (unsigned char)ports[p].frame[1] != PSYZ_CTRL_DISCONNECTED;
+}
+
+/* PSY-Q libpad (PadInitDirect, PadStartCom) exchanges with port 1, then
+ * port 2, in its vblank handler, and keeps each port's received packet
+ * until it next starts a transfer: when a port's own transfer starts
+ * (_padInitSioMode) and while the other port's packet bytes are clocked
+ * (_padTransferPacket) it copies the packet into the receive buffer
+ * (_padPacketDone). With pads in both ports port 1's bytes reach the buffer
+ * at the same vblank and port 2's at the next; with one pad, its bytes
+ * reach it at the next vblank. A port that does not answer fails at its
+ * first byte (_dirFailAuto): its buffer reads 0xFF 0x00 at once. */
+static struct {
+    char packet[PSYZ_PAD_BUF_LEN]; // received at the latest exchange
+    int pending;                   // not yet in the receive buffer
+} pad_received[2];
+
+static void LibpadStore(int p) {
+    if (!pad_received[p].pending) {
+        return;
     }
-    pads_sampled = 0;
+    pad_received[p].pending = 0;
+    if (!pad_buffers[p]) {
+        return;
+    }
+    // the status, the kind and the bytes received after them
+    unsigned halfwords = (unsigned char)pad_received[p].packet[1] & 0xF;
+    int len = halfwords ? 2 + 2 * (int)halfwords : PSYZ_PAD_BUF_LEN;
+    if (len > pad_buffer_lens[p]) {
+        len = pad_buffer_lens[p];
+    }
+    memcpy(pad_buffers[p], pad_received[p].packet, len);
+}
+
+static void LibpadExchange(void) {
+    for (int p = 0; p < LEN(ports); p++) {
+        LibpadStore(p);
+        if (!PortAnswers(p)) {
+            if (pad_buffers[p] && pad_buffer_lens[p] >= 2) {
+                pad_buffers[p][0] = (char)0xFF;
+                pad_buffers[p][1] = 0;
+            }
+            continue;
+        }
+        LibpadStore(p ^ 1);
+        memcpy(pad_received[p].packet, ports[p].frame, PSYZ_PAD_BUF_LEN);
+        pad_received[p].pending = 1;
+    }
+}
+
+/* The controllers answer with the host input sampled at the blank (or the
+ * frames an input callback sets); the actuator bytes they receive are
+ * those of this exchange, so a JogCon's frame reports the motor command of
+ * the one before. Without libpad the receive buffers take the frames at
+ * once. A blank libpad misses has no exchange (Psyz_VSyncBlank). */
+static void ReadPadsOnVsync(int exchange) {
+    if (exchange) {
+        for (int p = 0; p < LEN(ports); p++) {
+            Psyz_PadsExchange(p, ports[p].frame);
+        }
+    }
+    if (!pad_buffers[0] && !pad_buffers[1] && !Psyz_PadDriverRunning()) {
+        pads_sampled = 0; // nothing reads them: poll when asked
+        return;
+    }
+    pads_sampled = 1;
+    Psyz_PadsPoll();
+    if (pads_input_cb) {
+        pads_input_cb();
+    }
+    if (Psyz_PadDriverRunning()) {
+        if (exchange) {
+            LibpadExchange();
+        }
+        return;
+    }
     for (int p = 0; p < LEN(ports); p++) {
         if (pad_buffers[p]) {
             Psyz_PadsGet(p, pad_buffers[p], pad_buffer_lens[p]);
@@ -56,27 +138,62 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
 
 /* The vblank handler's PS1 time besides the kernel's: libetc's VSync
  * handler and callbacks dispatch, the BIOS card driver's turn, and libpad's
- * controller exchange once PadStartCom ran, more with a pad in port 2
- * (VBLANK_HANDLER_CYCLES, LIBPAD_VBLANK_*: timing_profile.h). */
-
-static int PadPort2Connected(void) {
-    return ports[1].frame[0] == 0 &&
-           (unsigned char)ports[1].frame[1] != PSYZ_CTRL_DISCONNECTED;
-}
+ * controller exchange once PadStartCom ran, more with a pad in port 2 and
+ * for longer packets (VBLANK_HANDLER_CYCLES, LIBPAD_*: timing_profile.h). */
 
 static uint64_t last_blank_us; // emulated time of the latest blank
 
+/* libpad clocks the packet of a controller that sends more than a digital
+ * pad's halfword of buttons byte by byte (LIBPAD_HALFWORD_CYCLES). */
+static unsigned PacketCycles(int p) {
+    unsigned halfwords = (unsigned char)ports[p].frame[1] & 0xF;
+    if (!PortAnswers(p) || halfwords < 2) {
+        return 0;
+    }
+    return (halfwords - 1) * LIBPAD_HALFWORD_CYCLES;
+}
+
+static int PadTrace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char* v = getenv("PSYZ_PAD_TRACE");
+        trace = v && *v == '1';
+    }
+    return trace;
+}
+
+/* A blank that comes while another interrupt is dispatched, after the BIOS
+ * chains tested for it, reaches only libetc's dispatcher: libpad has no
+ * exchange and the BIOS card driver no turn at that vblank
+ * (BIOS_CHAIN_*_TEST_CLOCKS, LIBETC_DISPATCH_EXIT_CLOCKS: timing_profile.h). */
 void Psyz_VSyncBlank(void) {
     last_blank_us = Psyz_KernelNowUs();
+    uint64_t blank_ns = last_blank_us * 1000 + Psyz_AudioBlankLagNs();
     Psyz_GpuCrtcBlank();
+    int pad_exchange =
+        Psyz_PadDriverRunning() &&
+        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
+                                    LIBETC_DISPATCH_EXIT_CLOCKS);
+    int card_turn =
+        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
+                                    LIBETC_DISPATCH_EXIT_CLOCKS);
     Psyz_KernelInterruptCycles(
         VBLANK_HANDLER_CYCLES +
-        (Psyz_PadDriverRunning()
-             ? LIBPAD_VBLANK_CYCLES +
-                   (PadPort2Connected() ? LIBPAD_VBLANK_PORT2_CYCLES : 0)
+        (pad_exchange
+             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) +
+                   (PortAnswers(1)
+                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1)
+                        : 0)
              : 0));
-    ReadPadsOnVsync();
-    Psyz_CardVBlank();
+    ReadPadsOnVsync(pad_exchange || !Psyz_PadDriverRunning());
+    if (PadTrace()) {
+        unsigned since = 0, cycles = 0;
+        int seen = Psyz_KernelLastDispatch(blank_ns, &since, &cycles);
+        fprintf(stderr, "pad: blank %u exchange %d card %d dispatch %d +%u/%u\n",
+                (unsigned)Psyz_VideoVSync(-1), pad_exchange, card_turn, seen,
+                since, cycles);
+    }
+    Psyz_CardVBlank(card_turn);
     if (g_PsyzVsyncCb)
         g_PsyzVsyncCb();
     Psyz_KernelVBlank();
@@ -222,6 +339,21 @@ int VSync(int mode) {
     return elapsed;
 }
 
+void Psyz_PadsReceived(int port, char* dst) {
+    if (port < 0 || port >= LEN(ports) || !dst) {
+        return;
+    }
+    if (Psyz_PadDriverRunning() && pad_buffers[port]) {
+        int len = pad_buffer_lens[port] < PSYZ_PAD_BUF_LEN
+                      ? pad_buffer_lens[port]
+                      : PSYZ_PAD_BUF_LEN;
+        memset(dst, 0, PSYZ_PAD_BUF_LEN);
+        memcpy(dst, pad_buffers[port], len);
+        return;
+    }
+    Psyz_PadsGet(port, dst, PSYZ_PAD_BUF_LEN);
+}
+
 PsyzControllerKind Psyz_PadsSetKind(
     int port, int channel, PsyzControllerKind kind) {
     if (port < 0 || port >= LEN(ports)) {
@@ -249,7 +381,6 @@ void Psyz_PadsSet(int port, const char* src, int len) {
     pads_sampled = 1;
 }
 
-void Psyz_PadsPoll(void); // implemented by the platform layer
 void Psyz_PadsGet(int port, char* dst, int len) {
     if (port < 0 || port >= LEN(ports) || !dst || len <= 0) {
         return;
