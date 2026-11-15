@@ -1,6 +1,7 @@
 #include <common.h>
 #include <libcd.h>
 #include "libcd_stream.h"
+#include "libcd_lock.h"
 
 StHEADER* StRingAddr;
 u_long* StRingBase;
@@ -14,7 +15,9 @@ s32 StCdIntrFlag, StCHANNEL, CChannel;
 static s32 padding_D_800D1F00[2];
 
 void StSetRing(u_long* ring_addr, u_long ring_size) {
+    CD_LOCK();
     StRingAddr = (StHEADER*)ring_addr;
     StRingSize = ring_size;
     StClearRing();
+    CD_UNLOCK();
 }

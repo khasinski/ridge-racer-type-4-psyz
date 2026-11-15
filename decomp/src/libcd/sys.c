@@ -1,5 +1,6 @@
 #include <common.h>
 #include <libcd.h>
+#include "libcd_lock.h"
 
 #ifndef CdlSync
 #define CdlSync 0
@@ -32,11 +33,26 @@ static int D_800B5718[] = {
     0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
 };
 
-int CdStatus(void) { return CD_status; }
+int CdStatus(void) {
+    CD_LOCK();
+    int value = CD_status;
+    CD_UNLOCK();
+    return value;
+}
 
-int CdMode(void) { return CD_mode; }
+int CdMode(void) {
+    CD_LOCK();
+    int value = CD_mode;
+    CD_UNLOCK();
+    return value;
+}
 
-int CdLastCom(void) { return CD_com; }
+int CdLastCom(void) {
+    CD_LOCK();
+    int value = CD_com;
+    CD_UNLOCK();
+    return value;
+}
 
 CdlLOC* CdLastPos(void) { return &CD_pos; }
 
@@ -86,36 +102,40 @@ int CdSync(int mode, u_char* result) { return CD_sync(mode, result); }
 int CdReady(int mode, u_char* result) { return CD_ready(mode, result); }
 
 CdlCB CdSyncCallback(CdlCB func) {
+    CD_LOCK();
     CdlCB prev = CD_cbsync;
     CD_cbsync = func;
+    CD_UNLOCK();
     return prev;
 }
 
 CdlCB CdReadyCallback(CdlCB func) {
+    CD_LOCK();
     CdlCB prev = CD_cbready;
     CD_cbready = func;
+    CD_UNLOCK();
     return prev;
 }
 
 static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
-    CdlCB old = CD_cbsync;
+    CdlCB old = CdSyncCallback(NULL);
     int count = 4;
 
     while (count--) {
-        CD_cbsync = NULL;
-        if (com != CdlNop && (CD_status & CdlStatShellOpen)) {
+        CdSyncCallback(NULL);
+        if (com != CdlNop && (CdStatus() & CdlStatShellOpen)) {
             CD_cw(CdlNop, NULL, NULL, 0);
         }
         if (param == NULL || D_800B5718[com] == 0 ||
             !CD_cw(CdlSetloc, param, result, 0)) {
-            CD_cbsync = old;
+            CdSyncCallback(old);
             if (!CD_cw(com, param, result, arg3)) {
                 return 0;
             }
         }
     }
 
-    CD_cbsync = old;
+    CdSyncCallback(old);
     return -1;
 }
 

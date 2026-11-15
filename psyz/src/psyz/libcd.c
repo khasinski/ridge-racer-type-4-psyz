@@ -83,7 +83,7 @@ CdlCB CD_cbsync = NULL;
 CdlCB CD_cbready = NULL;
 int CD_cbread = 0;
 int CD_debug = 0;
-int CD_status = 0;
+u_char CD_status = 0;
 int CD_status1 = 0;
 int CD_nopen = 0;
 CdlLOC CD_pos = {2, 0, 0, 0};
@@ -989,6 +989,7 @@ size_t Psyz_CdPullSamples(short* out, size_t num_frames) {
     } else {
         read_frames = 0;
     }
+    Psyz_AudioLock();
     if (!enable_passthrough) {
         for (size_t i = 0; i < read_frames; i++) {
             int l = out[i * 2 + 0];
@@ -999,6 +1000,7 @@ size_t Psyz_CdPullSamples(short* out, size_t num_frames) {
             out[i * 2 + 1] = clamp16(r_out);
         }
     }
+    Psyz_AudioUnlock();
     return read_frames;
 }
 
@@ -1372,19 +1374,23 @@ static void callback(void) { NOT_IMPLEMENTED; }
 
 int CD_init(void) {
     u_char nop_result[8];
+    Psyz_KernelLockInterrupts();
     CD_com = 0;
+    Psyz_AudioLock();
     if (CD_mode & CdlModeSpeed) {
         drive_init_was_double = 1;
     }
     CD_mode = 0;
+    Psyz_AudioUnlock();
     CD_cbready = 0;
     CD_cbsync = 0;
     CD_status1 = 0;
     CD_status = 0;
     ResetCallback();
     InterruptCallback(2, &callback);
+    Psyz_KernelUnlockInterrupts();
     CD_cw(CdlNop, 0, nop_result, 0);
-    if (CD_status & CdlStatShellOpen) {
+    if (CdStatus() & CdlStatShellOpen) {
         CD_cw(CdlNop, 0, nop_result, 0);
     }
     if (CD_cw(CdlReset, 0, 0, 0)) {
@@ -1403,6 +1409,7 @@ void CD_initintr(void) { NOT_IMPLEMENTED; }
 void CD_flush(void) { NOT_IMPLEMENTED; }
 
 int CD_vol(CdlATV* vol) {
+    Psyz_AudioLock();
     // 0x1F801800 = 2
     ctx.cd_src_l_dst_l = vol->val0; // 0x1F801802
     ctx.cd_src_l_dst_r = vol->val1; // 0x1F801803
@@ -1411,6 +1418,7 @@ int CD_vol(CdlATV* vol) {
     ctx.cd_src_r_dst_r = vol->val2; // 0x1F801801
     ctx.cd_src_r_dst_l = vol->val3; // 0x1F801802
     CHNGATV();                      // 0x1F801803 = 0x20
+    Psyz_AudioUnlock();
     return 0;
 }
 
@@ -1453,21 +1461,25 @@ int CD_initvol(void) {
  * CdlNoIntr until it completes; mode 0 waits for it. */
 int CD_sync(int mode, u_char* result) {
     if (mode == 0) {
-        drive_poll_until(drive.done_us);
+        Psyz_KernelLockInterrupts();
+        uint64_t done = drive.done_us;
+        Psyz_KernelUnlockInterrupts();
+        drive_poll_until(done);
         Psyz_CdServiceDrive();
     } else {
         Psyz_CdPollQuery();
-        if (!drive_is_instant() && drive_now() < drive.done_us) {
-            return CdlNoIntr;
-        }
     }
-    if (result) {
-        // Hand back only what the last command produced; the caller sized its
-        // buffer for that command, not for last_result.
+    Psyz_KernelLockInterrupts();
+    int intr = last_intr;
+    if (mode != 0 && !drive_is_instant() && drive_now() < drive.done_us) {
+        intr = CdlNoIntr;
+    } else if (result) {
         memcpy(result, last_result, last_result_len);
     }
-    return last_intr;
+    Psyz_KernelUnlockInterrupts();
+    return intr;
 }
+
 static int read_data_sector_into(int sector, u_char* out) {
     if (disk_read_cb) {
         struct PsyzCdRead read = {(unsigned int)sector, SECTOR_SIZE, out};
@@ -1489,29 +1501,45 @@ static int is_played_audio_sector(void) {
 // Polled reads (CdReady). A ready callback receives the sectors instead,
 // and polled ADPCM playback (CdlModeRT) keeps this data path idle.
 int CD_ready(int mode, u_char* result) {
-    if (!data_read_active || CD_cbready || (CD_mode & CdlModeRT))
-        return CdlNoIntr;
-    if (!data_sector_valid) {
-        // The next sector arrives one period after the previous one.
-        uint64_t at = drive_start_us +
-                      (drive_delivered + 1) * 1000000 / drive_rate();
-        if (mode == 0) {
-            drive_poll_until(at);
-        } else {
-            Psyz_CdPollQuery();
-            if (!drive_is_instant() && drive_now() < at)
-                return CdlNoIntr;
+    int polled = 0;
+    for (;;) {
+        Psyz_KernelLockInterrupts();
+        int intr = CdlNoIntr;
+        if (!data_read_active || CD_cbready || (CD_mode & CdlModeRT)) {
+            Psyz_KernelUnlockInterrupts();
+            return intr;
         }
-        if (read_data_sector(data_sector_number) < 0)
-            return CdlDiskError;
-        drive_delivered++;
-        data_sector_valid = 1;
-        data_getsector_count = 0;
+        if (!data_sector_valid) {
+            uint64_t at = drive_start_us +
+                          (drive_delivered + 1) * 1000000 / drive_rate();
+            if (!polled || (mode == 0 && !drive_is_instant() && drive_now() < at)) {
+                /* Never keep the IRQ thread locked during a mechanical wait.
+                 * Recheck the request after waiting: a callback may replace it. */
+                Psyz_KernelUnlockInterrupts();
+                if (mode == 0)
+                    drive_poll_until(at);
+                else
+                    Psyz_CdPollQuery();
+                polled = 1;
+                continue;
+            }
+            if (mode != 0 && !drive_is_instant() && drive_now() < at) {
+                Psyz_KernelUnlockInterrupts();
+                return intr;
+            }
+            if (read_data_sector(data_sector_number) < 0) {
+                Psyz_KernelUnlockInterrupts();
+                return CdlDiskError;
+            }
+            drive_delivered++;
+            data_sector_valid = 1;
+            data_getsector_count = 0;
+        }
+        if (result)
+            result[0] = (u_char)CD_status;
+        Psyz_KernelUnlockInterrupts();
+        return CdlDataReady;
     }
-    if (result) {
-        result[0] = (u_char)CD_status;
-    }
-    return CdlDataReady;
 }
 
 // Frame being assembled by StCdInterrupt (below).
@@ -1613,7 +1641,11 @@ static void service_sync_callback(void) {
 static void drive_schedule(void);
 
 void Psyz_CdServiceDrive(void) {
+    /* Both main-thread polls and the timed IRQ callback service this state.
+     * The recursive kernel lock also serializes callbacks with command work. */
+    Psyz_KernelLockInterrupts();
     if (drive_servicing) {
+        Psyz_KernelUnlockInterrupts();
         return;
     }
     drive_servicing = 1;
@@ -1638,6 +1670,7 @@ void Psyz_CdServiceDrive(void) {
     }
     drive_servicing = 0;
     drive_schedule();
+    Psyz_KernelUnlockInterrupts();
 }
 
 /* The drive's interrupts come at their time: the next sector of a read
@@ -1797,8 +1830,12 @@ static uint64_t command_ack_us;
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     // LIBCD's CD_cw first waits (CD_sync(0)) for the previous command to
     // complete, a second response included.
-    drive_wait_until(drive.done_us);
+    Psyz_KernelLockInterrupts();
+    uint64_t previous_done = drive.done_us;
+    Psyz_KernelUnlockInterrupts();
+    drive_wait_until(previous_done);
     Psyz_CdServiceDrive();
+    Psyz_KernelLockInterrupts();
     CD_com = com; // CdLastCom
     command_ack_us = drive_now();
     if (!drive_is_instant()) {
@@ -1823,8 +1860,10 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     }
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     drive_schedule();
+    uint64_t ack = command_ack_us;
+    Psyz_KernelUnlockInterrupts();
     if (!arg3) {
-        drive_wait_until(command_ack_us);
+        drive_wait_until(ack);
     }
     return ret;
 }

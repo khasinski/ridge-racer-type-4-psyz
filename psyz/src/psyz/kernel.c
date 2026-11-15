@@ -136,14 +136,16 @@ static Event events[EVENT_COUNT];
 static AtomicWord event_waiters;
 
 static void* kernel_lock;
-static volatile uintptr_t lock_owner;
+/* Read before taking kernel_lock to recognize recursive entry. Volatile
+ * does not synchronize this shared owner with the IRQ thread. */
+static AtomicTime lock_owner;
 static int lock_depth;
 static int in_critical_section;
 static int in_interrupt;
 
 static void* bell_events;
 static void* bell_irq;
-static int irq_thread_state; // 0: not started, 1: running, -1: polled
+static AtomicWord irq_thread_state; // 0: not started, 2: starting, 1: running, -1: polled
 
 static unsigned irq_mask = 1u << IRQ_VBLANK;
 static unsigned irq_latched;
@@ -291,17 +293,17 @@ static void KernelInit(void) {
     }
 }
 
-static int OwnsKernel(void) { return lock_owner == Psyz_OsThreadSelf(); }
+static int OwnsKernel(void) { return AtomicTimeLoad(&lock_owner) == Psyz_OsThreadSelf(); }
 
 static void KernelLock(void) {
     uintptr_t self = Psyz_OsThreadSelf();
     KernelInit();
-    if (lock_owner == self) {
+    if (AtomicTimeLoad(&lock_owner) == self) {
         lock_depth++;
         return;
     }
     Psyz_OsLock(kernel_lock);
-    lock_owner = self;
+    AtomicTimeStore(&lock_owner, self);
     lock_depth = 1;
 }
 
@@ -309,7 +311,7 @@ static void KernelUnlock(void) {
     if (--lock_depth > 0) {
         return;
     }
-    lock_owner = 0;
+    AtomicTimeStore(&lock_owner, 0);
     Psyz_OsUnlock(kernel_lock);
 }
 
@@ -525,7 +527,7 @@ long TestEvent(long event) {
     if (AtomicCas(&e->status, EvStALREADY, EvStACTIVE)) {
         return 1;
     }
-    if (irq_thread_state < 0) {
+    if (AtomicLoad(&irq_thread_state) < 0) {
         Psyz_KernelPoll();
     }
     return 0;
@@ -560,7 +562,7 @@ long WaitEvent(long event) {
             ret = 0;
             break;
         }
-        if (irq_thread_state < 0) {
+        if (AtomicLoad(&irq_thread_state) < 0) {
             Psyz_KernelPoll();
             Psyz_OsBellWait(bell_events, 1000);
         } else {
@@ -764,15 +766,16 @@ static void IrqThread(void) {
 }
 
 static void StartIrqThread(void) {
-    if (irq_thread_state) {
-        return;
-    }
     KernelInit();
+    /* Publish "starting" before the new thread can post another callback. */
+    if (!AtomicCas(&irq_thread_state, 0, 2))
+        return;
     if (UsesAudioClock()) {
-        irq_thread_state = -1;
+        AtomicStore(&irq_thread_state, -1);
         return;
     }
-    irq_thread_state = Psyz_OsThreadStart(IrqThread, "psyz_irq") ? -1 : 1;
+    AtomicStore(&irq_thread_state,
+                Psyz_OsThreadStart(IrqThread, "psyz_irq") ? -1 : 1);
 }
 
 /* Desktop modal/focus pauses exclude wall time from root counters too.
@@ -815,7 +818,7 @@ void Psyz_KernelSetHostClockSpeed(unsigned speed) {
 
 void Psyz_KernelPoll(void) {
     uint64_t deadline;
-    if (!irq_thread_state || OwnsKernel() ||
+    if (!AtomicLoad(&irq_thread_state) || OwnsKernel() ||
         (!UsesAudioClock() &&
          !IsDue(AtomicTimeLoad(&poll_deadline_us), KernelNowUs()))) {
         return;
@@ -829,7 +832,7 @@ unsigned Psyz_KernelAudioBatch(unsigned maximum) {
     if (!UsesAudioClock())
         return maximum;
     Psyz_KernelPoll();
-    if (!irq_thread_state)
+    if (!AtomicLoad(&irq_thread_state))
         return maximum;
     uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
     uint64_t now = AtomicTimeLoad(&audio_time_us);

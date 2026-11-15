@@ -1,5 +1,13 @@
 /* Frame interpolation of the SDL GPU renderer (included by sdl3_gpu.c).
  *
+ * Psyz_GpuSetPresentationRate(60/120) samples the paired geometry at output
+ * deadlines while retaining the original simulation/audio field clock.
+ * The midpoint solver below supplies motion and junction constraints;
+ * InterpSampleVertex evaluates each output fraction from the two poses.
+ * Complete samples are cropped to a bounded output queue, with one native
+ * frame of latency. Cooperative polling presents them during CPU geometry
+ * work and native blank waits. A rate of zero retains the legacy API below.
+ *
  * A game frame that takes two fields (25 or 30 fps) gets a midpoint drawn
  * between it and the frame before, presented at the blank in between
  * (Psyz_GpuPrepareInterpolatedBlank). The midpoint is drawn from the same
@@ -117,6 +125,12 @@ typedef struct {
 } InterpAddress;
 
 typedef struct {
+    float current[3], previous[3], depth, old_depth;
+    bool paired, anchor_old;
+    unsigned edge; /* selected T-junction edge + 1 */
+} InterpTemporalVertex;
+
+typedef struct {
     const void *a, *b;
     unsigned serial, frame, count;
     bool background;
@@ -133,6 +147,7 @@ typedef struct {
     uint64_t signature;
     float position[6][3];
     float depth[6]; /* view depths of position (vertex_depth), 0 for none */
+    InterpTemporalVertex temporal[6]; /* same-frame duplicate packets */
     unsigned long long id; /* the identity (PSYZ_INTERP_PROBE) */
     /* Psyz_GpuTagInterpolationPacket'ed for this frame */
     unsigned tagged_frame;
@@ -152,6 +167,7 @@ static InterpAddress interp_addresses[INTERP_MAP], interp_queue[INTERP_MAP];
 /* Packets tagged with a stable identity (Psyz_GpuTagInterpolationPacket):
  * the packet address -> its identity's pair, for the frame it is drawn in. */
 static InterpAddress interp_tags[INTERP_MAP];
+static InterpAddress* interp_map_scratch;
 
 typedef struct {
     unsigned long long id;
@@ -178,6 +194,35 @@ static int interp_next_y = -1;
 static bool interpolation_requested;
 static bool interpolation_enabled, interp_present_mid, interp_pair_ready;
 static SDL_GPUTexture* interpolated_vram;
+/* At most five distinct positions per PAL race frame at 120 Hz. The
+ * first uses the existing interpolation target; the others share its
+ * packet history, texture lifetime and drawing-state splits. */
+#define INTERP_SAMPLES 5
+#define INTERP_OUTPUTS 12
+static SDL_GPUTexture* interp_sample_targets[INTERP_SAMPLES - 1];
+static unsigned interp_sample_scale, interp_sample_count, interp_fields = 2;
+static float interp_sample_alpha[INTERP_SAMPLES];
+static double interp_sample_due[INTERP_SAMPLES], interp_output_tick;
+static double interp_last_output_due;
+static bool interp_scheduled_present;
+static bool interp_render_busy;
+static void InterpServiceOutput(void);
+typedef struct {
+    SDL_GPUTexture* texture;
+    unsigned width, height;
+    double due;
+    float aspect;
+    bool generated;
+} InterpOutput;
+static InterpOutput interp_outputs[INTERP_OUTPUTS];
+static unsigned interp_output_write;
+static int interp_output_selected = -1;
+static void InterpSamplesBegin(void);
+static void InterpSamplesReady(int y);
+static void InterpSamplesRelease(void);
+static SDL_GPUTexture* InterpSampleTarget(unsigned i) {
+    return i ? interp_sample_targets[i - 1] : interpolated_vram;
+}
 /* Failed submission/wait is not a completion witness. Retain until idle. */
 static SDL_GPUTexture* interp_unwitnessed;
 static unsigned interpolated_scale;
@@ -191,6 +236,8 @@ static unsigned interpolated_scale;
 #define INTERP_MID_VERTICES 262144u
 #define INTERP_MID_INDICES (INTERP_MID_VERTICES / 4u * 6u)
 static Vertex interp_mid_store[INTERP_MID_VERTICES];
+static InterpTemporalVertex interp_temporal[INTERP_MID_VERTICES];
+static Vertex interp_sample_vertices[MAX_VERTEX_COUNT];
 static float interp_mid_depth_store[INTERP_MID_VERTICES];
 static u32 interp_mid_index[INTERP_MID_INDICES];
 static unsigned interp_mid_len, interp_mid_index_len;
@@ -268,12 +315,15 @@ static float InterpArea(float (*pos)[3], unsigned count);
  * after the primitive drawn before it in that frame (interp_order). A new
  * identity drawn where a ghost goes (the other representation) stays out
  * of the midpoint. PSYZ_INTERP_GHOSTS=0 turns them off. */
-#define INTERP_STORE 32768u
+/* At most six vertices per pair per frame. Grow each bank on demand so a
+ * dense frame cannot lose ghosts while its pair table still has room. */
+#define INTERP_STORE_INITIAL 32768u
+#define INTERP_STORE (INTERP_PAIRS * 6u)
 /* the largest move (pixels a frame) a ghost continues */
 #define INTERP_GHOST_MOTION 384.0f
-#define INTERP_ORDER 16384u
-static Vertex interp_store[2][INTERP_STORE];
-static unsigned interp_store_len[2];
+#define INTERP_ORDER INTERP_PAIRS
+static Vertex* interp_store[2];
+static unsigned interp_store_len[2], interp_store_capacity[2];
 static unsigned interp_order[2][INTERP_ORDER], interp_order_len[2];
 static unsigned interp_inject, interp_ghost_first;
 static int interp_ghosts = -1;
@@ -325,6 +375,18 @@ typedef struct {
 
 static InterpField interp_field[2];
 
+/* A snapshot of each bucket in its original list order. Pending primitives
+ * can still prepend entries to the live field after this snapshot is made. */
+typedef struct {
+    InterpFieldEntry entry[INTERP_FIELD];
+    unsigned begin[INTERP_FIELD_CELLS + 1], len, frame;
+    unsigned long long verified_queries;
+} InterpFieldCache;
+
+static InterpFieldCache* interp_field_cache;
+static bool interp_field_cache_tried, interp_field_cache_verify;
+static unsigned interp_field_cache_active;
+
 /* Where a primitive drawn now lands in the frame's buffer: the drawing
  * offset, the widescreen squeeze and the drawing area. */
 typedef struct {
@@ -373,11 +435,43 @@ static void InterpFinishPending(unsigned pending);
 #define INTERP_JUNCTION_MOVE 6.0f
 
 typedef struct {
-    float a0[2], b0[2], a1[2], b1[2], am[2], bm[2], da, db;
+    float a0[2], b0[2], a1[2], b1[2], am[2], bm[2], da, db, da1, db1;
     unsigned pair;
     short ox, oy;
     bool posed;
 } InterpEdge;
+
+typedef struct {
+    float length2[2], length[2];
+} InterpEdgeMeasure;
+
+typedef struct { float lo, hi; } InterpDepthBounds;
+
+#define INTERP_QUERY_CACHE 16384u
+typedef struct {
+    float pose[5];
+    short ox, oy;
+    bool posed;
+    unsigned generation;
+    const InterpEdge *first, *other;
+} InterpJunctionQuery;
+
+typedef struct {
+    InterpEdgeMeasure measures[INTERP_EDGES];
+    unsigned begin[INTERP_EDGE_CELLS + 1], edges[INTERP_EDGE_REFS];
+    unsigned frame, refs;
+    InterpDepthBounds depth8[INTERP_EDGE_REFS / 8 + INTERP_EDGE_CELLS];
+    InterpDepthBounds depth64[INTERP_EDGE_REFS / 64 + INTERP_EDGE_CELLS];
+    unsigned start8[INTERP_EDGE_CELLS], start64[INTERP_EDGE_CELLS];
+    bool tree_enabled, verify_tree, reject_enabled;
+    InterpJunctionQuery queries[INTERP_QUERY_CACHE];
+    unsigned generation;
+    bool query_enabled, verify_queries, log_queries;
+    unsigned long long query_count, query_hits, query_excluded;
+} InterpEdgeCache;
+
+static InterpEdgeCache* interp_edge_cache;
+static bool interp_edge_measures_tried;
 
 typedef struct {
     unsigned edge, next;
@@ -404,7 +498,7 @@ static unsigned interp_junction_prims_len;
 static void InterpSnapJunctions(unsigned n);
 static void InterpAddEdge(
     const float* a0, const float* b0, const float* a1, const float* b1,
-    const float* am, const float* bm, float da, float db, unsigned pair, int ox,
+    const float* am, const float* bm, float da, float db, float da1, float db1, unsigned pair, int ox,
     int oy, bool posed);
 /* Exposure: what the midpoint shows where both frames show something
  * nearer. Each frame's opaque primitives and the midpoint's are rasterized
@@ -550,7 +644,7 @@ static void InterpInjectGhosts(unsigned h);
 static unsigned InterpEdgeCell(int cx, int cy, int ox, int oy);
 static void InterpAddEdge(
     const float* a0, const float* b0, const float* a1, const float* b1,
-    const float* am, const float* bm, float da, float db, unsigned pair, int ox,
+    const float* am, const float* bm, float da, float db, float da1, float db1, unsigned pair, int ox,
     int oy, bool posed);
 static float InterpAlong(
     const float* p, const float* a, const float* b, float* distance);

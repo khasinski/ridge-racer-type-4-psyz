@@ -27,7 +27,11 @@ static struct {
  * once. */
 static int mdec_instant;
 
-void Psyz_MdecSetInstantTiming(int instant) { mdec_instant = instant != 0; }
+void Psyz_MdecSetInstantTiming(int instant) {
+    Psyz_KernelLockInterrupts();
+    mdec_instant = instant != 0;
+    Psyz_KernelUnlockInterrupts();
+}
 
 static unsigned unit_bytes(void) {
     switch ((mdec.command >> 27) & 3) {
@@ -229,7 +233,7 @@ static void decode(const u8* source, const u8* end) {
     }
 }
 
-void MDEC_reset(int mode) {
+static void MDEC_reset_locked(int mode) {
     if (mode != 0 && mode != 1) {
         mdec.error = -1;
         return;
@@ -242,7 +246,7 @@ void MDEC_reset(int mode) {
         DecDCTGetEnv(&mdec.env);
 }
 
-void MDEC_in(void* buf, int size) {
+static void MDEC_in_locked(void* buf, int size) {
     mdec.error = 0;
     if (!buf || size < 0) {
         mdec.error = -1;
@@ -289,7 +293,7 @@ void MDEC_in(void* buf, int size) {
         Psyz_DmaComplete(0);
 }
 
-void MDEC_out(void* buf, int size) {
+static void MDEC_out_locked(void* buf, int size) {
     if (!size)
         return;
     if (!buf || size < 0 || mdec.error ||
@@ -310,28 +314,62 @@ void MDEC_out(void* buf, int size) {
     mdec.out_us = ready;
     Psyz_KernelPostAt(ready, out_done);
 }
-int MDEC_in_sync(void) { return mdec.error; }
+/* The timed completion and DMA callbacks hold the same recursive lock.
+ * In particular, never cancel a transfer after another thread has already
+ * completed it and its callback has submitted the next slice. */
+void MDEC_reset(int mode) {
+    Psyz_KernelLockInterrupts();
+    MDEC_reset_locked(mode);
+    Psyz_KernelUnlockInterrupts();
+}
+void MDEC_in(void* buf, int size) {
+    Psyz_KernelLockInterrupts();
+    MDEC_in_locked(buf, size);
+    Psyz_KernelUnlockInterrupts();
+}
+void MDEC_out(void* buf, int size) {
+    Psyz_KernelLockInterrupts();
+    MDEC_out_locked(buf, size);
+    Psyz_KernelUnlockInterrupts();
+}
+int MDEC_in_sync(void) {
+    Psyz_KernelLockInterrupts();
+    int error = mdec.error;
+    Psyz_KernelUnlockInterrupts();
+    return error;
+}
 int MDEC_out_sync(void) {
-    // DecDCToutSync(0) waits for the transfer.
+    // DecDCToutSync(0) waits for the transfer, without starving the IRQ thread.
+    Psyz_KernelLockInterrupts();
     while (mdec.out_pending) {
         uint64_t now = Psyz_KernelNowUs();
-        if (mdec.out_us > now && Psyz_AudioWaitUs(mdec.out_us - now) &&
-            Psyz_KernelNowUs() != now) {
+        uint64_t due = mdec.out_us;
+        Psyz_KernelUnlockInterrupts();
+        int advanced = due > now && Psyz_AudioWaitUs(due - now) &&
+                       Psyz_KernelNowUs() != now;
+        Psyz_KernelLockInterrupts();
+        if (advanced || !mdec.out_pending || mdec.out_us != due)
             continue;
-        }
-        if (Psyz_KernelOfflineClock() || mdec.out_us <= now) {
+        if (Psyz_KernelOfflineClock() || due <= now) {
             // due, or no time can pass here (inside an interrupt)
             Psyz_KernelCancel(out_done);
             out_done();
         } else {
+            Psyz_KernelUnlockInterrupts();
             Psyz_KernelPoll();
+            Psyz_KernelLockInterrupts();
         }
     }
-    return mdec.error;
+    int error = mdec.error;
+    Psyz_KernelUnlockInterrupts();
+    return error;
 }
 u_long MDEC_status(void) {
+    Psyz_KernelLockInterrupts();
     u32 status = 0x0004ffffu | ((mdec.command >> 2) & 0x07800000u);
-    return status | (mdec.cursor == mdec.length ? 0x80000000u : 0x28000000u);
+    status |= mdec.cursor == mdec.length ? 0x80000000u : 0x28000000u;
+    Psyz_KernelUnlockInterrupts();
+    return status;
 }
 
 int DecDCTvlc(u_long* bs, u_long* buf) {

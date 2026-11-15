@@ -1,8 +1,10 @@
 #include <common.h>
 #include <libcd.h>
 #include "libcd_stream.h"
+#include "libcd_lock.h"
 
 u_long StFreeRing(u_long* base) {
+    CD_LOCK();
     s32 temp_a1;
     s32 i;
     s16 nSectors;
@@ -12,11 +14,13 @@ u_long StFreeRing(u_long* base) {
     temp_v0 = &StRingAddr[temp_a1];
     nSectors = StRingAddr[temp_a1].nSectors;
     if ((s16)temp_v0->id != 4) {
+        CD_UNLOCK();
         return 1;
     }
     for (i = 0; i < nSectors; i++) {
         *((s16*)((u_char*)StRingAddr + ((i + temp_a1) << 5))) = 0;
     }
     StRingIdx3 = i + temp_a1;
+    CD_UNLOCK();
     return 0;
 }

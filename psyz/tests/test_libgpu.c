@@ -11,6 +11,9 @@
 #endif
 
 #include "ztest.h"
+#ifdef PSYZ_TEST_SDL_GPU
+#include "../src/draw.h"
+#endif
 
 /* What the GPU tests draw with: the CPU rasterizer under PSYZ_HEADLESS=1 and
  * when the SDL GPU backend fell back to it (no SDL GPU device, PSYZ_GPU=off),
@@ -172,10 +175,10 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
 #ifdef PSYZ_TEST_SDL_GPU
     if(CpuRasterizerOnly())zskip("requires SDL GPU");
     extern bool InitPlatform(void);if(!InitPlatform())zskip("requires SDL GPU");
-    const unsigned scales[]={2,8,2,2};
-    for(unsigned test=0;test<4;++test){
-    unsigned scale=scales[test];bool animated=test==3;
-    Psyz_VideoSetInternalResolution(scale);Psyz_VideoSetAntialiasing(test==2);
+    const unsigned scales[]={2,8,2,2,8};
+    for(unsigned test=0;test<5;++test){
+    unsigned scale=scales[test];bool animated=test==3,aa=test==2||test==4;
+    Psyz_VideoSetInternalResolution(scale);Psyz_VideoSetAntialiasing(aa);
     Psyz_VideoSetGeometryCorrection(0);Psyz_VideoSetWidescreen(0);Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
     Psyz_GpuSetFrameInterpolation(1);Psyz_GpuResetInterpolation();
     TILE tile[4]={{0}},ui={0};
@@ -184,6 +187,13 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
     if(animated){Psyz_GpuRegisterInterpolationBackgroundPair(&tile[0].r0,&tile[1].r0);Psyz_GpuRegisterInterpolationBackgroundPair(&tile[2].r0,&tile[3].r0);}
     else Psyz_GpuRegisterInterpolationPair(&tile[0].r0,&tile[1].r0);
     RECT clear={0,0,320,480};ClearImage(&clear,0,0,0);DrawSync(0);
+    /* A previous scene with a large unpaired face must not permanently
+     * suppress later midpoints when PSYZ_INTERP_STATS is disabled. A reset
+     * removes its motion history, while the next frame owns fresh areas. */
+    TILE cut={0};setTile(&cut);setXY0(&cut,0,0);setWH(&cut,320,240);setRGB0(&cut,0,0,0);
+    Psyz_GpuTagInterpolationPacket(&cut.r0,0xC070000u+test);
+    Psyz_GpuBeginInterpolationFrame();DrawPrim(&cut);DrawSync(0);
+    Psyz_GpuResetInterpolation();
     for(unsigned i=0;i<2;++i){
         Psyz_GpuBeginInterpolationFrame();if(animated)Psyz_GpuSetInterpolationCamera(10*i,0);
         DRAWENV draw;SetDefDrawEnv(&draw,0,240*i,320,240);draw.isbg=0;draw.dtd=0;PutDrawEnv(&draw);
@@ -205,7 +215,7 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
     for(unsigned i=0;i<3;++i){zassert_ptr_ne(NULL,images[i]);zexpect_s32_eq(320*scale,widths[i]);zexpect_s32_eq(240*scale,heights[i]);
         int left=320*scale;
         for(unsigned y=25*scale;y<50*scale;++y)for(unsigned x=0;x<80*scale;++x){unsigned char *p=images[i]+((size_t)y*widths[i]+x)*3;if(p[0]>240&&p[1]<10&&p[2]<10&&(int)x<left)left=x;}
-        printf("Interpolation %ux AA=%u animated=%u sample %u: left=%d, expected=%d\n",scale,test==2,animated,i,left,(int)(positions[i]*scale));
+        printf("Interpolation %ux AA=%u animated=%u sample %u: left=%d, expected=%d\n",scale,aa,animated,i,left,(int)(positions[i]*scale));
         zexpect_s32_eq((int)(positions[i]*scale),left);
         if(i)for(unsigned y=60*scale;y<68*scale;++y)zexpect_s32_eq(0,memcmp(images[0]+((size_t)y*widths[0]+150*scale)*3,images[i]+((size_t)y*widths[i]+150*scale)*3,16*scale*3));
     }
@@ -215,6 +225,236 @@ ZTEST(gpu, interpolated_sprite_is_midpoint_without_native_vram_changes) {
     zexpect_s32_eq(0,(int)(Psyz_GpuGetInterpolatedPresentCount()-count));
     Psyz_GpuSetFrameInterpolation(0);Psyz_VideoSetAntialiasing(0);Psyz_VideoSetInternalResolution(1);
     }
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* Address churn crosses the map's reclamation threshold. Every packet has
+ * an explicit, stable identity, so allocation layout must never lose a tag. */
+ZTEST(gpu, independent_frame_rates_render_distinct_geometry_samples) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (CpuRasterizerOnly()) zskip("requires SDL GPU");
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_GpuSetFrameInterpolation(1);
+    const int original_video_mode = GetVideoMode();
+    for (int region = 0; region < 2; ++region) {
+    SetVideoMode(region);
+    for (unsigned fps = 60; fps <= 120; fps += 60) {
+        Psyz_GpuSetPresentationRate(fps);
+        Psyz_GpuSetPresentationInterval(2);
+        Psyz_GpuResetInterpolation();
+        TILE tiles[2] = {{0}};
+        for (unsigned i = 0; i < 2; ++i) {
+            setTile(&tiles[i]); setXY0(&tiles[i], 40 + 24 * i, 30);
+            setWH(&tiles[i], 16, 16); setRGB0(&tiles[i], 255, 0, 0);
+        }
+        Psyz_GpuRegisterInterpolationPair(&tiles[0].r0, &tiles[1].r0);
+        RECT clear = {0, 0, 320, 480}; ClearImage(&clear, 0, 0, 0); DrawSync(0);
+        for (unsigned i = 0; i < 2; ++i) {
+            Psyz_GpuBeginInterpolationFrame();
+            DRAWENV draw; SetDefDrawEnv(&draw, 0, 240 * i, 320, 240);
+            draw.isbg = 0; draw.dtd = 0; PutDrawEnv(&draw);
+            DrawPrim(&tiles[i]); DrawSync(0);
+        }
+        DISPENV display; SetDefDispEnv(&display, 0, 240, 320, 240); PutDispEnv(&display);
+        Psyz_GpuPrepareInterpolatedPresent(240);
+        int nw, nh; unsigned char* native = Psyz_VideoAllocCapturedFrame(&nw, &nh);
+        zassert_ptr_ne(NULL, native);
+        unsigned samples = 0;
+        float previous = -1;
+        for (unsigned i = 0; i < 5; ++i) {
+            int w, h; float t;
+            unsigned char* pixels = Psyz_VideoAllocInterpolationSample(i, &t, &w, &h);
+            if (!pixels) break;
+            zexpect_s32_eq(1, t > previous && t > 0 && t <= 1);
+            int left = w;
+            for (int x = 0; x < 100 * 2; ++x) {
+                const unsigned char* p = pixels + ((size_t)35 * 2 * w + x) * 3;
+                if (p[0] > 240 && p[1] < 10 && x < left) left = x;
+            }
+            int expected = (int)((40 + 24 * t) * 2);
+            printf("%u FPS sample %u alpha=%.6f left=%d expected=%d\n", fps, i, t, left, expected);
+            zexpect_s32_eq(1, abs(left - expected) <= 1);
+            previous = t; ++samples; free(pixels);
+        }
+        zexpect_s32_eq(1, samples >= (fps == 120 ? 4u : 2u));
+        unsigned char* after = Psyz_VideoAllocCapturedFrame(&nw, &nh);
+        zassert_ptr_ne(NULL, after);
+        zexpect_s32_eq(0, memcmp(native, after, (size_t)nw * nh * 3));
+        free(native); free(after);
+    }
+    }
+    SetVideoMode(original_video_mode);
+    Psyz_GpuSetPresentationRate(0);
+    Psyz_GpuSetFrameInterpolation(0);
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+ZTEST(gpu, interpolation_keeps_tags_across_packet_address_churn) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (CpuRasterizerOnly()) zskip("requires SDL GPU");
+    enum { COUNT = 6000, CAPACITY = 131072 };
+    TILE* packets = calloc(CAPACITY, sizeof(*packets));
+    zassert_ptr_ne(NULL, packets);
+    unsigned* order = malloc(CAPACITY * sizeof(*order));
+    if (!order) free(packets);
+    zassert_ptr_ne(NULL, order);
+    for (unsigned i = 0; i < CAPACITY; ++i) order[i] = i;
+    unsigned seed = 0x83DB0915;
+    for (unsigned i = CAPACITY - 1; i; --i) {
+        seed = seed * 1664525u + 1013904223u;
+        unsigned j = seed % (i + 1), temp = order[i];
+        order[i] = order[j]; order[j] = temp;
+    }
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_GpuSetFrameInterpolation(1);
+    Psyz_GpuClearInterpolationPackets();
+    unsigned failed = 0;
+    for (unsigned frame = 0; frame < 12; ++frame) {
+        for (unsigned i = 0; i < COUNT; ++i) {
+            TILE* t = packets + order[frame * COUNT + i];
+            setTile(t); setXY0(t, 20 + frame, 20); setWH(t, 2, 2);
+            setRGB0(t, 255, 0, 0);
+            Psyz_GpuTagInterpolationPacket(&t->r0, 0xADD00000u + i);
+        }
+        Psyz_GpuBeginInterpolationFrame();
+        if (frame) {
+            unsigned primitives, tagged, paired;
+            Psyz_GpuGetInterpolationStats(&primitives, &tagged, &paired);
+            zprintf("address churn frame %u: primitives=%u tagged=%u paired=%u\n",
+                    frame - 1, primitives, tagged, paired);
+            failed += primitives != COUNT || tagged != COUNT;
+            if (frame > 1) failed += paired != COUNT;
+        }
+        DRAWENV draw;
+        SetDefDrawEnv(&draw, 0, (frame & 1) * 240, 320, 240);
+        draw.isbg = 0; draw.dtd = 0; PutDrawEnv(&draw);
+        for (unsigned i = 0; i < COUNT; ++i)
+            DrawPrim(packets + order[frame * COUNT + i]);
+        DrawSync(0);
+    }
+    Psyz_GpuSetFrameInterpolation(0);
+    Psyz_GpuClearInterpolationPackets();
+    free(order);
+    free(packets);
+    zexpect_u32_eq(0, failed);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* A run of live pairs must not evict its neighbours when unused pairs exist
+ * farther round the ring. Keep a stable set while scenery identities churn. */
+ZTEST(gpu, interpolation_keeps_live_pairs_across_identity_churn) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (CpuRasterizerOnly()) zskip("requires SDL GPU");
+    enum { STABLE = 512, CHURN = 2048, COUNT = STABLE + CHURN };
+    TILE* packets = calloc(COUNT, sizeof(*packets));
+    zassert_ptr_ne(NULL, packets);
+    Psyz_VideoSetInternalResolution(2);
+    Psyz_GpuSetFrameInterpolation(1);
+    Psyz_GpuClearInterpolationPackets();
+    unsigned failed = 0;
+    for (unsigned frame = 0; frame < 20; ++frame) {
+        for (unsigned i = 0; i < COUNT; ++i) {
+            TILE* t = packets + i;
+            setTile(t); setXY0(t, 20 + frame, 20); setWH(t, 2, 2);
+            setRGB0(t, 255, 0, 0);
+            unsigned id = i < STABLE ? i : i + frame * CHURN;
+            Psyz_GpuTagInterpolationPacket(&t->r0, 0xA1100000u + id);
+        }
+        Psyz_GpuBeginInterpolationFrame();
+        if (frame) {
+            unsigned primitives, tagged, paired;
+            Psyz_GpuGetInterpolationStats(&primitives, &tagged, &paired);
+            zprintf("identity churn frame %u: primitives=%u tagged=%u paired=%u\n",
+                    frame - 1, primitives, tagged, paired);
+            failed += primitives != COUNT || tagged != COUNT;
+            if (frame > 1) failed += paired != STABLE;
+        }
+        DRAWENV draw;
+        SetDefDrawEnv(&draw, 0, (frame & 1) * 240, 320, 240);
+        draw.isbg = 0; draw.dtd = 0; PutDrawEnv(&draw);
+        for (unsigned i = 0; i < COUNT; ++i) DrawPrim(packets + i);
+        DrawSync(0);
+    }
+    Psyz_GpuSetFrameInterpolation(0);
+    Psyz_GpuClearInterpolationPackets();
+    free(packets);
+    zexpect_u32_eq(0, failed);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* The last face of a dense frame disappears in the next one. Its retained
+ * pose belongs in the midpoint even after 32768 vertices have been stored. */
+ZTEST(gpu, interpolation_keeps_ghost_after_dense_frame) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (CpuRasterizerOnly()) zskip("requires SDL GPU");
+    enum { COUNT = 9000, SCALE = 2 };
+    TILE* packets = calloc(COUNT, sizeof(*packets));
+    zassert_ptr_ne(NULL, packets);
+    Psyz_VideoSetInternalResolution(SCALE);
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+    Psyz_GpuSetFrameInterpolation(1);
+    Psyz_GpuClearInterpolationPackets();
+    RECT clear = {0, 0, 320, 480};
+    ClearImage(&clear, 0, 0, 0); DrawSync(0);
+    for (unsigned frame = 0; frame < 2; ++frame) {
+        for (unsigned i = 0; i < COUNT - frame; ++i) {
+            TILE* t = packets + i;
+            setTile(t); setXY0(t, i == COUNT - 1 ? 100 : 20, 20);
+            setWH(t, 2, 2); setRGB0(t, 255, 0, 0);
+            Psyz_GpuTagInterpolationPacket(&t->r0, 0x6A050000u + i);
+        }
+        Psyz_GpuBeginInterpolationFrame();
+        DRAWENV draw;
+        SetDefDrawEnv(&draw, 0, frame * 240, 320, 240);
+        draw.isbg = 0; draw.dtd = 0; PutDrawEnv(&draw);
+        for (unsigned i = 0; i < COUNT - frame; ++i) DrawPrim(packets + i);
+        DrawSync(0);
+    }
+    DISPENV display;
+    SetDefDispEnv(&display, 0, 0, 320, 240); PutDispEnv(&display);
+    SetDispMask(1);
+    Psyz_GpuPrepareInterpolatedPresent(240);
+    unsigned long long before = Psyz_GpuGetInterpolatedPresentCount();
+    VSync(0);
+    int width, height;
+    unsigned char* first = Psyz_VideoAllocRenderedFrame(&width, &height);
+    free(first);
+    VSync(0);
+    unsigned char* mid = Psyz_VideoAllocRenderedFrame(&width, &height);
+    zassert_ptr_ne(NULL, mid);
+    zexpect_s32_eq(1, (int)(Psyz_GpuGetInterpolatedPresentCount() - before));
+    zexpect_s32_eq(320 * SCALE, width);
+    zexpect_s32_eq(240 * SCALE, height);
+    if (width == 320 * SCALE && height == 240 * SCALE) {
+        const unsigned char* pixel = mid + ((21 * SCALE) * width + 101 * SCALE) * 3;
+        zexpect_u32_eq(255, pixel[0]);
+        zexpect_u32_eq(0, pixel[1]);
+        zexpect_u32_eq(0, pixel[2]);
+    }
+    free(mid);
+    SetDefDispEnv(&display, 0, 240, 320, 240); PutDispEnv(&display);
+    unsigned char* native = Psyz_VideoAllocCapturedFrame(&width, &height);
+    zassert_ptr_ne(NULL, native);
+    zexpect_s32_eq(320, width);
+    zexpect_s32_eq(240, height);
+    if (width == 320 && height == 240)
+        zexpect_u32_eq(0, native[(21 * width + 101) * 3]);
+    free(native);
+    Psyz_GpuSetFrameInterpolation(0);
+    Psyz_GpuClearInterpolationPackets();
+    free(packets);
 #else
     zskip("requires SDL GPU");
 #endif
@@ -876,6 +1116,53 @@ ZTEST(gpu, queued_hd_sprite_preserves_native_vram_coverage_and_palette_fallback)
 #endif
 }
 
+ZTEST(gpu, ssaa_window_downscale_resolves_distant_texture_detail) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!SdlGpuHidden()) zskip("requires hidden SDL GPU output");
+    Psyz_VideoSetInternalResolution(8);
+    Psyz_VideoSetAntialiasing(1);
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetAspectMode(PSYZ_ASPECT_DISPLAY);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_OFF);
+    DISPENV disp; SetDefDispEnv(&disp, 0, 0, 320, 240); PutDispEnv(&disp);
+    DRAWENV draw; SetDefDrawEnv(&draw, 0, 0, 320, 240); draw.dtd = 0; PutDrawEnv(&draw);
+    u16 texture[256 * 32];
+    unsigned char* images[2] = {0};
+    for (unsigned phase = 0; phase < 2; ++phase) {
+        for (unsigned i = 0; i < 256 * 32; ++i) texture[i] = (i + phase) & 1 ? 0x001f : 0x03e0;
+        RECT atlas = {512, 0, 256, 32}; LoadImage(&atlas, (u_long*)texture);
+        RECT clear = {0, 0, 320, 240}; ClearImage(&clear, 0, 0, 0);
+        POLY_FT4 poly = {0}; setPolyFT4(&poly); setRGB0(&poly, 128, 128, 128);
+        setXYWH(&poly, 40, 30, 32, 16);
+        setUV4(&poly, 0, 0, 255, 0, 0, 31, 255, 31);
+        poly.tpage = getTPage(2, 0, 512, 0);
+        DrawPrim(&poly); DrawSync(0); VSync(0);
+        int w, h; images[phase] = Psyz_VideoAllocHiddenDisplay(&w, &h);
+        zassert_ptr_ne(NULL, images[phase]);
+        zassert_s32_eq(1280, w); zassert_s32_eq(720, h);
+    }
+    unsigned largest_change = 0, samples = 0, mean = 0, change_energy = 0;
+    for (unsigned y = 100; y < 125; ++y) for (unsigned x = 290; x < 365; ++x) {
+        unsigned at = (y * 1280 + x) * 3;
+        mean += images[0][at]; ++samples;
+        unsigned change = (unsigned)abs((int)images[0][at] - (int)images[1][at]);
+        change_energy += change * change;
+        if (change > largest_change) largest_change = change;
+    }
+    printf("8x AA final output: mean=%u peak phase change=%u mean square change=%u\n",
+           mean / samples, largest_change, change_energy / samples);
+    zexpect_s32_eq(1, mean / samples >= 115 && mean / samples <= 140);
+    /* The 255-texel span includes a partial stripe, so a few columns can
+     * change; the interior as a whole must remain its average colour. */
+    zexpect_s32_eq(1, change_energy / samples <= 400);
+    free(images[0]); free(images[1]);
+    Psyz_VideoSetAntialiasing(0); Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, optional_model_filter_and_ssaa_preserve_native_vram_and_text) {
 #ifdef PSYZ_TEST_SDL_GPU
     if (CpuRasterizerOnly())
@@ -1372,6 +1659,49 @@ ZTEST(gpu, text_quad_is_stable_across_field_buffers) {
         free(reference);
     }
     Psyz_VideoSetInternalResolution(1);
+#endif
+}
+
+ZTEST(gpu, rgb555_upload_preserves_every_color_and_mask) {
+#if defined(__psyz) && !defined(__PSP__)
+    enum { width = 512, height = 128, count = width * height };
+    static u16 source[count], actual[count];
+    for (unsigned i = 0; i < count; i++)
+        source[i] = (u16)i;
+    RECT region = {0, 256, width, height};
+    DISPENV display;
+    SetDefDispEnv(&display, region.x, region.y, width, height);
+    display.screen.h = height;
+    /* Test both texture uploads and presentation of CPU-drawn native VRAM.
+     * Inspect RGB888 too: a 16-bit roundtrip alone can hide DAC rounding
+     * errors that disappear when quantized back to five bits. */
+    for (int native = 0; native < 2; native++) {
+        Psyz_VideoSetInternalResolution(1);
+        Psyz_VideoSetNativeRasterizer(native);
+        VSync(0);
+        LoadImage(&region, (u_long*)source);
+        DrawSync(0);
+        PutDispEnv(&display);
+        VSync(0);
+        int w, h;
+        unsigned char *pixels = Psyz_VideoAllocCapturedFrame(&w, &h);
+        zassert_ptr_ne(NULL, pixels);
+        zassert_s32_eq(width, w);
+        zassert_s32_eq(height, h);
+        for (unsigned i = 0; i < count; i++)
+            for (unsigned channel = 0; channel < 3; channel++) {
+                unsigned c = (source[i] >> (channel * 5)) & 31;
+                zassert_u8_eq((c * 255 + 15) / 31, pixels[i * 3 + channel]);
+            }
+        free(pixels);
+        StoreImage(&region, (u_long*)actual);
+        DrawSync(0);
+        for (unsigned i = 0; i < count; i++)
+            zassert_u16_eq(source[i], actual[i]);
+    }
+    Psyz_VideoSetNativeRasterizer(0);
+#else
+    zskip("requires the native host renderer");
 #endif
 }
 
@@ -3807,6 +4137,31 @@ ZTEST(gpu, mask_bit_set_and_check) {
     SubmitGP0(unmask, 1);
 }
 
+/* Exercise the backend boundary directly: GP0 normally splits/clamps copies
+ * before dispatch, but the masked CPU merge must never index outside VRAM. */
+ZTEST(gpu, masked_copy_validates_destination_before_cpu_merge) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (CpuRasterizerOnly())
+        zskip("requires SDL GPU");
+    Psyz_VideoSetNativeRasterizer(0);
+    VSync(0);
+    RECT source = {8, 306, 2, 1}, destination = {0, 306, 2, 1};
+    u16 pixels[2] = {0x001F, 0x0002};
+    u16 initial[2] = {0x83E0, 0x0001}, result[2] = {0, 0};
+    Draw_SetMask(0, 0);
+    Draw_LoadImage(&source, (u_long *)pixels);
+    Draw_LoadImage(&destination, (u_long *)initial);
+    Draw_SetMask(1, 1);
+    Draw_MoveImage(&source, UINT32_MAX, 306);
+    Draw_StoreImage(&destination, (u_long *)result);
+    zexpect_u16_eq(0x83E0, result[0]);
+    zexpect_u16_eq(0x8002, result[1]);
+    Draw_SetMask(0, 0);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 /* A textured primitive loads the GPU's CLUT cache only when its CLUT (or
  * the 8-bit depth) changes; GP0 01h, which LoadImage sends, invalidates it.
  * A copy over the cached palette is not seen until then. */
@@ -4059,40 +4414,49 @@ ZTEST(gpu, sdl_gpu_rasterizer_matches_cpu_rasterizer_at_every_scale) {
     if (CpuRasterizerOnly())
         zskip("requires SDL GPU");
     static u16 cpu[1024 * 512], gpu[1024 * 512];
+    static const unsigned scales[] = {1, 2, 3, 4, 8};
     for (u32 seed = 1; seed <= 3; seed++) {
+        Psyz_VideoSetInternalResolution(1);
         Psyz_VideoSetNativeRasterizer(1);
         VSync(0);
         RasterStream(seed, cpu);
         Psyz_VideoSetNativeRasterizer(0);
         VSync(0);
-        for (unsigned scale = 1; scale <= 4; scale++) {
+        for (unsigned s = 0; s < LEN(scales); s++) {
+            unsigned scale = scales[s];
             zassert_s32_eq(0, Psyz_VideoSetInternalResolution(scale));
             VSync(0);
-            RasterStream(seed, gpu);
-            int first, n = CountDifferences(cpu, gpu, &first);
-            if (n)
-                fprintf(stderr, "seed %u %ux: %d pixels differ, first (%d,%d) cpu %04x gpu %04x\n",
-                        seed, scale, n, first % 1024, first / 1024, cpu[first], gpu[first]);
-            zexpect_s32_eq(0, n);
-            int w, h;
-            unsigned char* rgba = Psyz_VideoAllocScaledVramDump(&w, &h);
-            zassert_ptr_ne(NULL, rgba);
-            zexpect_s32_eq(1024 * (int)scale, w);
-            zexpect_s32_eq(512 * (int)scale, h);
-            for (int i = 0; i < 1024 * 512; i++) {
-                const unsigned char* p =
-                    rgba + ((size_t)(i / 1024) * scale * w + (size_t)(i % 1024) * scale) * 4;
-                gpu[i] = (u16)(((p[0] * 31 + 127) / 255) |
-                               (((p[1] * 31 + 127) / 255) << 5) |
-                               (((p[2] * 31 + 127) / 255) << 10) |
-                               (p[3] > 127 ? 0x8000 : 0));
+            /* Partial destination snapshots used to fail intermittently,
+             * especially seed 2 at 2x. Reuse targets across repeated draws
+             * so stale destination texels cannot hide behind a lucky run. */
+            const unsigned repeats = seed == 2 && scale == 2 ? 12 : 1;
+            for (unsigned repeat = 0; repeat < repeats; ++repeat) {
+                RasterStream(seed, gpu);
+                int first, n = CountDifferences(cpu, gpu, &first);
+                if (n)
+                    fprintf(stderr, "seed %u %ux: %d pixels differ, first (%d,%d) cpu %04x gpu %04x\n",
+                            seed, scale, n, first % 1024, first / 1024, cpu[first], gpu[first]);
+                zexpect_s32_eq(0, n);
+                int w, h;
+                unsigned char* rgba = Psyz_VideoAllocScaledVramDump(&w, &h);
+                zassert_ptr_ne(NULL, rgba);
+                zexpect_s32_eq(1024 * (int)scale, w);
+                zexpect_s32_eq(512 * (int)scale, h);
+                for (int i = 0; i < 1024 * 512; i++) {
+                    const unsigned char* p =
+                        rgba + ((size_t)(i / 1024) * scale * w + (size_t)(i % 1024) * scale) * 4;
+                    gpu[i] = (u16)(((p[0] * 31 + 127) / 255) |
+                                   (((p[1] * 31 + 127) / 255) << 5) |
+                                   (((p[2] * 31 + 127) / 255) << 10) |
+                                   (p[3] > 127 ? 0x8000 : 0));
+                }
+                free(rgba);
+                n = CountDifferences(cpu, gpu, &first);
+                if (n)
+                    fprintf(stderr, "seed %u %ux decimated: %d pixels differ, first (%d,%d) cpu %04x gpu %04x\n",
+                            seed, scale, n, first % 1024, first / 1024, cpu[first], gpu[first]);
+                zexpect_s32_eq(0, n);
             }
-            free(rgba);
-            n = CountDifferences(cpu, gpu, &first);
-            if (n)
-                fprintf(stderr, "seed %u %ux decimated: %d pixels differ, first (%d,%d)\n",
-                        seed, scale, n, first % 1024, first / 1024);
-            zexpect_s32_eq(0, n);
         }
     }
     zassert_s32_eq(0, Psyz_VideoSetInternalResolution(1));

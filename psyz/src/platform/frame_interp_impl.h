@@ -1,3 +1,5 @@
+#include <math.h>
+
 /* The batches the midpoint keeps until it is drawn (InterpMidpointSync):
  * their vertices (interp_mid_store) and indices (interp_mid_index), and the
  * view (for the midpoint target, as Draw_FlushBuffer computed it then) and
@@ -39,7 +41,7 @@ static unsigned InterpFieldAdd(unsigned which, const float* from, float depth,
         InterpEvict(IEVICT_FIELD);
         return 0;
     }
-    if (!(SDL_fabsf(from[0]) < 2048.0f && SDL_fabsf(from[1]) < 2048.0f))
+    if (!(fabsf(from[0]) < 2048.0f && fabsf(from[1]) < 2048.0f))
         return 0;
     const unsigned c =
         InterpFieldCell((int)SDL_floorf(from[0] / INTERP_FIELD_CELL),
@@ -55,14 +57,67 @@ static unsigned InterpFieldAdd(unsigned which, const float* from, float depth,
     return f->len;
 }
 
-/* The motion of the nearest entry within reach at a like depth (depth 0:
- * any), its squared distance at *distance; false for none. */
-static bool InterpFieldMotion(
+/* Build only after junction snapping has updated the live entries' motion.
+ * The snapshot lasts through pending primitives and lines, then is invalidated
+ * before any later junction pass can change those entries again. */
+static void InterpFieldPack(unsigned pending) {
+    interp_field_cache_active = 0;
+    if (pending < 64)
+        return;
+    if (!interp_field_cache_tried) {
+        interp_field_cache_tried = true;
+        const char* enabled = SDL_getenv("PSYZ_INTERP_FIELD_CACHE");
+        const char* verify = SDL_getenv("PSYZ_INTERP_FIELD_VERIFY");
+        interp_field_cache_verify = verify && *verify == '1';
+        if (enabled && *enabled == '1')
+            interp_field_cache = SDL_calloc(2, sizeof(*interp_field_cache));
+    }
+    if (!interp_field_cache)
+        return;
+    for (unsigned which = 0; which < 2; ++which) {
+        const InterpField* f = &interp_field[which];
+        if (f->frame != interp_frame || f->len < 128)
+            continue;
+        InterpFieldCache* cache = &interp_field_cache[which];
+        unsigned at = 0;
+        for (unsigned c = 0; c < INTERP_FIELD_CELLS; ++c) {
+            cache->begin[c] = at;
+            if (f->stamp[c] != interp_frame)
+                continue;
+            for (unsigned k = f->head[c]; k; k = f->entry[k - 1].next)
+                cache->entry[at++] = f->entry[k - 1];
+        }
+        cache->begin[INTERP_FIELD_CELLS] = at;
+        cache->len = f->len;
+        cache->frame = f->frame;
+        interp_field_cache_active |= 1u << which;
+    }
+}
+
+static bool InterpFieldConsider(const InterpFieldEntry* e, const float* at,
+                                float depth, int ox, int oy,
+                                float* best, float motion[2]) {
+    if (e->ox != ox || e->oy != oy)
+        return false;
+    if (depth > 0.0f && e->depth > 0.0f &&
+        fabsf(e->depth - depth) > INTERP_FIELD_DEPTH * SDL_max(e->depth, depth))
+        return false;
+    const float d = (e->x - at[0]) * (e->x - at[0]) +
+                    (e->y - at[1]) * (e->y - at[1]);
+    if (!(d < *best))
+        return false;
+    *best = d;
+    motion[0] = e->dx;
+    motion[1] = e->dy;
+    return true;
+}
+
+static bool InterpFieldSearch(
     unsigned which, const float* at, float depth, int ox, int oy,
-    float motion[2], float* distance) {
+    float motion[2], float* distance, const InterpFieldCache* cache) {
     const InterpField* f = &interp_field[which];
     if (f->frame != interp_frame ||
-        !(SDL_fabsf(at[0]) < 2048.0f && SDL_fabsf(at[1]) < 2048.0f))
+        !(fabsf(at[0]) < 2048.0f && fabsf(at[1]) < 2048.0f))
         return false;
     const int cx = (int)SDL_floorf(at[0] / INTERP_FIELD_CELL),
               cy = (int)SDL_floorf(at[1] / INTERP_FIELD_CELL);
@@ -73,26 +128,45 @@ static bool InterpFieldMotion(
             const unsigned c = InterpFieldCell(x, y, ox, oy);
             if (f->stamp[c] != interp_frame)
                 continue;
-            for (unsigned k = f->head[c]; k; k = f->entry[k - 1].next) {
+            /* Entries added after packing are still at the front of the
+             * original chain. Visit them before its immutable packed tail. */
+            for (unsigned k = f->head[c]; k && (!cache || k > cache->len);
+                 k = f->entry[k - 1].next) {
                 const InterpFieldEntry* e = &f->entry[k - 1];
-                if (e->ox != ox || e->oy != oy)
-                    continue;
-                if (depth > 0.0f && e->depth > 0.0f &&
-                    SDL_fabsf(e->depth - depth) >
-                        INTERP_FIELD_DEPTH * SDL_max(e->depth, depth))
-                    continue;
-                const float d = (e->x - at[0]) * (e->x - at[0]) +
-                                (e->y - at[1]) * (e->y - at[1]);
-                if (d < best) {
-                    best = d;
-                    motion[0] = e->dx;
-                    motion[1] = e->dy;
-                    found = true;
-                }
+                found |= InterpFieldConsider(e, at, depth, ox, oy, &best, motion);
             }
+            if (cache)
+                for (unsigned k = cache->begin[c]; k < cache->begin[c + 1]; ++k)
+                    found |= InterpFieldConsider(&cache->entry[k], at, depth,
+                                                 ox, oy, &best, motion);
         }
     if (found)
         *distance = best;
+    return found;
+}
+
+/* The motion of the nearest entry within reach at a like depth (depth 0:
+ * any), its squared distance at *distance; false for none. */
+static bool InterpFieldMotion(
+    unsigned which, const float* at, float depth, int ox, int oy,
+    float motion[2], float* distance) {
+    const InterpFieldCache* cache = interp_field_cache_active & (1u << which)
+                                      ? &interp_field_cache[which] : NULL;
+    if (cache && (cache->frame != interp_frame || cache->len > interp_field[which].len))
+        cache = NULL;
+    const bool found = InterpFieldSearch(which, at, depth, ox, oy, motion, distance, cache);
+    if (cache && interp_field_cache_verify) {
+        ++interp_field_cache[which].verified_queries;
+        float reference[2], reference_distance;
+        const bool expected = InterpFieldSearch(which, at, depth, ox, oy,
+                                                reference, &reference_distance, NULL);
+        if (expected != found || (found &&
+            (memcmp(reference, motion, sizeof(reference)) ||
+             memcmp(&reference_distance, distance, sizeof(reference_distance))))) {
+            SDL_Log("interpolation field mismatch: frame=%u field=%u", interp_frame, which);
+            abort();
+        }
+    }
     return found;
 }
 
@@ -136,38 +210,71 @@ static unsigned InterpHash(const void* p) {
     return (unsigned)(((n >> 2) ^ (n >> 16) ^ (n >> 30)) & (INTERP_MAP - 1));
 }
 
+/* Linear probing must continue to an empty slot: four collisions used to
+ * discard live packet tags, making midpoint admission depend on arena layout.
+ * Reclaim obsolete addresses before the table becomes dense. Rehashing changes
+ * slots only; pair identities, flags and the order of geometry stay intact. */
+static unsigned interp_map_used[3], interp_map_compact_at[3];
+
 static InterpAddress* InterpFind(InterpAddress* map, const void* p) {
     unsigned h = InterpHash(p);
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < INTERP_MAP; ++i) {
         InterpAddress* e = &map[(h + i) & (INTERP_MAP - 1)];
         if (e->address == p)
             return e;
+        if (!e->address)
+            return NULL;
     }
     return NULL;
 }
 
+static bool InterpAddressLive(InterpAddress* map, const InterpAddress* e) {
+    return e->serial && interp_pairs[e->pair].serial == e->serial &&
+           (map != interp_tags || e->frame >= interp_frame);
+}
+
+static void InterpCompactMap(InterpAddress* map, unsigned* used) {
+    if (!interp_map_scratch)
+        interp_map_scratch = SDL_malloc(sizeof(interp_addresses));
+    if (!interp_map_scratch)
+        return; /* Full probing still preserves entries until true capacity. */
+    unsigned count = 0;
+    for (unsigned i = 0; i < INTERP_MAP; ++i)
+        if (map[i].address && InterpAddressLive(map, &map[i]))
+            interp_map_scratch[count++] = map[i];
+    memset(map, 0, sizeof(interp_addresses));
+    for (unsigned i = 0; i < count; ++i) {
+        InterpAddress entry = interp_map_scratch[i];
+        unsigned h = InterpHash(entry.address);
+        while (map[h].address)
+            h = (h + 1) & (INTERP_MAP - 1);
+        map[h] = entry;
+    }
+    *used = count;
+}
+
 static void InterpMap(
     InterpAddress* map, const void* p, unsigned pair, unsigned serial) {
-    unsigned h = InterpHash(p);
-    InterpAddress* e = InterpFind(map, p);
-    if (!e) {
-        e = &map[h];
-        bool free_slot = false;
-        for (unsigned i = 0; i < 4; ++i)
-            if (!map[(h + i) & (INTERP_MAP - 1)].address) {
-                e = &map[(h + i) & (INTERP_MAP - 1)];
-                free_slot = true;
-                break;
-            }
-        /* another packet's entry goes: count it when its pair (for a tag,
-         * its frame) is still current */
-        if (!free_slot && e->serial &&
-            interp_pairs[e->pair].serial == e->serial &&
-            (map != interp_tags || e->frame >= interp_frame))
-            InterpEvict(map == interp_tags    ? IEVICT_TAGS
-                        : map == interp_queue ? IEVICT_QUEUE
-                                              : IEVICT_ADDRESSES);
+    unsigned which = map == interp_tags ? 1 : map == interp_queue ? 2 : 0;
+    unsigned* used = &interp_map_used[which];
+    if (*used >= INTERP_MAP * 3 / 4 && *used >= interp_map_compact_at[which]) {
+        InterpCompactMap(map, used);
+        interp_map_compact_at[which] = *used + 1024;
     }
+    unsigned h = InterpHash(p);
+    for (unsigned i = 0; i < INTERP_MAP; ++i) {
+        InterpAddress* e = &map[(h + i) & (INTERP_MAP - 1)];
+        if (!e->address || e->address == p) {
+            *used += e->address == NULL;
+            *e = (InterpAddress){p, pair, serial};
+            return;
+        }
+    }
+    /* A genuinely full table retains the documented bounded fallback. */
+    InterpAddress* e = &map[h];
+    if (InterpAddressLive(map, e))
+        InterpEvict(map == interp_tags ? IEVICT_TAGS :
+                    map == interp_queue ? IEVICT_QUEUE : IEVICT_ADDRESSES);
     *e = (InterpAddress){p, pair, serial};
 }
 
@@ -247,8 +354,9 @@ void Psyz_GpuTagInterpolationPacketFlags(
         }
         if (!interp_serial)
             interp_target_stale = true;
-        /* a new identity takes the next pair that no identity drew in the
-         * last two frames, so the live ones keep their history */
+        /* Search the whole ring: a cluster of live pairs is not exhaustion.
+         * Tags for the upcoming frame must also survive until drawing starts,
+         * even when their identity has never drawn a pose yet. */
         unsigned serial, index;
         for (unsigned tries = 0;; ++tries) {
             serial = ++interp_serial;
@@ -256,10 +364,11 @@ void Psyz_GpuTagInterpolationPacketFlags(
                 serial = ++interp_serial;
             index = serial & (INTERP_PAIRS - 1);
             const InterpPair* old = &interp_pairs[index];
-            if (!old->serial || !old->tagged || !old->frame ||
-                old->frame + 1 < interp_frame)
+            if (!old->serial ||
+                ((!old->frame || old->frame + 1 < interp_frame) &&
+                 (!old->tagged || old->tagged_frame < interp_frame)))
                 break;
-            if (tries >= 64) {
+            if (tries + 1 >= INTERP_PAIRS) {
                 InterpEvict(IEVICT_PAIRS);
                 break;
             }
@@ -302,9 +411,16 @@ void Psyz_GpuCopyInterpolationPacket(const void* from, const void* to) {
 }
 
 void Psyz_GpuResetInterpolation(void) {
+    interp_output_selected = -1;
+    interp_output_tick = 0;
+    interp_last_output_due = 0;
+    interp_sample_count = 0;
+    for (unsigned i = 0; i < INTERP_OUTPUTS; ++i)
+        interp_outputs[i].due = 0;
     for (unsigned i = 0; i < INTERP_PAIRS; ++i)
         interp_pairs[i].frame = 0;
     memset(interp_queue, 0, sizeof(interp_queue));
+    interp_map_used[2] = interp_map_compact_at[2] = 0;
     interp_pair_ready = false;
     interp_next_y = -1;
     interp_phase = 0;
@@ -319,6 +435,8 @@ void Psyz_GpuClearInterpolationPackets(void) {
     memset(interp_addresses, 0, sizeof(interp_addresses));
     memset(interp_pairs, 0, sizeof(interp_pairs));
     memset(interp_tags, 0, sizeof(interp_tags));
+    memset(interp_map_used, 0, sizeof(interp_map_used));
+    memset(interp_map_compact_at, 0, sizeof(interp_map_compact_at));
     memset(interp_ids, 0, sizeof(interp_ids));
 }
 
@@ -339,7 +457,7 @@ int Psyz_GpuSetFrameInterpolation(int enabled) {
     if (interpolation_enabled && device && !InterpEnsureTarget()) {
         interpolation_enabled = false;
         Psyz_GpuResetInterpolation();
-        WARNF("60 Hz interpolation admission failed; staying at original "
+        WARNF("interpolation admission failed; staying at original "
               "cadence: %s",
               SDL_GetError());
     }
@@ -363,7 +481,7 @@ int Psyz_GpuSetFrameInterpolation(int enabled) {
     Psyz_PgxpSetEffectEnabled(set_effect_geometry_correction);
     if (logged_requested != (enabled != 0) ||
         logged_effective != interpolation_enabled) {
-        INFOF("60 Hz presentation requested=%d effective=%d scale=%u target=%s "
+        INFOF("geometry interpolation requested=%d effective=%d scale=%u target=%s "
               "simulation=original rendered=unobserved",
               enabled != 0, interpolation_enabled, internal_res,
               interpolated_vram ? "admitted" : "none");
@@ -378,6 +496,153 @@ int Psyz_GpuGetFrameInterpolationRequested(void) {
 }
 
 int Psyz_GpuGetFrameInterpolation(void) { return interpolation_enabled; }
+
+int Psyz_GpuSetPresentationRate(unsigned fps) {
+    if (fps != 0 && fps != 60 && fps != 120)
+        return -1;
+    if (fps == presentation_fps)
+        return 0;
+    Draw_FlushBuffer();
+    InterpMidpointSync(INTERP_SYNC_SETTINGS);
+    if (device && (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device)))
+        return -1;
+    presentation_fps = fps;
+    if (device) InterpSamplesRelease();
+    Psyz_GpuResetInterpolation();
+#ifndef PLATFORM_IOS
+    if (fullscreen_field_rate) ApplyFullscreenMode();
+#endif
+    ConfigureVSync(target_frame_rate);
+    return 0;
+}
+
+void Psyz_GpuSetPresentationInterval(unsigned fields) {
+    interp_fields = SDL_clamp(fields, 1u, 2u);
+}
+
+static void InterpSamplesRelease(void) {
+    for (unsigned i = 0; i < INTERP_SAMPLES - 1; ++i) {
+        if (interp_sample_targets[i])
+            SDL_ReleaseGPUTexture(device, interp_sample_targets[i]);
+        interp_sample_targets[i] = NULL;
+    }
+    for (unsigned i = 0; i < INTERP_OUTPUTS; ++i) {
+        if (interp_outputs[i].texture)
+            SDL_ReleaseGPUTexture(device, interp_outputs[i].texture);
+        interp_outputs[i] = (InterpOutput){0};
+    }
+    interp_sample_scale = interp_sample_count = 0;
+    interp_output_selected = -1;
+    interp_output_tick = 0;
+}
+
+static void InterpSamplesUnavailable(void) {
+    WARNF("%u FPS output allocation failed; restoring original presentation: %s",
+          presentation_fps, SDL_GetError());
+    presentation_fps = 0;
+    Psyz_GpuSetFrameInterpolation(0);
+    Psyz_GpuResetInterpolation();
+    if (!gpu_failed && SubmitCmdAndWait() && SDL_WaitForGPUIdle(device))
+        InterpSamplesRelease();
+    ConfigureVSync(target_frame_rate);
+}
+
+static void InterpSamplesBegin(void) {
+    interp_sample_count = 0;
+    if (!presentation_fps || !interpolation_enabled || !interpolated_vram ||
+        game_speed != 1 || display_rgb24 || debug_show_vram)
+        return;
+    if (interp_sample_scale != internal_res) {
+        InterpSamplesRelease();
+        interp_sample_scale = internal_res;
+    }
+    const double duration = (double)interp_fields * 1e9 / target_frame_rate;
+    const double field = 1e9 / target_frame_rate;
+    const double now = (double)SDL_GetTicksNS();
+    /* One original frame of latency makes the whole pair available before
+     * its first output deadline. This does not delay controller sampling. */
+    const double start = floor(now / field) * field + duration;
+    const double period = 1e9 / presentation_fps;
+    double due = (floor(start / period) + 1.0) * period;
+    while (due <= start + duration + 1.0 && interp_sample_count < INTERP_SAMPLES) {
+        unsigned i = interp_sample_count++;
+        interp_sample_alpha[i] = (float)((due - start) / duration);
+        interp_sample_due[i] = due;
+        due += period;
+    }
+    const SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = VRAM_W * internal_res, .height = VRAM_H * internal_res,
+        .layer_count_or_depth = 1, .num_levels = 1};
+    for (unsigned i = 1; i < interp_sample_count; ++i) {
+        if (interp_sample_targets[i - 1])
+            continue;
+        SDL_GPUTexture* texture = SDL_CreateGPUTexture(device, &info);
+        if (!texture) {
+            InterpSamplesUnavailable();
+            return;
+        }
+        interp_sample_targets[i - 1] = texture;
+        SDL_GPUCommandBuffer* cmd = AcquireCmd();
+        SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+        if (!copy) { InterpSamplesUnavailable(); return; }
+        const SDL_GPUTextureLocation from = {.texture = interpolated_vram},
+                                     to = {.texture = texture};
+        SDL_CopyGPUTextureToTexture(copy, &from, &to, info.width, info.height, 1, false);
+        SDL_EndGPUCopyPass(copy);
+    }
+}
+
+static void InterpSamplesReady(int y) {
+    if (!presentation_fps || !interp_sample_count || y < 0 ||
+        y + display_size.y > VRAM_H || display_rgb24 || debug_show_vram) {
+        for (unsigned i = 0; i < INTERP_OUTPUTS; ++i) interp_outputs[i].due = 0;
+        return;
+    }
+    const bool generated = interp_matches && !InterpMidpointUnsound();
+    const bool wide = widescreen && !WidescreenNativeBuffer(y);
+    const unsigned height = display_size.y * output_internal_res;
+    const unsigned width = wide ? (height * 16u + 4u) / 9u : display_size.x * output_internal_res;
+    for (unsigned i = 0; i < interp_sample_count; ++i) {
+        InterpOutput* out = &interp_outputs[interp_output_write];
+        if (!out->texture || out->width != width || out->height != height) {
+            if (out->texture) SDL_ReleaseGPUTexture(device, out->texture);
+            *out = (InterpOutput){0};
+            const SDL_GPUTextureCreateInfo info = {
+                .type = SDL_GPU_TEXTURETYPE_2D,
+                .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                .width = width, .height = height, .layer_count_or_depth = 1, .num_levels = 1};
+            out->texture = SDL_CreateGPUTexture(device, &info);
+            if (!out->texture) { InterpSamplesUnavailable(); return; }
+            out->width = width; out->height = height;
+        }
+        /* Use the normal display path, including AA resolve, aspect and
+         * room margins, into a bounded output texture. No CPU readback. */
+        SDL_GPUTexture* saved_capture = ws_capture;
+        SDL_GPUTexture* saved_target = interpolated_vram;
+        const unsigned saved_w = ws_capture_width, saved_h = ws_capture_height;
+        const bool saved_mid = interp_present_mid;
+        const int saved_y = interp_next_y, saved_display_y = display_area.y;
+        ws_capture = out->texture; ws_capture_width = width; ws_capture_height = height;
+        interpolated_vram = InterpSampleTarget(i);
+        interp_next_y = display_area.y = y;
+        interp_present_mid = generated;
+        ws_capture_active = true;
+        PlatformBackend_Present();
+        ws_capture_active = false;
+        ws_capture = saved_capture; ws_capture_width = saved_w; ws_capture_height = saved_h;
+        interpolated_vram = saved_target; interp_present_mid = saved_mid;
+        interp_next_y = saved_y; display_area.y = saved_display_y;
+        out->due = interp_sample_due[i];
+        out->generated = generated;
+        out->aspect = wide ? 16.0f / 9.0f : PresentGameAspect(y, false);
+        interp_output_write = (interp_output_write + 1) % INTERP_OUTPUTS;
+    }
+    SubmitCmd();
+}
 
 unsigned long long Psyz_GpuGetInterpolatedPresentCount(void) {
     return interpolated_present_count;
@@ -487,11 +752,20 @@ static void InterpStatsBatches(char* out, size_t size) {
 }
 
 static void InterpStatsFrame(void) {
+    if (interp_edge_cache && interp_edge_cache->log_queries &&
+        interp_frame && interp_frame % 500 == 0)
+        SDL_Log("[interp-query] frame=%u queries=%llu hits=%llu excluded=%llu",
+                interp_frame, interp_edge_cache->query_count, interp_edge_cache->query_hits,
+                interp_edge_cache->query_excluded);
     if (interp_stats_log < 0) {
         const char* e = SDL_getenv("PSYZ_INTERP_STATS");
         interp_stats_log = e && *e && *e != '0';
     }
     if (interp_stats_log <= 0 || !interp_frame) {
+        /* These per-frame areas also decide whether a midpoint is safe.
+         * Logging must not leave them accumulating across earlier scenes. */
+        memset(interp_area, 0, sizeof(interp_area));
+        memset(interp_count, 0, sizeof(interp_count));
         memset(&draw_frame_stats, 0, sizeof(draw_frame_stats));
         memset(interp_evict, 0, sizeof(interp_evict));
         return;
@@ -539,7 +813,7 @@ void Psyz_GpuBeginInterpolationFrame(void) {
     if (!interpolation_enabled || !device || UseSoftwareBackend())
         return;
     if (!InterpEnsureTarget()) {
-        WARNF("60 Hz interpolation target unavailable; original 30 Hz "
+        WARNF("interpolation target unavailable; original "
               "presentation retained: %s",
               SDL_GetError());
         interpolation_enabled = false;
@@ -561,6 +835,7 @@ void Psyz_GpuBeginInterpolationFrame(void) {
             interp_target_stale = false;
         }
     }
+    InterpSamplesBegin();
 }
 
 static void InterpBackdropCopy(int x, int y, int w, int h) {
@@ -578,8 +853,12 @@ static void InterpBackdropCopy(int x, int y, int w, int h) {
                                  to = {.texture = interpolated_vram,
                                        .x = (Uint32)x * r,
                                        .y = (Uint32)y * r};
-    SDL_CopyGPUTextureToTexture(
-        copy, &from, &to, (Uint32)w * r, (Uint32)h * r, 1, false);
+    SDL_CopyGPUTextureToTexture(copy, &from, &to, (Uint32)w * r, (Uint32)h * r, 1, false);
+    for (unsigned i = 1; i < interp_sample_count; ++i) {
+        SDL_GPUTextureLocation sample = to;
+        sample.texture = InterpSampleTarget(i);
+        SDL_CopyGPUTextureToTexture(copy, &from, &sample, (Uint32)w * r, (Uint32)h * r, 1, false);
+    }
     SDL_EndGPUCopyPass(copy);
 }
 
@@ -676,6 +955,7 @@ static bool InterpMidpointUnsound(void) {
 void Psyz_GpuPrepareInterpolatedPresent(int next_y) {
     /* the frame is complete: its midpoint is placed and drawn */
     InterpMidpointComplete(INTERP_SYNC_FRAME);
+    InterpSamplesReady(next_y);
     interp_next_y = next_y;
     interp_phase = 0;
     interp_blank_mid = false;
@@ -726,9 +1006,9 @@ static bool InterpLine(const u_long* words, int count, bool gouraud, int* mid_x,
         position[i][1] = (float)s11(((const short*)&words[at])[1]);
         position[i][2] = 1.0f;
         at++;
-        if (SDL_fabsf(position[i][0] - p->position[i][0]) >
+        if (fabsf(position[i][0] - p->position[i][0]) >
                 INTERP_LINE_PAIR_REACH ||
-            SDL_fabsf(position[i][1] - p->position[i][1]) >
+            fabsf(position[i][1] - p->position[i][1]) >
                 INTERP_LINE_PAIR_REACH)
             valid = false;
     }
@@ -850,6 +1130,17 @@ static bool InterpUnclamped(const float* pos) {
 static void InterpCaptureDraw(const void* packet, Vertex* v, unsigned count) {
     unsigned offset = (unsigned)(v - vertex_buf);
     memcpy(interpolated_vertices + offset, v, count * sizeof(*v));
+    if (presentation_fps)
+        for (unsigned i = 0; i < count; ++i) {
+            InterpTemporalVertex* tv = &interp_temporal[interp_mid_len + offset + i];
+            *tv = (InterpTemporalVertex){0};
+            const bool precise = (geometry_correction || effect_geometry_correction) &&
+                internal_res > 1 && (v[i].t & TPAGE_POLYGON) && v[i].pgxp_pos[2] > 0;
+            tv->current[0] = precise ? v[i].pgxp_pos[0] : v[i].x;
+            tv->current[1] = precise ? v[i].pgxp_pos[1] : v[i].y;
+            tv->current[2] = precise ? v[i].pgxp_pos[2] : 1.0f;
+            tv->depth = vertex_depth[offset + i];
+        }
     for (unsigned i = 0; i < count && offset + i < MAX_VERTEX_COUNT; ++i)
         interp_mid_depth[offset + i] = vertex_depth[offset + i];
     for (unsigned i = 0; i < count; ++i)
@@ -931,6 +1222,9 @@ static void InterpCaptureDraw(const void* packet, Vertex* v, unsigned count) {
      * same face twice): drawn as the first one was. */
     if (p->tagged && p->frame == interp_frame && p->count == count &&
         !memcmp(p->position, position, count * sizeof(position[0]))) {
+        if (presentation_fps && !frame_only)
+            memcpy(&interp_temporal[interp_mid_len + offset], p->temporal,
+                   count * sizeof(*interp_temporal));
         for (unsigned i = 0; i < count; ++i) {
             Vertex* out = interpolated_vertices + offset + i;
             if (p->out_mode == 1 && !frame_only) {
@@ -976,8 +1270,8 @@ static void InterpCaptureDraw(const void* packet, Vertex* v, unsigned count) {
          * view reaches (vertices past the GTE's limit are handled below) */
         const float limit =
             p->tagged ? INTERP_PAIR_REACH_TAGGED : INTERP_PAIR_REACH;
-        if (SDL_fabsf(position[i][0] - p->position[i][0]) > limit ||
-            SDL_fabsf(position[i][1] - p->position[i][1]) > limit)
+        if (fabsf(position[i][0] - p->position[i][0]) > limit ||
+            fabsf(position[i][1] - p->position[i][1]) > limit)
             valid = false;
     }
     /* An authored animation may switch to another tile entry this frame.
@@ -1039,6 +1333,15 @@ static void InterpCaptureDraw(const void* packet, Vertex* v, unsigned count) {
     p->out_mode = 0;
     for (unsigned i = 0; i < count; ++i) {
         Vertex* out = interpolated_vertices + offset + i;
+        if (presentation_fps) {
+            InterpTemporalVertex* tv = &interp_temporal[interp_mid_len + offset + i];
+            memcpy(tv->current, position[i], sizeof(tv->current));
+            memcpy(tv->previous, p->position[i], sizeof(tv->previous));
+            tv->depth = depth[i]; tv->old_depth = p->depth[i];
+            tv->paired = valid && !frame_only;
+            tv->anchor_old = extrapolated || midpoint_only;
+            p->temporal[i] = *tv;
+        }
         if (valid && depth[i] > 0.0f && p->depth[i] > 0.0f &&
             InterpUnclamped(position[i]) && InterpUnclamped(p->position[i])) {
             /* the projection of the midpoint of the two view-space
@@ -1105,7 +1408,7 @@ static void InterpCaptureDraw(const void* packet, Vertex* v, unsigned count) {
                     p->position[a], p->position[b], position[a], position[b],
                     interpolated_vertices[offset + a].pgxp_pos,
                     interpolated_vertices[offset + b].pgxp_pos, p->depth[a],
-                    p->depth[b], e->pair, ox, oy, !midpoint_only);
+                    p->depth[b], depth[a], depth[b], e->pair, ox, oy, !midpoint_only);
             }
         if (interp_junction_prims_len >= INTERP_JUNCTION_PRIMS)
             InterpEvict(IEVICT_JUNCTIONS);
@@ -1249,7 +1552,7 @@ static float InterpArea(float (*pos)[3], unsigned count) {
             q[i][0] = SDL_clamp(pos[tri[k][t][i]][0], x0, x1);
             q[i][1] = SDL_clamp(pos[tri[k][t][i]][1], y0, y1);
         }
-        area += SDL_fabsf((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) -
+        area += fabsf((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) -
                           (q[2][0] - q[0][0]) * (q[1][1] - q[0][1])) *
                 0.5f;
     }
@@ -1275,7 +1578,7 @@ static void InterpCoverTriangle(
     const float a[2], const float b[2], const float c[2]) {
     const float area =
         (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
-    if (SDL_fabsf(area) < 1.0f)
+    if (fabsf(area) < 1.0f)
         return;
     const int x0 =
         SDL_max(0, (int)SDL_floorf(
@@ -1386,7 +1689,8 @@ static void InterpStore(
     if (count < 3 || count > 6 || interp_capture_indices < 3 ||
         interp_capture_indices > 6 || v[0].exact[0][3] || v[0].a != 0xFF)
         return;
-    if (interp_store_len[b] + count > INTERP_STORE) {
+    const unsigned needed = interp_store_len[b] + count;
+    if (needed > INTERP_STORE) {
         InterpEvict(IEVICT_STORE);
         return;
     }
@@ -1401,8 +1705,8 @@ static void InterpStore(
             v[i].y >= 1023)
             return;
         if (p->motion_frame == interp_frame &&
-            (SDL_fabsf(p->motion[i][0]) > INTERP_GHOST_MOTION ||
-             SDL_fabsf(p->motion[i][1]) > INTERP_GHOST_MOTION))
+            (fabsf(p->motion[i][0]) > INTERP_GHOST_MOTION ||
+             fabsf(p->motion[i][1]) > INTERP_GHOST_MOTION))
             return;
     }
     const unsigned base = (unsigned)(v - vertex_buf);
@@ -1411,6 +1715,18 @@ static void InterpStore(
         if (i >= count)
             return;
         p->store_index[k] = (unsigned char)i;
+    }
+    if (needed > interp_store_capacity[b]) {
+        unsigned capacity = interp_store_capacity[b]
+            ? SDL_min(interp_store_capacity[b] * 2, INTERP_STORE)
+            : INTERP_STORE_INITIAL;
+        Vertex* grown = SDL_realloc(interp_store[b], capacity * sizeof(*grown));
+        if (!grown) {
+            InterpEvict(IEVICT_STORE);
+            return; /* Keep the already stored history on allocation failure. */
+        }
+        interp_store[b] = grown;
+        interp_store_capacity[b] = capacity;
     }
     memcpy(&interp_store[b][interp_store_len[b]], v, count * sizeof(*v));
     p->store_offset = interp_store_len[b];
@@ -1567,7 +1883,7 @@ static void InterpExposeTriangle(
     float db, float dc, const int clip[4]) {
     const float area =
         (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
-    if (!(SDL_fabsf(area) >= 0.25f))
+    if (!(fabsf(area) >= 0.25f))
         return;
     const float lx =
                     SDL_max(SDL_min(a[0], SDL_min(b[0], c[0])), (float)clip[0]),
@@ -1784,7 +2100,7 @@ static unsigned InterpEdgeCell(int cx, int cy, int ox, int oy) {
 
 static void InterpAddEdge(
     const float* a0, const float* b0, const float* a1, const float* b1,
-    const float* am, const float* bm, float da, float db, unsigned pair, int ox,
+    const float* am, const float* bm, float da, float db, float da1, float db1, unsigned pair, int ox,
     int oy, bool posed) {
     if (interp_edges_frame != interp_frame) {
         interp_edges_frame = interp_frame;
@@ -1821,8 +2137,40 @@ static void InterpAddEdge(
     memcpy(g->b1, b1, sizeof(g->b1));
     memcpy(g->am, am, sizeof(g->am));
     memcpy(g->bm, bm, sizeof(g->bm));
+    if (!interp_edge_measures_tried) {
+        interp_edge_measures_tried = true;
+        const char* cache = SDL_getenv("PSYZ_INTERP_EDGE_CACHE");
+        if (!(cache && *cache == '0')) {
+            interp_edge_cache = SDL_calloc(1, sizeof(*interp_edge_cache));
+            if (interp_edge_cache) {
+                const char* tree = SDL_getenv("PSYZ_INTERP_EDGE_TREE");
+                const char* tree_verify = SDL_getenv("PSYZ_INTERP_TREE_VERIFY");
+                interp_edge_cache->tree_enabled = !(tree && *tree == '0');
+                interp_edge_cache->verify_tree = tree_verify && *tree_verify == '1';
+                const char* reject = SDL_getenv("PSYZ_INTERP_EDGE_REJECT");
+                interp_edge_cache->reject_enabled = !(reject && *reject == '0');
+                const char* query = SDL_getenv("PSYZ_INTERP_QUERY_CACHE");
+                const char* verify = SDL_getenv("PSYZ_INTERP_QUERY_VERIFY");
+                interp_edge_cache->query_enabled = !(query && *query == '0');
+                interp_edge_cache->verify_queries = verify && *verify == '1';
+                interp_edge_cache->log_queries = SDL_getenv("PSYZ_INTERP_QUERY_STATS") != NULL;
+            }
+        }
+    }
+    if (interp_edge_cache) {
+        InterpEdgeMeasure* m = &interp_edge_cache->measures[e];
+        for (unsigned pose = 0; pose < 2; ++pose) {
+            const float *a = pose ? g->a1 : g->a0, *b = pose ? g->b1 : g->b0;
+            const float dx = b[0] - a[0], dy = b[1] - a[1];
+            m->length2[pose] = dx * dx + dy * dy;
+            m->length[pose] = m->length2[pose] > 1.0f
+                                  ? SDL_sqrtf(m->length2[pose]) : 0.0f;
+        }
+    }
     g->da = da;
     g->db = db;
+    g->da1 = da1;
+    g->db1 = db1;
     g->pair = pair;
     g->ox = (short)ox;
     g->oy = (short)oy;
@@ -1850,21 +2198,243 @@ static float InterpAlong(
     }
     const float t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2;
     *distance =
-        SDL_fabsf((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / SDL_sqrtf(l2);
+        fabsf((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / SDL_sqrtf(l2);
     return t;
 }
 
-/* InterpMidpointSync: the first n queued paired primitives' vertices that
- * lie on another paired primitive's edge in both frames go onto the edge's
- * midpoint. */
+/* Candidate edges are tested against many vertices. Their lengths do not
+ * change during the frame; avoid recomputing square roots in this hot loop.
+ * A point outside the segment is rejected before its distance is needed. */
+static float InterpAlongEdge(const float* p, const InterpEdge* edge,
+                             const InterpEdgeMeasure* measure,
+                             unsigned pose, float* distance) {
+    const float *a = pose ? edge->a1 : edge->a0,
+                *b = pose ? edge->b1 : edge->b0;
+    if (!measure)
+        return InterpAlong(p, a, b, distance);
+    const float l2 = measure->length2[pose];
+    if (!(l2 > 1.0f)) {
+        *distance = 1e9f;
+        return -1.0f;
+    }
+    const float dx = b[0] - a[0], dy = b[1] - a[1];
+    const float t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2;
+    *distance = t > 0.0f && t < 1.0f
+                    ? fabsf((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) /
+                          measure->length[pose]
+                    : 1e9f;
+    return t;
+}
+
+/* Reject clearly unsuitable candidates without divisions. Surviving edges
+ * still use InterpAlongEdge's original arithmetic and strict comparisons.
+ * The distance margin covers rounding when comparing a cross product against
+ * a multiplied threshold instead of dividing by the segment length. */
+static bool InterpEdgeMayMatch(const float* p, const InterpEdge* g,
+                               const InterpEdgeMeasure* m, unsigned pose,
+                               float reach) {
+    const float *a = pose ? g->a1 : g->a0, *b = pose ? g->b1 : g->b0;
+    const float l2 = m->length2[pose];
+    if (!(l2 > 1.0f))
+        return false;
+    const float dx = b[0] - a[0], dy = b[1] - a[1];
+    const float dot = (p[0] - a[0]) * dx + (p[1] - a[1]) * dy;
+    if (!(dot > 0.0f && dot < l2))
+        return false;
+    const float cross = fabsf((p[0] - a[0]) * dy - (p[1] - a[1]) * dx);
+    return cross <= reach * m->length[pose] * 1.001f + 0.0001f;
+}
+
+/* Two different face groups allow reuse even when the caller must exclude
+ * its own edges. Strict comparisons preserve the first winner on ties. */
+static const InterpEdge* InterpSelectJunction(
+    const InterpJunctionPrim* q, unsigned i, unsigned c, float reach,
+    InterpEdgeCache* cache, bool linear, bool groups, bool hierarchy, const InterpEdge** other) {
+    const float *v0 = q->p0[i], *v1 = q->p1[i];
+    float best = 1e9f, other_best = 1e9f;
+    const InterpEdge* second = NULL;
+    const InterpEdge* on = NULL;
+    unsigned r = linear ? cache->begin[c] : interp_edge_head[c];
+    const unsigned end = linear ? cache->begin[c + 1] : 0;
+    const bool reject = hierarchy && cache && cache->reject_enabled;
+    while (linear ? r < end : r != 0) {
+        if (linear && hierarchy && cache->tree_enabled && end - cache->begin[c] >= 32 &&
+            q->d0[i] > 0.0f && q->d0[i] < 1e9f) {
+            const unsigned offset = r - cache->begin[c];
+            unsigned skip = 0;
+            if (!(offset % 64)) {
+                const InterpDepthBounds b = cache->depth64[cache->start64[c] + offset / 64];
+                if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 64;
+            }
+            if (!skip && !(offset % 8)) {
+                const InterpDepthBounds b = cache->depth8[cache->start8[c] + offset / 8];
+                if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 8;
+            }
+            if (skip) { r = SDL_min(r + skip, end); continue; }
+        }
+        unsigned edge;
+        if (linear) {
+            edge = cache->edges[r++];
+        } else {
+            const InterpEdgeRef* ref = &interp_edge_refs[r - 1];
+            edge = ref->edge;
+            r = ref->next;
+        }
+        const InterpEdge* g = &interp_edges[edge];
+        const InterpEdgeMeasure* measure = cache ? &cache->measures[edge] : NULL;
+        if ((!groups && g->pair == q->pair) || g->ox != q->ox || g->oy != q->oy)
+            continue;
+        /* a midpoint-only pose in this frame (nearer than the
+         * projection plane) is no projection to test */
+        const bool both = q->posed && g->posed;
+        /* with one pose to test (geometry passing the view, often a
+         * long edge) the direction of a long edge counts less */
+        const float dx = g->b0[0] - g->a0[0], dy = g->b0[1] - g->a0[1];
+        const float l0 = measure ? measure->length[0] : SDL_sqrtf(dx * dx + dy * dy);
+        if (reject &&
+            (!InterpEdgeMayMatch(v0, g, measure, 0,
+                                 reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)) ||
+             (both && !InterpEdgeMayMatch(v1, g, measure, 1, reach))))
+            continue;
+        float d0, d1 = 0.0f;
+        const float t0 = InterpAlongEdge(v0, g, measure, 0, &d0);
+        if (!(t0 > 0.0f && t0 < 1.0f &&
+              d0 < reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)))
+            continue;
+        if (both) {
+            const float t1 = InterpAlongEdge(v1, g, measure, 1, &d1);
+            if (!(t1 > 0.0f && t1 < 1.0f && d1 < reach))
+                continue;
+        }
+        /* not one of its ends (a shared vertex is joined already) */
+        if (t0 * l0 < 0.5f || (1.0f - t0) * l0 < 0.5f)
+            continue;
+        /* at the edge's depth there (not something in front or behind)
+         */
+        if (q->d0[i] > 0.0f && g->da > 0.0f && g->db > 0.0f) {
+            const float z = 1.0f / ((1.0f - t0) / g->da + t0 / g->db);
+            if (fabsf(z - q->d0[i]) > 0.1f * SDL_max(z, q->d0[i]))
+                continue;
+        }
+        const float score = d0 + (both ? d1 : d0);
+        if (score < best) {
+            if (groups && on && g->pair != on->pair) {
+                second = on;
+                other_best = best;
+            }
+            best = score;
+            on = g;
+        } else if (groups && on && g->pair != on->pair && score < other_best) {
+            second = g;
+            other_best = score;
+        }
+    }
+    if (other)
+        *other = second;
+    return on;
+}
+
+static InterpJunctionQuery* InterpFindJunctionQuery(
+    InterpEdgeCache* cache, const InterpJunctionPrim* q, unsigned i, bool* hit) {
+    const float pose[5] = {q->p0[i][0], q->p0[i][1], q->p1[i][0], q->p1[i][1], q->d0[i]};
+    u32 bits[5];
+    memcpy(bits, pose, sizeof(bits));
+    u32 hash = ((u32)(u16)q->ox << 16) | (u16)q->oy;
+    for (unsigned k = 0; k < 5; ++k)
+        hash = (hash ^ bits[k]) * 0x9E3779B1u;
+    hash ^= q->posed ? 0x85EBCA77u : 0u;
+    hash = (hash ^ (hash >> 16)) & (INTERP_QUERY_CACHE - 1);
+    InterpJunctionQuery* slot = NULL;
+    ++cache->query_count;
+    for (unsigned probe = 0; probe < 4; ++probe) {
+        InterpJunctionQuery* entry = &cache->queries[(hash + probe) & (INTERP_QUERY_CACHE - 1)];
+        if (entry->generation != cache->generation) {
+            if (!slot)
+                slot = entry;
+        } else if (entry->ox == q->ox && entry->oy == q->oy && entry->posed == q->posed &&
+                   !memcmp(entry->pose, pose, sizeof(pose))) {
+            *hit = true;
+            ++cache->query_hits;
+            return entry;
+        }
+    }
+    *hit = false;
+    if (!slot)
+        slot = &cache->queries[hash];
+    memcpy(slot->pose, pose, sizeof(pose));
+    slot->ox = q->ox;
+    slot->oy = q->oy;
+    slot->posed = q->posed;
+    slot->generation = cache->generation;
+    slot->first = slot->other = NULL;
+    return slot;
+}
+
+/* The queued paired vertices lying on another face's edge in both poses
+ * move onto that edge's midpoint. */
 static void InterpSnapJunctions(unsigned n) {
     static int snap = -1;
     if (snap < 0) {
         const char* e = SDL_getenv("PSYZ_INTERP_JUNCTIONS");
         snap = !(e && *e == '0');
     }
-    if (!snap || interp_edges_frame != interp_frame)
+    if (!n || !snap || interp_edges_frame != interp_frame)
         return;
+    /* Keep each bucket in exactly its linked-list order (including hash
+     * collisions and duplicate references), but scan contiguous indices.
+     * Later CLUT splits can reuse it until another edge was queued. */
+    InterpEdgeCache* cache = interp_edge_cache;
+    const bool current = cache && cache->frame == interp_frame &&
+                         cache->refs == interp_edge_refs_len;
+    /* A small partial batch is cheaper to walk directly than to rebuild
+     * the whole index. An already current index costs nothing to reuse. */
+    const bool linear = cache && (current || n >= 64);
+    if (linear && !current) {
+        unsigned at = 0;
+        for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
+            cache->begin[c] = at;
+            if (interp_edge_stamp[c] != interp_frame)
+                continue;
+            for (unsigned r = interp_edge_head[c]; r;
+                 r = interp_edge_refs[r - 1].next)
+                cache->edges[at++] = interp_edge_refs[r - 1].edge;
+        }
+        cache->begin[INTERP_EDGE_CELLS] = at;
+        if (cache->tree_enabled) {
+            unsigned at8 = 0, at64 = 0;
+            for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
+                cache->start8[c] = at8; cache->start64[c] = at64;
+                const unsigned count = cache->begin[c + 1] - cache->begin[c];
+                if (count < 32) continue;
+                for (unsigned j = 0; j < count; j += 8) {
+                    InterpDepthBounds b = {1e30f, 0.0f};
+                    for (unsigned k = j; k < SDL_min(j + 8, count); ++k) {
+                        const InterpEdge* g = &interp_edges[cache->edges[cache->begin[c] + k]];
+                        if (!(g->da >= 1.0f && g->da <= 1e9f && g->db >= 1.0f && g->db <= 1e9f)) {
+                            b.lo = 0.0f; b.hi = HUGE_VALF; break;
+                        }
+                        b.lo = SDL_min(b.lo, 0.89f * SDL_min(g->da, g->db));
+                        b.hi = SDL_max(b.hi, 1.12f * SDL_max(g->da, g->db));
+                    }
+                    cache->depth8[at8++] = b;
+                }
+                for (unsigned j = cache->start8[c]; j < at8; j += 8) {
+                    InterpDepthBounds b = {1e30f, 0.0f};
+                    for (unsigned k = j; k < SDL_min(j + 8, at8); ++k) {
+                        b.lo = SDL_min(b.lo, cache->depth8[k].lo);
+                        b.hi = SDL_max(b.hi, cache->depth8[k].hi);
+                    }
+                    cache->depth64[at64++] = b;
+                }
+            }
+        }
+        cache->frame = interp_frame;
+        cache->refs = interp_edge_refs_len;
+    }
+    if (cache && cache->query_enabled && ++cache->generation == 0) {
+        memset(cache->queries, 0, sizeof(cache->queries));
+        cache->generation = 1;
+    }
     /* how far off the edge a vertex on it lies: the projection's precision
      * (PGXP, or whole pixels); a vertex farther off belongs to another
      * surface next to the edge (the faces of a thin beam) */
@@ -1874,6 +2444,7 @@ static void InterpSnapJunctions(unsigned n) {
             : INTERP_JUNCTION_PIXELS;
     for (unsigned k = 0; k < n; ++k) {
         const InterpJunctionPrim* q = &interp_junction_prims[k];
+        if ((k & 63u) == 0) InterpServiceOutput();
         for (unsigned i = 0; i < q->count; ++i) {
             const float *v0 = q->p0[i], *v1 = q->p1[i];
             const int cx = (int)SDL_floorf(v0[0] / INTERP_EDGE_CELL),
@@ -1881,42 +2452,30 @@ static void InterpSnapJunctions(unsigned n) {
             const unsigned c = InterpEdgeCell(cx, cy, q->ox, q->oy);
             if (interp_edge_stamp[c] != interp_frame)
                 continue;
-            float best = 1e9f;
-            const InterpEdge* on = NULL;
-            for (unsigned r = interp_edge_head[c]; r;
-                 r = interp_edge_refs[r - 1].next) {
-                const InterpEdge* g =
-                    &interp_edges[interp_edge_refs[r - 1].edge];
-                if (g->pair == q->pair || g->ox != q->ox || g->oy != q->oy)
-                    continue;
-                float d0, d1;
-                const float t0 = InterpAlong(v0, g->a0, g->b0, &d0),
-                            t1 = InterpAlong(v1, g->a1, g->b1, &d1);
-                /* a midpoint-only pose in this frame (nearer than the
-                 * projection plane) is no projection to test */
-                const bool both = q->posed && g->posed;
-                /* with one pose to test (geometry passing the view, often a
-                 * long edge) the direction of a long edge counts less */
-                const float l0 =
-                    SDL_sqrtf((g->b0[0] - g->a0[0]) * (g->b0[0] - g->a0[0]) +
-                              (g->b0[1] - g->a0[1]) * (g->b0[1] - g->a0[1]));
-                if (!(t0 > 0.0f && t0 < 1.0f &&
-                      d0 < reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE) &&
-                      (!both || (t1 > 0.0f && t1 < 1.0f && d1 < reach))))
-                    continue;
-                /* not one of its ends (a shared vertex is joined already) */
-                if (t0 * l0 < 0.5f || (1.0f - t0) * l0 < 0.5f)
-                    continue;
-                /* at the edge's depth there (not something in front or behind)
-                 */
-                if (q->d0[i] > 0.0f && g->da > 0.0f && g->db > 0.0f) {
-                    const float z = 1.0f / ((1.0f - t0) / g->da + t0 / g->db);
-                    if (SDL_fabsf(z - q->d0[i]) > 0.1f * SDL_max(z, q->d0[i]))
-                        continue;
+            const InterpEdge* on;
+            InterpJunctionQuery* query = NULL;
+            bool hit = false;
+            if (linear && cache->query_enabled && cache->begin[c + 1] - cache->begin[c] >= 32)
+                query = InterpFindJunctionQuery(cache, q, i, &hit);
+            if (hit) {
+                on = query->first;
+            } else {
+                const InterpEdge* other = NULL;
+                on = InterpSelectJunction(q, i, c, reach, cache, linear, query != NULL, true, &other);
+                if (query) {
+                    query->first = on;
+                    query->other = other;
                 }
-                if (d0 + (both ? d1 : d0) < best) {
-                    best = d0 + (both ? d1 : d0);
-                    on = g;
+            }
+            if (query && on && on->pair == q->pair) {
+                ++cache->query_excluded;
+                on = query->other;
+            }
+            if (cache && ((query && cache->verify_queries) || cache->verify_tree)) {
+                const InterpEdge* reference = InterpSelectJunction(q, i, c, reach, cache, linear, false, false, NULL);
+                if (reference != on) {
+                    SDL_Log("interpolation query mismatch: frame=%u pair=%u vertex=%u", interp_frame, q->pair, i);
+                    abort();
                 }
             }
             if (!on)
@@ -1928,6 +2487,7 @@ static void InterpSnapJunctions(unsigned n) {
             const float t = InterpAlong(out->pgxp_pos, on->am, on->bm, &d);
             if (!(t > 0.0f && t < 1.0f) || d > INTERP_JUNCTION_MOVE)
                 continue;
+            if (presentation_fps) interp_temporal[q->base + i].edge = (unsigned)(on - interp_edges) + 1;
             out->pgxp_pos[0] = on->am[0] + (on->bm[0] - on->am[0]) * t;
             out->pgxp_pos[1] = on->am[1] + (on->bm[1] - on->am[1]) * t;
             /* what moves with the vertex (a ghost or a new identity sharing
@@ -2056,8 +2616,8 @@ static void InterpFinishLines(unsigned n, unsigned vertices) {
                 d > INTERP_LINE_REACH * INTERP_LINE_REACH)
                 continue;
             const float x = q->from[i][0] + m[0], y = q->from[i][1] + m[1];
-            if (q->which == 0 && (SDL_fabsf(x - q->want[i][0]) > 1.5f ||
-                                  SDL_fabsf(y - q->want[i][1]) > 1.5f))
+            if (q->which == 0 && (fabsf(x - q->want[i][0]) > 1.5f ||
+                                  fabsf(y - q->want[i][1]) > 1.5f))
                 continue;
             to[i][0] = x;
             to[i][1] = y;
@@ -2162,12 +2722,60 @@ static void InterpMidpointRecord(
 
 /* Draws the kept batches into the midpoint target, each as the frame's
  * batch was drawn (through the same vertex and index buffers). */
-static bool InterpMidpointDraw(void) {
+static void InterpSampleVertex(Vertex* out, const Vertex* mid,
+                               const InterpTemporalVertex* tv, float t) {
+    *out = *mid;
+    if (mid->pgxp_pos[2] <= 0 || fabsf(mid->pgxp_pos[0]) >= 2048 ||
+        fabsf(mid->pgxp_pos[1]) >= 2048)
+        return;
+    if (tv->paired) {
+        float w = t, wm = 0.5f;
+        if (tv->depth > 0 && tv->old_depth > 0) {
+            w = t * tv->depth / ((1 - t) * tv->old_depth + t * tv->depth);
+            wm = tv->depth / (tv->old_depth + tv->depth);
+        }
+        for (unsigned a = 0; a < 2; ++a) {
+            const float at_mid = tv->previous[a] * (1 - wm) + tv->current[a] * wm;
+            out->pgxp_pos[a] = tv->previous[a] * (1 - w) + tv->current[a] * w +
+                (mid->pgxp_pos[a] - at_mid) * (4 * t * (1 - t));
+        }
+        if (tv->current[2] > 1 && tv->previous[2] > 1)
+            out->pgxp_pos[2] = tv->previous[2] * (1 - t) + tv->current[2] * t;
+        else if (tv->current[2] > 0 && tv->previous[2] > 0)
+            out->pgxp_pos[2] = 1 / ((1 - t) / tv->previous[2] + t / tv->current[2]);
+    } else {
+        const float* anchor = tv->anchor_old ? tv->previous : tv->current;
+        const float step = tv->anchor_old ? 2 * t : 2 * (1 - t);
+        for (unsigned a = 0; a < 2; ++a)
+            out->pgxp_pos[a] = anchor[a] + (mid->pgxp_pos[a] - anchor[a]) * step;
+    }
+    if (tv->edge && tv->edge <= interp_edges_len) {
+        const InterpEdge* edge = &interp_edges[tv->edge - 1];
+        float a[2], b[2];
+        float wa = t, wb = t;
+        if (edge->da > 0 && edge->da1 > 0)
+            wa = t * edge->da1 / ((1 - t) * edge->da + t * edge->da1);
+        if (edge->db > 0 && edge->db1 > 0)
+            wb = t * edge->db1 / ((1 - t) * edge->db + t * edge->db1);
+        for (unsigned axis = 0; axis < 2; ++axis) {
+            a[axis] = edge->a0[axis] * (1 - wa) + edge->a1[axis] * wa;
+            b[axis] = edge->b0[axis] * (1 - wb) + edge->b1[axis] * wb;
+        }
+        float distance;
+        float along = InterpAlong(out->pgxp_pos, a, b, &distance);
+        if (along > 0 && along < 1 && distance <= INTERP_JUNCTION_MOVE)
+            for (unsigned axis = 0; axis < 2; ++axis)
+                out->pgxp_pos[axis] = a[axis] + (b[axis] - a[axis]) * along;
+    }
+}
+
+static bool InterpMidpointDrawSample(unsigned sample) {
     if (!interpolation_enabled || !interpolated_vram ||
         interpolated_scale != internal_res)
         return true; /* no target to draw into */
     const unsigned target_index = scaled_vram_render ? 2u : 1u;
     for (unsigned k = 0; k < interp_mid_batches_len; ++k) {
+        InterpServiceOutput();
         const InterpMidBatch* b = &interp_mid_batches[k];
         if (!b->indices)
             continue;
@@ -2188,7 +2796,14 @@ static bool InterpMidpointDraw(void) {
         const Uint32 vtx_offset = vertex_at * (Uint32)sizeof(Vertex);
         const Uint32 idx_offset = MAX_VERTEX_COUNT * (Uint32)sizeof(Vertex) +
                                   index_at * (Uint32)sizeof(*interp_mid_index);
-        memcpy(map + vtx_offset, &interp_mid_store[b->vertex], vtx_size);
+        const Vertex* vertices = &interp_mid_store[b->vertex];
+        if (interp_sample_count) {
+            for (unsigned i = 0; i < b->vertices; ++i)
+                InterpSampleVertex(&interp_sample_vertices[i], vertices + i,
+                    &interp_temporal[b->vertex + i], interp_sample_alpha[sample]);
+            vertices = interp_sample_vertices;
+        }
+        memcpy(map + vtx_offset, vertices, vtx_size);
         memcpy(map + idx_offset, &interp_mid_index[b->index], idx_size);
         SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
         SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
@@ -2211,11 +2826,11 @@ static bool InterpMidpointDraw(void) {
         SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, buffers_cycle);
         SDL_EndGPUCopyPass(copy);
         const DrawTargetBatch target = {
-            interpolated_vram,
+            InterpSampleTarget(sample),
             target_index,
             internal_res,
             true,
-            &interp_mid_store[b->vertex],
+            vertices,
             &interp_mid_index[b->index],
             (int)b->indices,
             vtx_offset,
@@ -2228,6 +2843,14 @@ static bool InterpMidpointDraw(void) {
         if (!DrawTargetRuns(&target))
             return false;
     }
+    return true;
+}
+
+static bool InterpMidpointDraw(void) {
+    const unsigned count = interp_sample_count ? interp_sample_count : 1;
+    for (unsigned i = 0; i < count; ++i)
+        if (!InterpMidpointDrawSample(i))
+            return false;
     return true;
 }
 
@@ -2262,8 +2885,10 @@ static void InterpMidpointSync(unsigned reason) {
         }
     }
     InterpSnapJunctions(nj);
+    InterpFieldPack(np + nl);
     InterpFinishPending(np);
     InterpFinishLines(nl, drawn);
+    interp_field_cache_active = 0;
     if (!InterpMidpointDraw()) {
         interp_pair_ready = false;
         interp_matches = 0;
@@ -2295,6 +2920,9 @@ static void InterpMidpointSync(unsigned reason) {
         interp_line_pend = (int)interp_line_pending_len;
     }
     if (n_vertices) {
+        if (presentation_fps)
+            memmove(interp_temporal, interp_temporal + drawn,
+                    sizeof(*interp_temporal) * n_vertices);
         memmove(interp_mid_store, interp_mid_store + drawn,
                 sizeof(Vertex) * n_vertices);
         memmove(interp_mid_depth_store, interp_mid_depth_store + drawn,

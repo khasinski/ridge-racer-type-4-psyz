@@ -405,3 +405,85 @@ ZTEST(mdec, generated_streams_all_depths_and_output_guards) {
     }
 }
 #endif
+
+#if defined(__psyz) && !defined(__PSP__)
+#include <SDL3/SDL.h>
+
+/* Querying DMA status is allowed while a transfer completes or is reset.
+ * Keep the observer live across successive commands so TSan also checks
+ * publication of a new command against the preceding completion. */
+typedef struct {
+    SDL_AtomicInt stop, started;
+    unsigned queries;
+} MdecObserver;
+
+static int observe_mdec(void* data) {
+    MdecObserver* observer = data;
+    SDL_SetAtomicInt(&observer->started, 1);
+    while (!SDL_GetAtomicInt(&observer->stop)) {
+        (void)MDEC_status();
+        (void)MDEC_in_sync();
+        ++observer->queries;
+    }
+    return 0;
+}
+
+ZTEST(mdec, concurrent_status_and_transfers) {
+    DecDCTReset(0);
+    MdecObserver observer = {0};
+    SDL_Thread* thread = SDL_CreateThread(observe_mdec, "mdec-observer", &observer);
+    zassert_ptr_ne(NULL, thread);
+    while (!SDL_GetAtomicInt(&observer.started))
+        SDL_Delay(1);
+    unsigned errors = 0;
+    for (unsigned n = 0; n < 128; ++n) {
+        u32 input[] = {0x30000006, 0xfe000400, 0xfe000400, 0xfe000400,
+                       0xfe000400, 0xfe000400, 0xfe000400};
+        u32 pixels[192];
+        MDEC_reset(1);
+        MDEC_in(input, 6);
+        MDEC_out(pixels, 192);
+        errors += MDEC_out_sync() != 0;
+        for (unsigned i = 0; i < 192; ++i)
+            errors += pixels[i] != 0x80808080;
+    }
+    SDL_SetAtomicInt(&observer.stop, 1);
+    SDL_WaitThread(thread, NULL);
+    zexpect_u32_eq(0, errors);
+    zexpect_u32_ne(0, observer.queries);
+}
+#endif
+
+#if defined(__psyz) && !defined(__PSP__)
+void Psyz_DmaComplete(unsigned channel);
+static unsigned concurrent_dma_calls;
+static void count_dma_completion(void) { ++concurrent_dma_calls; }
+static int complete_dma_on_thread(void* data) {
+    SDL_AtomicInt* started = data;
+    SDL_SetAtomicInt(started, 1);
+    for (unsigned i = 0; i < 10000; ++i)
+        Psyz_DmaComplete(0);
+    return 0;
+}
+ZTEST(mdec, concurrent_dma_callbacks_are_serialized) {
+    DecDCTReset(0);
+    concurrent_dma_calls = 0;
+    DecDCTinCallback(count_dma_completion);
+    DecDCToutCallback(count_dma_completion);
+    SDL_AtomicInt started = {0};
+    SDL_Thread* thread = SDL_CreateThread(complete_dma_on_thread, "dma-complete", &started);
+    if (!thread) {
+        DecDCTinCallback(NULL);
+        DecDCToutCallback(NULL);
+    }
+    zassert_ptr_ne(NULL, thread);
+    while (!SDL_GetAtomicInt(&started))
+        SDL_Delay(1);
+    for (unsigned i = 0; i < 10000; ++i)
+        Psyz_DmaComplete(1);
+    SDL_WaitThread(thread, NULL);
+    DecDCTinCallback(NULL);
+    DecDCToutCallback(NULL);
+    zexpect_u32_eq(20000, concurrent_dma_calls);
+}
+#endif

@@ -545,6 +545,9 @@ unsigned char* Psyz_VideoAllocCapturedFrame(int* w, int* h);
  * @return NULL on failure, or a buffer to release with free(ptr)
  */
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h);
+/* Diagnostic final-output readback for PSYZ_HEADLESS=gpu, after window
+ * scaling and overlays. NULL on other backends; free the returned RGB888. */
+unsigned char* Psyz_VideoAllocHiddenDisplay(int* w, int* h);
 
 /**
  * @brief Dump the whole video memory plane as RGB888

@@ -116,12 +116,22 @@ static inline unsigned int color_8to5(unsigned int c8) {
     return (c8 * 31 + 127) / 255;
 }
 static void ConvertRgb5551ToRgba8888(const u16* src, u8* dst, size_t pixels) {
+    /* Graphics calls are serialized on the render thread. Keep exact DAC
+     * rounding and alpha for all 16-bit values, without repeating three
+     * channel conversions for every pixel of each native VRAM upload. */
+    static u8 colors[65536][4];
+    static bool ready;
+    if (!ready) {
+        for (unsigned v = 0; v < 65536; v++) {
+            colors[v][0] = color_5to8(v & 0x1F);
+            colors[v][1] = color_5to8((v >> 5) & 0x1F);
+            colors[v][2] = color_5to8((v >> 10) & 0x1F);
+            colors[v][3] = (v & 0x8000) ? 0xFF : 0x00;
+        }
+        ready = true;
+    }
     for (size_t i = 0; i < pixels; i++) {
-        u16 v = src[i];
-        dst[0] = color_5to8(v & 0x1F);
-        dst[1] = color_5to8((v >> 5) & 0x1F);
-        dst[2] = color_5to8((v >> 10) & 0x1F);
-        dst[3] = (v & 0x8000) ? 0xFF : 0x00;
+        memcpy(dst, colors[src[i]], 4);
         dst += 4;
     }
 }
@@ -248,6 +258,9 @@ static Uint32 limitless_lines;
 
 // frame pacing state
 static double target_frame_rate = VSYNC_NTSC;
+/* Output cadence is independent of the emulated video/ audio clock. */
+static unsigned presentation_fps;
+static void PlatformBackend_PresentationPoll(void);
 static double target_frame_time_us = 1000000.0 / VSYNC_NTSC;
 static Uint64 perf_frequency = 0;
 static Uint64 last_frame_time = 0;
@@ -340,6 +353,18 @@ static SDL_DisplayID WindowDisplay(void) {
 
 static void ConfigureVSync(double target_fps) {
     present_sync = false;
+    if (presentation_fps) {
+        /* A swapchain wait must not become the game's VBlank clock. */
+        use_driver_vsync = false;
+        const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(WindowDisplay());
+        if ((vsync_mode == PSYZ_VSYNC_AUTO || vsync_mode == PSYZ_VSYNC_ON) &&
+            mode && mode->refresh_rate >= presentation_fps * 0.99f)
+            present_sync = PlatformBackend_SetPresentSync(true);
+        /* At a lower refresh, prefer nonblocking mailbox sync if available:
+         * waiting at each output deadline would stall the original game. */
+        if (!present_sync) PlatformBackend_SetDriverVsync(false);
+        return;
+    }
     if (vsync_mode == PSYZ_VSYNC_ON) {
         use_driver_vsync = PlatformBackend_SetDriverVsync(true);
         INFOF("vsync forced ON (driver VSync)");
@@ -530,6 +555,17 @@ static void WaitForNextFrame(void) {
         const Uint64 now_ns = SDL_GetTicksNS();
         const Uint64 blank_ns =
             (Uint64)((floor((double)now_ns / field_ns) + 1.0) * field_ns);
+        if (presentation_fps) {
+            while (SDL_GetTicksNS() < blank_ns) {
+                PlatformBackend_PresentationPoll();
+                const Uint64 now = SDL_GetTicksNS();
+                if (blank_ns > now + 1000000)
+                    SDL_DelayNS(SDL_min(blank_ns - now - 500000, 1000000));
+            }
+            wall_blank_us = (Uint32)(blank_ns / 1000);
+            wall_blank_valid = true;
+            goto frame_wait_finished;
+        }
         /* Sleep to a margin before the blank and spin the rest. The margin
          * follows the sleeps' recent overshoot (the system's timer slack,
          * often over 1 ms on macOS), so the wait ends at the blank. */
@@ -550,6 +586,8 @@ static void WaitForNextFrame(void) {
     }
 #endif
 
+frame_wait_finished:
+    ;
     Uint64 frame_end_time = SDL_GetPerformanceCounter();
     gpu_stats.last_frame_time_us =
         GetElapsedMicroseconds(last_frame_time, frame_end_time);
@@ -771,6 +809,8 @@ int Psyz_VideoVSync(int mode) {
     unsigned short ret;
     unsigned blanks = 1;
     Sdl3Common_ApplyPendingTimingReset();
+    if (presentation_fps && mode >= 0)
+        PlatformBackend_PresentationPoll();
     if (mode < 0) {
         if (host_clock_pause_depth)
             return (int)host_clock_pause_count;
@@ -1284,9 +1324,9 @@ static const SDL_DisplayMode* FieldRateDisplayMode(void) {
     static SDL_DisplayMode chosen;
     const SDL_DisplayID display = WindowDisplay();
     const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+    const double display_rate = presentation_fps ? presentation_fps : target_frame_rate;
     if (!desktop ||
-        SDL_fabs(desktop->refresh_rate - target_frame_rate) <
-            target_frame_rate * 0.01) {
+        SDL_fabs(desktop->refresh_rate - display_rate) < display_rate * 0.01) {
         return NULL;
     }
     int count = 0;
@@ -1294,12 +1334,12 @@ static const SDL_DisplayMode* FieldRateDisplayMode(void) {
     const SDL_DisplayMode* best = NULL;
     for (int i = 0; modes && i < count; ++i) {
         const SDL_DisplayMode* m = modes[i];
-        const double off = SDL_fabs(m->refresh_rate - target_frame_rate);
+        const double off = SDL_fabs(m->refresh_rate - display_rate);
         if (m->w != desktop->w || m->h != desktop->h ||
             m->pixel_density != desktop->pixel_density ||
-            off >= target_frame_rate * 0.01)
+            off >= display_rate * 0.01)
             continue;
-        if (!best || off < SDL_fabs(best->refresh_rate - target_frame_rate))
+        if (!best || off < SDL_fabs(best->refresh_rate - display_rate))
             best = m;
     }
     if (best)
@@ -1383,9 +1423,9 @@ int Psyz_VideoFullscreenFieldRateAvailable(void) {
     if (!sdl3_window)
         return 0;
     const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(WindowDisplay());
+    const double display_rate = presentation_fps ? presentation_fps : target_frame_rate;
     return FieldRateDisplayMode() != NULL ||
-           (desktop && SDL_fabs(desktop->refresh_rate - target_frame_rate) <
-                           target_frame_rate * 0.01);
+           (desktop && SDL_fabs(desktop->refresh_rate - display_rate) < display_rate * 0.01);
 #else
     return 0;
 #endif

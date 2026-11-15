@@ -129,6 +129,19 @@ static struct {
 #define ZSF4 GTE(zsf4)
 #define FLAG GTE(flag)
 
+static int extended_projection;
+static int projected_depth, extended_sz[4];
+
+int Psyz_GteSetExtendedProjection(int enabled) {
+    int previous = extended_projection;
+    if (enabled && !previous) {
+        extended_sz[0] = SZ0; extended_sz[1] = SZ1;
+        extended_sz[2] = SZ2; extended_sz[3] = SZ3;
+    }
+    extended_projection = enabled != 0;
+    return previous;
+}
+
 // Packs a screen XY register pair the way the GTE data registers hold it.
 // Both halves must be masked: SX/SY are signed, so promoting a negative SX to
 // int would sign-extend over the whole upper half and clobber SY.
@@ -1197,6 +1210,7 @@ static const short rcossin_tbl[][2] = {
     {0xFFE7, 0x1000}, {0xFFED, 0x1000}, {0xFFF3, 0x1000}, {0xFFFA, 0x1000}};
 
 void InitGeom() {
+    extended_projection = 0;
     ZSF3 = 0x155;
     ZSF4 = 0x100;
     H = 1000;
@@ -2027,9 +2041,9 @@ static inline PgxpSxyEntry PgxpRecordVertex(
         fy *= 4096.0;
     }
     double min_ir = lm ? 0.0 : -32768.0;
-    double ir1_f = CLAMP(fx, min_ir, 32767.0);
-    double ir2_f = CLAMP(fy, min_ir, 32767.0);
-    double sz_f = CLAMP(fz, 0.0, 65535.0);
+    double ir1_f = extended_projection && sf ? fx : CLAMP(fx, min_ir, 32767.0);
+    double ir2_f = extended_projection && sf ? fy : CLAMP(fy, min_ir, 32767.0);
+    double sz_f = extended_projection ? (fz > 0.0 ? fz : 0.0) : CLAMP(fz, 0.0, 65535.0);
     double h_f = (double)(unsigned short)H;
     double scale_f = (h_f >= sz_f * 2.0 || sz_f <= 0.0)
                          ? ((double)0x1FFFF / 65536.0)
@@ -2301,22 +2315,37 @@ void Psyz_GteCopyQueuedPgxpSxy(
         (mac1) = (sf) ? rv_h1 : rv_l1;                                         \
         (mac2) = (sf) ? rv_h2 : rv_l2;                                         \
         (mac3) = (sf) ? rv_h3 : rv_l3;                                         \
-        SAT_FLAG(ir1, mac1, (lm) ? 0 : -0x8000, 0x7FFF, FLAG_IR1_SAT, f);      \
-        SAT_FLAG(ir2, mac2, (lm) ? 0 : -0x8000, 0x7FFF, FLAG_IR2_SAT, f);      \
+        if (extended_projection && (sf)) {                                   \
+            (ir1) = CLAMP(mac1, (lm) ? 0 : -0x8000, 0x7FFF);                  \
+            (ir2) = CLAMP(mac2, (lm) ? 0 : -0x8000, 0x7FFF);                  \
+        } else {                                                              \
+            SAT_FLAG(ir1, mac1, (lm) ? 0 : -0x8000, 0x7FFF, FLAG_IR1_SAT, f);  \
+            SAT_FLAG(ir2, mac2, (lm) ? 0 : -0x8000, 0x7FFF, FLAG_IR2_SAT, f);  \
+        }                                                                     \
         (ir3) = CLAMP(mac3, (lm) ? 0 : -0x8000, 0x7FFF);                       \
         if (rv_h3 < -0x8000 || rv_h3 > 0x7FFF)                                 \
             (f) |= FLAG_IR3_SAT;                                               \
-        SAT_FLAG(sz, rv_h3, 0, 0xFFFF, FLAG_SZ3_OTZ_SAT, f);                   \
+        if (extended_projection && rv_h3 > 0xFFFF) (sz) = 0xFFFF;            \
+        else SAT_FLAG(sz, rv_h3, 0, 0xFFFF, FLAG_SZ3_OTZ_SAT, f);              \
+        projected_depth = rv_h3 > 0 ? rv_h3 : 0;                              \
         if (H >= (sz) * 2) {                                                   \
             (f) |= FLAG_DIV_OVF;                                               \
             (div) = 0x1FFFF;                                                   \
         } else {                                                               \
             GTE_DIVIDE(div, H, sz);                                            \
         }                                                                      \
-        (sx) = OFX + MUL_DIV_HI(div, ir1);                                     \
+        if (extended_projection && (sf) && rv_h3 > 0 && H < rv_h3 * (int64_t)2 && \
+            (rv_h3 > 0xFFFF || rv_h1 < -0x8000 || rv_h1 > 0x7FFF ||          \
+             rv_h2 < -0x8000 || rv_h2 > 0x7FFF)) {                            \
+            (div) = (int)(((int64_t)H << 16) / rv_h3);                         \
+            (sx) = OFX + (int)(((int64_t)(div) * rv_h1) >> 16);                \
+            (sy) = OFY + (int)(((int64_t)(div) * rv_h2) >> 16);                \
+        } else {                                                              \
+            (sx) = OFX + MUL_DIV_HI(div, ir1);                                 \
+            (sy) = OFY + MUL_DIV_HI(div, ir2);                                 \
+        }                                                                     \
         MAC0_OVF(sx, f);                                                       \
         SAT_FLAG(sx, sx, -0x400, 0x3FF, FLAG_SX2_SAT, f);                      \
-        (sy) = OFY + MUL_DIV_HI(div, ir2);                                     \
         MAC0_OVF(sy, f);                                                       \
         SAT_FLAG(sy, sy, -0x400, 0x3FF, FLAG_SY2_SAT, f);                      \
     } while (0)
@@ -2344,6 +2373,10 @@ void Psyz_GteCopyQueuedPgxpSxy(
         SZ1 = SZ2;                                                             \
         SZ2 = SZ3;                                                             \
         SZ3 = (unsigned short)rt_sz;                                           \
+        if (extended_projection) {                                           \
+            extended_sz[0] = extended_sz[1]; extended_sz[1] = extended_sz[2];  \
+            extended_sz[2] = extended_sz[3]; extended_sz[3] = projected_depth; \
+        }                                                                     \
         SX0 = SX1;                                                             \
         SY0 = SY1;                                                             \
         SX1 = SX2;                                                             \
@@ -2371,10 +2404,12 @@ void Psyz_GteCopyQueuedPgxpSxy(
         int rt_div, rt_mac1, rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3;         \
         int rt_sx, rt_sy, rt_sz;                                               \
         SZ0 = SZ3;                                                             \
+        if (extended_projection) extended_sz[0] = extended_sz[3];             \
         RTP_VERTEX(sf, lm, V0.vx, V0.vy, V0.vz, FLAG, rt_div, rt_mac1,         \
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
         SZ1 = (unsigned short)rt_sz;                                           \
+        if (extended_projection) extended_sz[1] = projected_depth;            \
         SX0 = (short)rt_sx;                                                    \
         SY0 = (short)rt_sy;                                                    \
         (sxy0) = SXY(rt_sx, rt_sy);                                            \
@@ -2386,6 +2421,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
         SZ2 = (unsigned short)rt_sz;                                           \
+        if (extended_projection) extended_sz[2] = projected_depth;            \
         SX1 = (short)rt_sx;                                                    \
         SY1 = (short)rt_sy;                                                    \
         (sxy1) = SXY(rt_sx, rt_sy);                                            \
@@ -2397,6 +2433,7 @@ void Psyz_GteCopyQueuedPgxpSxy(
                    rt_mac2, rt_mac3, rt_ir1, rt_ir2, rt_ir3, rt_sx, rt_sy,     \
                    rt_sz);                                                     \
         SZ3 = (unsigned short)rt_sz;                                           \
+        if (extended_projection) extended_sz[3] = projected_depth;            \
         SX2 = (short)rt_sx;                                                    \
         SY2 = (short)rt_sy;                                                    \
         SXP = (short)rt_sx;                                                    \
@@ -2904,7 +2941,22 @@ static int PgxpFifoNclip(int int_area) {
     } while (0)
 
 // Average of three Z values
+static void AverageExtendedDepth(int count) {
+    int64_t sum = (int64_t)extended_sz[1] + extended_sz[2] + extended_sz[3];
+    if (count == 4) sum += extended_sz[0];
+    int64_t mac = sum * (count == 3 ? ZSF3 : ZSF4);
+    int64_t otz = mac >> 12;
+    FLAG = 0;
+    if (mac > INT32_MAX) FLAG |= FLAG_MAC0_OVF_POS;
+    if (mac < INT32_MIN) FLAG |= FLAG_MAC0_OVF_NEG;
+    if (otz < 0 || otz > 0xFFFF) FLAG |= FLAG_SZ3_OTZ_SAT;
+    MAC0 = (int32_t)(uint32_t)mac;
+    OTZ = (unsigned short)CLAMP(otz, 0, 0xFFFF);
+    FLAG_UPDATE_ERROR();
+}
+
 static void AVSZ3() {
+    if (extended_projection) { AverageExtendedDepth(3); return; }
     FLAG = 0;
     MAC0 = ZSF3 * (SZ1 + SZ2 + SZ3);
     int otz = MAC0 >> 12;
@@ -2917,6 +2969,7 @@ static void AVSZ3() {
 
 // Average of four Z values
 static void AVSZ4() {
+    if (extended_projection) { AverageExtendedDepth(4); return; }
     FLAG = 0;
     MAC0 = ZSF4 * (SZ0 + SZ1 + SZ2 + SZ3);
     int otz = MAC0 >> 12;
@@ -2931,6 +2984,9 @@ long AverageZ3(long sz0, long sz1, long sz2) {
     SZ1 = sz0;
     SZ2 = sz1;
     SZ3 = sz2;
+    if (extended_projection) {
+        extended_sz[1] = SZ1; extended_sz[2] = SZ2; extended_sz[3] = SZ3;
+    }
     AVSZ3();
     return MAC0 >> 12;
 }
@@ -2940,6 +2996,10 @@ long AverageZ4(long sz0, long sz1, long sz2, long sz3) {
     SZ1 = sz1;
     SZ2 = sz2;
     SZ3 = sz3;
+    if (extended_projection) {
+        extended_sz[0] = SZ0; extended_sz[1] = SZ1;
+        extended_sz[2] = SZ2; extended_sz[3] = SZ3;
+    }
     AVSZ4();
     return MAC0 >> 12;
 }
@@ -3636,15 +3696,19 @@ void Psyz_GteDataWrite(unsigned idx, unsigned int v) {
         break;
     case 16:
         SZ0 = (u16)(v & 0xFFFF);
+        extended_sz[0] = SZ0;
         break;
     case 17:
         SZ1 = (u16)(v & 0xFFFF);
+        extended_sz[1] = SZ1;
         break;
     case 18:
         SZ2 = (u16)(v & 0xFFFF);
+        extended_sz[2] = SZ2;
         break;
     case 19:
         SZ3 = (u16)(v & 0xFFFF);
+        extended_sz[3] = SZ3;
         break;
     case 20:
         RGB0 = v;

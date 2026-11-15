@@ -16,6 +16,7 @@ static bool headless_renderer;
  * (only at 1x without GPU-only enhancements). */
 static bool native_rasterizer_requested, native_rasterizer;
 static bool hidden_gpu_renderer;
+static SDL_GPUTexture* hidden_present_target;
 static bool UseSoftwareBackend(void);
 #define PSYZ_SOFTWARE_ROUTING
 static const void *interpolation_packet_current;
@@ -231,7 +232,9 @@ static SDL_GPUTexture* antialias_display;
 static Uint32 antialias_width, antialias_height;
 static SDL_GPUTexture* prescale_display;
 static Uint32 prescale_width, prescale_height;
+static struct { SDL_GPUTexture* texture; Uint32 w, h; } display_reduce[14];
 static unsigned set_internal_res = 1;
+static unsigned output_internal_res = 1;
 static bool geometry_correction = false;
 static bool dynamic_lighting = false;
 static bool effect_geometry_correction = false;
@@ -383,11 +386,12 @@ static void RecordPresentedCommit(void) {
     Uint64 elapsed = now - present_window_start;
     if (elapsed >= 1000) {
         actual_present_fps = 1000.0f * present_window_frames / (float)elapsed;
-        INFOF("[Presentation FPS] actual=%.1f midpoint=%.1f requested=%d "
-              "effective=%d logic=original elapsed_ms=%llu",
+        INFOF("[Presentation FPS] actual=%.1f generated=%.1f target=%u requested=%d "
+              "effective=%d output=%s logic=original elapsed_ms=%llu",
               actual_present_fps,
               1000.0f * present_window_mid / (float)elapsed,
-              interpolation_requested, interpolation_enabled,
+              presentation_fps, interpolation_requested, interpolation_enabled,
+              hidden_gpu_renderer ? "offscreen" : "display",
               (unsigned long long)elapsed);
         present_window_start = now;
         present_window_frames = present_window_mid = 0;
@@ -1467,7 +1471,7 @@ static bool InitFallbackPresenter(void) {
     SoftwareRasterizer_Reset();
     /* the enhancements asked for before the renderer started are off: the
      * game reads some of them back (widescreen, interpolation) */
-    set_internal_res = internal_res = 1;
+    output_internal_res = set_internal_res = internal_res = 1;
     set_antialiasing = antialiasing = false;
     set_model_filtering = model_filtering = false;
     set_sprite_filtering = sprite_filtering = false;
@@ -1629,7 +1633,10 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
     }
     SDL_GPUPresentMode mode = SDL_GPU_PRESENTMODE_VSYNC;
     if (!enable) {
-        if (SDL_WindowSupportsGPUPresentMode(
+        if (presentation_fps && vsync_mode != PSYZ_VSYNC_OFF &&
+            SDL_WindowSupportsGPUPresentMode(device, sdl3_window, SDL_GPU_PRESENTMODE_MAILBOX)) {
+            mode = SDL_GPU_PRESENTMODE_MAILBOX;
+        } else if (SDL_WindowSupportsGPUPresentMode(
                 device, sdl3_window, SDL_GPU_PRESENTMODE_IMMEDIATE)) {
             mode = SDL_GPU_PRESENTMODE_IMMEDIATE;
         } else if (SDL_WindowSupportsGPUPresentMode(
@@ -1719,8 +1726,11 @@ static void SyncNativeVramToScaled(int x, int y, int w, int h) {
     if (!cmd) {
         return;
     }
-    SDL_GPUTexture *targets[]={scaled_vram_render,interpolated_scale==internal_res?interpolated_vram:NULL};
-    for(unsigned i=0;i<2;++i){if(!targets[i])continue;
+    SDL_GPUTexture *targets[INTERP_SAMPLES + 1] = {scaled_vram_render,
+        interpolated_scale == internal_res ? interpolated_vram : NULL};
+    for (unsigned i = 1; i < interp_sample_count; ++i)
+        targets[i + 1] = InterpSampleTarget(i);
+    for(unsigned i=0;i<INTERP_SAMPLES + 1;++i){if(!targets[i])continue;
     const SDL_GPUBlitInfo blit = {
         .source = {.texture = vram_render,
                    .x = (Uint32)x,
@@ -1748,6 +1758,7 @@ static void ReleaseTransientDisplayTextures(void) {
         SDL_ReleaseGPUTexture(device,interpolated_vram);interpolated_vram=NULL;
     }
     interpolated_scale=0;
+    InterpSamplesRelease();
     Psyz_GpuResetInterpolation();
     if (presentation_display) {
         SDL_ReleaseGPUTexture(device, presentation_display);
@@ -1763,6 +1774,11 @@ static void ReleaseTransientDisplayTextures(void) {
         SDL_ReleaseGPUTexture(device, prescale_display);
         prescale_display = NULL;
         prescale_width = prescale_height = 0;
+    }
+    for (unsigned i = 0; i < 14; ++i) {
+        if (display_reduce[i].texture) SDL_ReleaseGPUTexture(device, display_reduce[i].texture);
+        display_reduce[i].texture = NULL;
+        display_reduce[i].w = display_reduce[i].h = 0;
     }
 }
 
@@ -1819,12 +1835,15 @@ static unsigned AdjustInternalRes(unsigned scale) {
 }
 
 static void ApplyPendingInternalRes(void) {
-    unsigned n =
-        AdjustInternalRes(set_internal_res * (set_antialiasing ? 2u : 1u));
+    const char* cheap = SDL_getenv("PSYZ_AA_CHEAP");
+    unsigned requested = set_internal_res;
+    if (set_antialiasing)
+        requested = cheap && *cheap == '1' && requested > 2 ? requested + 2 : requested * 2;
+    unsigned n = AdjustInternalRes(requested);
     bool want_scaled = n > 1 || set_geometry_correction ||
                        set_effect_geometry_correction || set_model_filtering || set_sprite_filtering;
     bool have_scaled = scaled_vram_render != NULL;
-    if (n == internal_res && set_geometry_correction == geometry_correction &&
+    if (n == internal_res && set_internal_res == output_internal_res && set_geometry_correction == geometry_correction &&
         set_effect_geometry_correction == effect_geometry_correction &&
         set_antialiasing == antialiasing &&
         set_model_filtering == model_filtering && set_sprite_filtering == sprite_filtering && want_scaled == have_scaled) {
@@ -1844,7 +1863,7 @@ static void ApplyPendingInternalRes(void) {
             unsigned requested_n = n;
             n = internal_res;
             set_antialiasing = antialiasing;
-            set_internal_res = n / (antialiasing ? 2u : 1u);
+            set_internal_res = output_internal_res;
             if (!have_scaled && requested_n > 1 &&
                 (set_geometry_correction || set_effect_geometry_correction ||
                  set_model_filtering || set_sprite_filtering) &&
@@ -1891,6 +1910,7 @@ static void ApplyPendingInternalRes(void) {
         antialias_width = antialias_height = 0;
     }
     internal_res = n;
+    output_internal_res = SDL_min(set_internal_res, n);
     geometry_correction = set_geometry_correction;
     if (geometry_correction || set_effect_geometry_correction) {
         pgxp_trace_budget=4;
@@ -2114,7 +2134,8 @@ static SDL_GPUBlitRegion PrepareDisplayTexture(
     src.texture = presentation_display;
     src.x = src.y = 0;
     if (antialiasing) {
-        Uint32 width = src.w / 2, height = src.h / 2;
+        Uint32 width = (Uint32)((Uint64)src.w * output_internal_res / internal_res),
+               height = (Uint32)((Uint64)src.h * output_internal_res / internal_res);
         if (!antialias_display || antialias_width != width ||
             antialias_height != height) {
             if (antialias_display)
@@ -2225,6 +2246,34 @@ static SDL_GPUBlitRegion PrescaleWidescreen(
 /* SDL's D3D12 ResizeBuffers failure path frees the old views before it knows
  * whether resizing succeeded. Recreate the claimed swapchain at a frame
  * boundary instead, while its old views are still valid. Keep VRAM intact. */
+/* A single bilinear sample cannot resolve an 8x image into a smaller
+ * window: it skips source pixels, making distant texels/edges flash as
+ * they move. Reduce by at most 2 in each axis before the final resolve. */
+static SDL_GPUBlitRegion ReduceDisplayTexture(SDL_GPUCommandBuffer* cmd,
+    SDL_GPUBlitRegion src, Uint32 width, Uint32 height) {
+    if (!antialiasing || !width || !height) return src;
+    for (unsigned level = 0; level < 14 && (src.w > width * 2 || src.h > height * 2); ++level) {
+        const Uint32 w = src.w > width * 2 ? (src.w + 1) / 2 : src.w;
+        const Uint32 h = src.h > height * 2 ? (src.h + 1) / 2 : src.h;
+        if (!display_reduce[level].texture || display_reduce[level].w != w || display_reduce[level].h != h) {
+            if (display_reduce[level].texture) SDL_ReleaseGPUTexture(device, display_reduce[level].texture);
+            const SDL_GPUTextureCreateInfo info = {
+                .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1};
+            display_reduce[level].texture = SDL_CreateGPUTexture(device, &info);
+            display_reduce[level].w = w; display_reduce[level].h = h;
+        }
+        if (!display_reduce[level].texture) break;
+        const SDL_GPUBlitInfo blit = {
+            .source = src, .destination = {.texture = display_reduce[level].texture, .w = w, .h = h},
+            .load_op = SDL_GPU_LOADOP_DONT_CARE, .filter = SDL_GPU_FILTER_LINEAR};
+        SDL_BlitGPUTexture(cmd, &blit);
+        src = (SDL_GPUBlitRegion){.texture = display_reduce[level].texture, .w = w, .h = h};
+    }
+    return src;
+}
+
 static bool RefreshWindowSwapchain(void) {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(sdl3_window, &w, &h);
@@ -2304,6 +2353,38 @@ static void FallbackPresent(void) {
     present_commit_mid = false;
 }
 
+static void PlatformBackend_PresentationPoll(void) {
+    if (!presentation_fps || !interpolation_enabled || host_clock_pause_depth ||
+        game_speed != 1 || vsync_mode == PSYZ_VSYNC_LIMITLESS || !device ||
+        SDL_GetAtomicInt(&app_in_background))
+        return;
+    const double now = (double)SDL_GetTicksNS(), period = 1e9 / presentation_fps;
+    if (!interp_output_tick) interp_output_tick = (floor(now / period) + 1) * period;
+    if (now < interp_output_tick) return;
+    /* Skip missed deadlines, never burst presents to inflate the counter. */
+    interp_output_tick = (floor(now / period) + 1) * period;
+    double newest = 0;
+    interp_output_selected = -1;
+    for (unsigned i = 0; i < INTERP_OUTPUTS; ++i)
+        if (interp_outputs[i].due > newest && interp_outputs[i].due <= now) {
+            newest = interp_outputs[i].due;
+            interp_output_selected = (int)i;
+        }
+    if (interp_render_busy && interp_output_selected < 0) return;
+    interp_scheduled_present = true;
+    PlatformBackend_Present();
+    interp_scheduled_present = false;
+}
+
+static void InterpServiceOutput(void) {
+    if (!presentation_fps) return;
+    interp_render_busy = true;
+    PlatformBackend_PresentationPoll();
+    interp_render_busy = false;
+}
+
+void Psyz_GpuPollPresentation(void) { InterpServiceOutput(); }
+
 static void PlatformBackend_Present(void) {
     frame_presented=false;present_commit_pending=false;
     if(host_clock_pause_depth||SDL_GetAtomicInt(&app_in_background)){present_window_start=0;present_window_frames=present_window_mid=0;actual_present_fps=0;Psyz_GpuResetInterpolation();}
@@ -2324,21 +2405,31 @@ static void PlatformBackend_Present(void) {
         return;
     }
 
-    DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    if (presentation_fps && interpolation_enabled && !interp_scheduled_present &&
+        !ws_capture_active && game_speed == 1 && vsync_mode != PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth) {
+        Draw_FlushBuffer();
+        SubmitCmd();
+        finish_time = SDL_GetPerformanceCounter();
+        return;
+    }
+
+    const InterpOutput* output = interp_scheduled_present && interp_output_selected >= 0
+        ? &interp_outputs[interp_output_selected] : NULL;
+    if (!output) DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
     /* the midpoint may be shown: it is complete */
-    if (interp_pair_ready)
+    if (interp_pair_ready && !output)
         InterpMidpointSync(INTERP_SYNC_PRESENT);
-    ApplyPendingInternalRes();
+    if (!output) ApplyPendingInternalRes();
     if (native_rasterizer)
         PresentNativeVram();
-    bool can_present = swapchain_ok && !present_skip;
+    bool can_present = (swapchain_ok || hidden_gpu_renderer) && !present_skip;
     if (!ws_capture_active && !hidden_gpu_renderer &&
         !SDL_strcmp(SDL_GetGPUDeviceDriver(device), "direct3d12") &&
         !RefreshWindowSwapchain()) {
         can_present = false;
     }
     /* a capture shows what the last present showed */
-    if(!ws_capture_active){
+    if(!ws_capture_active && !interp_scheduled_present){
         const bool mid_ready=interp_pair_ready&&interpolation_enabled&&interpolated_vram&&
             interpolated_scale==internal_res&&interp_next_y>=0&&interp_next_y<=VRAM_H-display_size.y&&
             !display_rgb24&&
@@ -2354,6 +2445,12 @@ static void PlatformBackend_Present(void) {
         if(interp_blank_mid){interp_blank_mid=false;interp_pair_ready=false;}
         if(interp_present_mid)++interpolated_present_count;
         present_midpoint=interp_present_mid;
+    }
+    if (interp_scheduled_present) {
+        interp_present_mid = output && output->generated && output->due != interp_last_output_due;
+        present_midpoint = interp_present_mid;
+        if (interp_present_mid) ++interpolated_present_count;
+        if (output) interp_last_output_due = output->due;
     }
 
     if(display_rgb24||
@@ -2375,6 +2472,16 @@ static void PlatformBackend_Present(void) {
             swapchain = ws_capture;
             sc_w = ws_capture_width;
             sc_h = ws_capture_height;
+        } else if (hidden_gpu_renderer) {
+            sc_w = 1280; sc_h = 720;
+            if (!hidden_present_target) {
+                const SDL_GPUTextureCreateInfo info = {
+                    .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                    .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+                    .width = sc_w, .height = sc_h, .layer_count_or_depth = 1, .num_levels = 1};
+                hidden_present_target = SDL_CreateGPUTexture(device, &info);
+            }
+            swapchain = hidden_present_target;
         } else if (!SDL_WaitAndAcquireGPUSwapchainTexture(
                        cmd, sdl3_window, &swapchain, &sc_w, &sc_h)) {
             WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
@@ -2406,6 +2513,11 @@ static void PlatformBackend_Present(void) {
                                               .h = title_present_active ? title_texture_height : display_size.y};
                 float game_aspect = PresentGameAspect(
                     interp_present_mid ? interp_next_y : display_area.y, rgb24 != NULL);
+                if (output && !rgb24) {
+                    src = (SDL_GPUBlitRegion){.texture = output->texture,
+                        .w = output->width, .h = output->height};
+                    game_aspect = output->aspect;
+                }
                 if (rgb24 && title_present_active && widescreen) game_aspect=16.0f/9.0f;
                 if (debug_show_vram) {
                     src.x = 0;
@@ -2415,7 +2527,7 @@ static void PlatformBackend_Present(void) {
                     game_aspect = (float)VRAM_W / (float)VRAM_H;
                 }
 
-                if (!rgb24 && !debug_show_vram)
+                if (!rgb24 && !debug_show_vram && !output)
                     src = PrepareDisplayTexture(cmd, src);
 
                 WndSize win = {(int)sc_w, (int)sc_h};
@@ -2428,7 +2540,7 @@ static void PlatformBackend_Present(void) {
                  * the screen's pixel aspect) is shown around that point. Past
                  * the picture the swapchain clear leaves black; a room
                  * narrower than the window shows 4:3, with even bars. */
-                if (widescreen && !rgb24 && !debug_show_vram &&
+                if (widescreen && !rgb24 && !debug_show_vram && !output &&
                     !WidescreenNativeBuffer(interp_present_mid ? interp_next_y : display_area.y) &&
                     game_aspect > 0.0f) {
                     const float w = (float)display_size.x, centre = w * 0.5f;
@@ -2510,6 +2622,7 @@ static void PlatformBackend_Present(void) {
                 }
 
                 TraceAspectViewport(dst, win, rgb24 != NULL, ws_view);
+                src = ReduceDisplayTexture(cmd, src, (Uint32)dst.w, (Uint32)dst.h);
 
                 const SDL_GPUBlitInfo blit = {
                     .source = src,
@@ -2529,15 +2642,15 @@ static void PlatformBackend_Present(void) {
                     // the widescreen stretch is 1 / squeeze per game pixel: nearest
                     // would make every third column wider, so the view is
                     // prescaled and only this last step is linear
-                    .filter = ws_view ? SDL_GPU_FILTER_LINEAR
+                    .filter = (ws_view || antialiasing) ? SDL_GPU_FILTER_LINEAR
                                       : SDL_GPU_FILTER_NEAREST,
                 };
                 SDL_BlitGPUTexture(cmd, &blit);
             }
-            if (!ws_capture_active && overlay_frame_cb) {
+            if (!ws_capture_active && !interp_render_busy && overlay_frame_cb) {
                 overlay_frame_cb();
             }
-            if (!ws_capture_active && overlay_render_cb) {
+            if (!ws_capture_active && !interp_render_busy && overlay_render_cb) {
                 SDL_GPUColorTargetInfo target = {
                     .texture = swapchain,
                     .load_op = SDL_GPU_LOADOP_LOAD,
@@ -2574,13 +2687,37 @@ static void PlatformBackend_Present(void) {
         if(!pgxp_trace_budget)Psyz_PgxpTraceReasonsEnable(0);
         pgxp_valid_polygons=pgxp_fallback_polygons=pgxp_nonfinite_polygons=0;
     }
-    SubmitFrame();
+    if (ws_capture_active) SubmitCmd();
+    else SubmitFrame();
 }
 
 /* Releases the device and everything made on it (idle already). */
 static void ReleaseGpuDevice(void) {
     if (!device)
         return;
+    if (hidden_present_target) SDL_ReleaseGPUTexture(device, hidden_present_target);
+    hidden_present_target = NULL;
+    if (interp_edge_cache && interp_edge_cache->log_queries)
+        INFOF("interpolation queries=%llu hits=%llu",
+              interp_edge_cache->query_count, interp_edge_cache->query_hits);
+    SDL_free(interp_map_scratch);
+    interp_map_scratch = NULL;
+    for (unsigned b = 0; b < 2; ++b) {
+        SDL_free(interp_store[b]);
+        interp_store[b] = NULL;
+        interp_store_len[b] = interp_store_capacity[b] = interp_order_len[b] = 0;
+    }
+    SDL_free(interp_edge_cache);
+    interp_edge_cache = NULL;
+    interp_edge_measures_tried = false;
+    interp_edges_frame = 0;
+    if (interp_field_cache && interp_field_cache_verify)
+        INFOF("interpolation field verified queries=%llu",
+              interp_field_cache[0].verified_queries + interp_field_cache[1].verified_queries);
+    SDL_free(interp_field_cache);
+    interp_field_cache = NULL;
+    interp_field_cache_tried = interp_field_cache_verify = false;
+    interp_field_cache_active = 0;
     ReleaseFrameFences(); /* global idle already established */
     ReleaseRingFences();
     ReleaseWaitedFences();
@@ -2873,6 +3010,50 @@ unsigned char* Psyz_VideoAllocScaledVramDump(int* w, int* h) {
 }
 
 unsigned char* Psyz_VideoAllocRenderedFrame(int* w, int* h);
+unsigned char* Psyz_VideoAllocHiddenDisplay(int* w, int* h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!w || !h || !hidden_gpu_renderer || !hidden_present_target) return NULL;
+    const unsigned width = 1280, height = 720;
+    const size_t count = (size_t)width * height;
+    unsigned char* pixels = malloc(count * 3);
+    const SDL_GPUTransferBufferCreateInfo info = {
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = (Uint32)count * 4};
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(device, &info);
+    SDL_GPUCommandBuffer* cmd = pixels && transfer ? AcquireCmd() : NULL;
+    SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+    if (copy) {
+        const SDL_GPUTextureRegion region = {.texture = hidden_present_target, .w = width, .h = height, .d = 1};
+        const SDL_GPUTextureTransferInfo destination = {.transfer_buffer = transfer};
+        SDL_DownloadFromGPUTexture(copy, &region, &destination);
+        SDL_EndGPUCopyPass(copy);
+        const u8* rgba = SubmitCmdAndWait() ? SDL_MapGPUTransferBuffer(device, transfer, false) : NULL;
+        if (rgba) {
+            for (size_t i = 0; i < count; ++i) memcpy(pixels + i * 3, rgba + i * 4, 3);
+            SDL_UnmapGPUTransferBuffer(device, transfer);
+            *w = width; *h = height;
+        }
+    }
+    if (!gpu_retirement_uncertain && transfer) SDL_ReleaseGPUTransferBuffer(device, transfer);
+    if (!*w) { free(pixels); pixels = NULL; }
+    return pixels;
+}
+unsigned char* Psyz_VideoAllocInterpolationSample(unsigned sample, float* fraction, int* w, int* h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (sample >= interp_sample_count || interp_next_y < 0)
+        return NULL;
+    InterpMidpointComplete(INTERP_SYNC_PRESENT);
+    SDL_GPUTexture* saved = interpolated_vram;
+    const bool mid = interp_present_mid;
+    interpolated_vram = InterpSampleTarget(sample);
+    interp_present_mid = true;
+    if (fraction) *fraction = interp_sample_alpha[sample];
+    unsigned char* pixels = Psyz_VideoAllocRenderedFrame(w, h);
+    interpolated_vram = saved;
+    interp_present_mid = mid;
+    return pixels;
+}
 unsigned char* Psyz_VideoAllocMidpointFrame(int* w, int* h) {
     InterpMidpointComplete(INTERP_SYNC_PRESENT);
     if (w)
@@ -3065,7 +3246,7 @@ static void UpdateScissor() {
 }
 
 unsigned Psyz_VideoGetInternalResolution(void) {
-    return internal_res / (antialiasing ? 2u : 1u);
+    return output_internal_res;
 }
 
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
@@ -4619,17 +4800,8 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         software_rasterizer.move_image(rect, x, y);
         return;
     }
-    if (rect->x >= 0 && rect->y >= 0 && rect->w > 0 && rect->h > 0 &&
-        rect->x + rect->w <= VRAM_W && rect->y + rect->h <= VRAM_H &&
-        (int)x + rect->w <= VRAM_W && (int)y + rect->h <= VRAM_H) {
-        PS1_RECT dst = {(short)x, (short)y, rect->w, rect->h};
-        if (MaskedVramWrite(&dst, NULL, rect->x, rect->y))
-            return;
-    }
-    if (rect->x == x && rect->y == y) {
+    if (!mask_set_bit && !mask_check_bit && rect->x == x && rect->y == y)
         return;
-    }
-    Draw_FlushBuffer(); // flush primitives before operating with the VRAM
 
     int src_x = CLAMP(rect->x, 0, VRAM_W - 1);
     int src_y = CLAMP(rect->y, 0, VRAM_H - 1);
@@ -4653,6 +4825,14 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
         WARNF("nothing to copy");
         return;
     }
+
+    /* Masked copies must use the validated/clipped rectangle too. Casting
+     * an arbitrary unsigned destination to short before checking it can
+     * otherwise give the CPU merge a negative VRAM index. */
+    PS1_RECT dst_rect = {(short)dst_x, (short)dst_y, (short)copy_w, (short)copy_h};
+    if (MaskedVramWrite(&dst_rect, NULL, src_x, src_y))
+        return;
+    Draw_FlushBuffer(); // flush primitives before operating with the VRAM
 
     /* the copy goes through vram_sample at the source (as its native
      * pixels are now): the midpoint kept so far samples it first */
@@ -5041,7 +5221,7 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             boxes[n_segments] = box;
             segments[n_segments++] =
                 (DrawSegment){seg_start, seg_end, semi, mark};
-            n_draws += semi ? 1 : 2;
+            n_draws += (semi || PSX_SHADERS_CURRENT) ? 1 : 2;
         }
         if (!n_segments) {
             start = end;
@@ -5058,16 +5238,28 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
                 continue;
             if (!blend_copy)
                 blend_copy = SDL_BeginGPUCopyPass(cmd);
+#if defined(__APPLE__)
+            /* Small unaligned destination snapshots intermittently produce
+             * stale texels on Metal (randomized mask/blend regression).
+             * Copy complete 16-pixel blocks; all snapshots read the same
+             * pre-pass target, so their enlarged regions may safely overlap.
+             * Keep the original boxes for primitive dependency decisions. */
+            const SemiBox region = {boxes[i].x0 & ~15, boxes[i].y0 & ~15,
+                SDL_min((boxes[i].x1 + 15) & ~15, VRAM_W * (int)target_scale),
+                SDL_min((boxes[i].y1 + 15) & ~15, VRAM_H * (int)target_scale)};
+#else
+            const SemiBox region = boxes[i];
+#endif
             SDL_GPUTextureLocation from = {
                 .texture = render_target,
-                .x = (Uint32)boxes[i].x0,
-                .y = (Uint32)boxes[i].y0};
+                .x = (Uint32)region.x0,
+                .y = (Uint32)region.y0};
             SDL_GPUTextureLocation to = from;
             to.texture = destination_sample;
             SDL_CopyGPUTextureToTexture(
                 blend_copy, &from, &to,
-                (Uint32)(boxes[i].x1 - boxes[i].x0),
-                (Uint32)(boxes[i].y1 - boxes[i].y0), 1, false);
+                (Uint32)(region.x1 - region.x0),
+                (Uint32)(region.y1 - region.y0), 1, false);
         }
         if (blend_copy)
             SDL_EndGPUCopyPass(blend_copy);
@@ -5108,8 +5300,12 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
              * blended by the destination's mask bit (alpha), so a pixel
              * masked by an earlier primitive of the batch is kept. */
             const bool checked = PSX_SHADERS_CURRENT && !semi && view->mask_check;
+            /* The current shader's pass 3 writes RGB and the real mask bit
+             * together. Opaque draws without check-mask can overwrite both
+             * directly, avoiding a second full fragment pass at Nx. */
+            const bool combined = PSX_SHADERS_CURRENT && !semi;
             const u32 color_pass[4] = {
-                semi ? 2u : checked ? 3u : 0u, target_scale,
+                semi ? 2u : combined ? 3u : 0u, target_scale,
                 b->grid_same, pass_flags};
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
@@ -5118,12 +5314,12 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
                 pass, semi && destination_fetch ? pipe_direct_fetch :
                       pipe_tri[semi      ? BLEND_DIRECT
                                : checked ? BLEND_CHECK
+                               : combined ? BLEND_DIRECT
                                          : BLEND_ADD]);
             SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
-            /* Blend factors use source alpha as an operation selector.
-             * Write the actual PS1 mask bit separately, without changing
-             * the color result. */
-            if (!semi && !checked) {
+            /* Legacy shaders use alpha as an operation selector and need
+             * a separate write of the real mask bit. */
+            if (!semi && !combined) {
                 const u32 mask_pass[4] = {
                     1, target_scale, b->grid_same, pass_flags};
                 SDL_PushGPUFragmentUniformData(

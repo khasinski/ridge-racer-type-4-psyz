@@ -1,5 +1,6 @@
 #include <common.h>
 #include <libcd.h>
+#include "libcd_lock.h"
 #ifdef __psyz
 #include <libetc.h>
 #include "libcd_stream.h"
@@ -110,7 +111,7 @@ void cb_data(void) {
     }
 }
 
-int cd_read_retry(int mode) {
+static int cd_read_retry_locked(int mode) {
     u_char param;
 
     CdSyncCallback(0);
@@ -155,7 +156,15 @@ int cd_read_retry(int mode) {
     return ReadAttr.remaining;
 }
 
+int cd_read_retry(int mode) {
+    CD_LOCK();
+    int remaining = cd_read_retry_locked(mode);
+    CD_UNLOCK();
+    return remaining;
+}
+
 void CdReadBreak(void) {
+    CD_LOCK();
     if (ReadAttr.read_mode & 1) {
         CdDataSync(0);
     }
@@ -166,9 +175,11 @@ void CdReadBreak(void) {
         CdDataCallback(ReadAttr.data_callback);
     }
     CdControlF(CdlPause, NULL);
+    CD_UNLOCK();
 }
 
 int CdRead(int sectors, u_long* buf, int mode) {
+    CD_LOCK();
     ReadAttr.mode = mode;
     switch (ReadAttr.mode & (CdlModeSize0 | CdlModeSize1)) {
     case 0:
@@ -190,6 +201,7 @@ int CdRead(int sectors, u_long* buf, int mode) {
         ReadAttr.data_callback = (void (*)())CdDataCallback(NULL);
     }
     ReadAttr.start_time = VSync(-1);
+    CD_UNLOCK(); /* no ready callback can mutate this request until retry */
     if (CdStatus() & (CdlStatPlay | CdlStatSeek | CdlStatRead)) {
         CdControlB(CdlPause, NULL, NULL);
     }
@@ -204,6 +216,7 @@ int CdReadSync(int mode, u_char* result) {
         // The drive reads on while the caller polls.
         Psyz_CdPollQuery();
 #endif
+        CD_LOCK();
         if (VSync(-1) > ReadAttr.start_time + 1200) {
             ret = -1;
         } else if (
@@ -213,6 +226,7 @@ int CdReadSync(int mode, u_char* result) {
         } else {
             ret = ReadAttr.remaining;
         }
+        CD_UNLOCK();
     } while (mode == 0 && ret > 0);
 
     CdReady(1, result);
@@ -220,13 +234,17 @@ int CdReadSync(int mode, u_char* result) {
 }
 
 CdlCB CdReadCallback(CdlCB func) {
+    CD_LOCK();
     CdlCB prev = CD_cbread;
     CD_cbread = func;
+    CD_UNLOCK();
     return prev;
 }
 
 int CdReadMode(int mode) {
+    CD_LOCK();
     int prev = ReadAttr.read_mode;
     ReadAttr.read_mode = mode;
+    CD_UNLOCK();
     return prev;
 }

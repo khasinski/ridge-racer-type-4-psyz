@@ -5,6 +5,7 @@
 #include <psyz/gte.h>
 #include <libgpu.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef __psyz
 #define GTE_SET_ZSF3(v) Psyz_GteCtrlWrite(29, (unsigned int)(v))
@@ -22,6 +23,76 @@
 
 ZTEST_SETUP(gte) { InitGeom(); }
 ZTEST_TEARDOWN(gte) { InitGeom(); }
+
+#ifdef __psyz
+ZTEST(gte, extended_projection_keeps_far_angles_and_ordering_depth) {
+    MATRIX matrix = {{{4096,0,0},{0,4096,0},{0,0,4096}}, {40000,-20000,100000}};
+    SVECTOR point = {0,0,0,0};
+    unsigned int packed;
+    SetGeomOffset(0,0);
+    SetGeomScreen(256);
+    SetRotMatrix(&matrix);
+    SetTransMatrix(&matrix);
+    GTE_SET_ZSF4(0x100);
+    gte_ldv0(&point);
+    for (int i=0;i<4;++i) gte_rtps();
+    Psyz_GteStoreSxyTo(14,&packed);
+    zexpect_s32_eq(127,(short)packed);
+    Psyz_GteCommand(0x2E);
+    zexpect_u32_eq(16383,Psyz_GteDataRead(7));
+
+    zexpect_s32_eq(0,Psyz_GteSetExtendedProjection(1));
+    for (int i=0;i<4;++i) gte_rtps();
+    Psyz_GteStoreSxyTo(14,&packed);
+    zexpect_s32_eq(1,(short)packed >= 101 && (short)packed <= 103);
+    zexpect_s32_eq(1,(short)(packed>>16) >= -53 && (short)(packed>>16) <= -51);
+    Psyz_GteCommand(0x2E);
+    zexpect_u32_eq(25000,Psyz_GteDataRead(7));
+    /* A farther point on the same viewing ray stays in the same place. */
+    matrix.t[0] *= 2; matrix.t[1] *= 2; matrix.t[2] *= 2;
+    SetTransMatrix(&matrix);
+    for (int i=0;i<4;++i) gte_rtps();
+    Psyz_GteStoreSxyTo(14,&packed);
+    zexpect_s32_eq(1,(short)packed >= 101 && (short)packed <= 103);
+    Psyz_GteCommand(0x2E);
+    zexpect_u32_eq(50000,Psyz_GteDataRead(7));
+    /* Scope exit restores the original projection and depth saturation. */
+    zexpect_s32_eq(1,Psyz_GteSetExtendedProjection(0));
+    for (int i=0;i<4;++i) gte_rtps();
+    Psyz_GteStoreSxyTo(14,&packed);
+    zexpect_s32_eq(127,(short)packed);
+    Psyz_GteCommand(0x2E);
+    zexpect_u32_eq(16383,Psyz_GteDataRead(7));
+}
+
+ZTEST(gte, extended_projection_tracks_camera_yaw_with_precise_depth) {
+    extern void Psyz_PgxpSetActive(int);
+    extern int Psyz_PgxpLookupVertex(const void*, unsigned int, float*, float*, float*);
+    MATRIX matrix = {{{4096,0,0},{0,4096,0},{0,0,4096}}, {0,0,0}};
+    SVECTOR point = {0,0,0,0};
+    Psyz_PgxpSetActive(1);
+    Psyz_GteSetExtendedProjection(1);
+    SetGeomOffset(0,0); SetGeomScreen(256); SetRotMatrix(&matrix);
+    for (int step = -30; step <= 30; ++step) {
+        double angle = step * 0.02;
+        matrix.t[0] = (int)(sin(angle) * 120000);
+        matrix.t[2] = (int)(cos(angle) * 120000);
+        SetTransMatrix(&matrix);
+        Psyz_PgxpNextFrame();
+        gte_ldv0(&point); gte_rtps();
+        unsigned int packed;
+        Psyz_GteStoreSxyTo(14, &packed);
+        float x, y, depth;
+        zexpect_s32_eq(1, Psyz_PgxpLookupVertex(&packed, packed, &x, &y, &depth));
+        double expected = 256.0 * matrix.t[0] / matrix.t[2];
+        zexpect_s32_eq(1, fabs(x - expected) < 0.002);
+        zexpect_s32_eq(1, fabs((short)packed - expected) < 3.0);
+        zexpect_s32_eq(1, fabs(depth - matrix.t[2]) < 0.01);
+    }
+    Psyz_GteSetExtendedProjection(0);
+    Psyz_PgxpSetActive(0);
+}
+#endif
 
 #define zexpect_matrix_eq(exp, act) zexpect_matrix_eq_(__LINE__, exp, act)
 static int zexpect_matrix_eq_(int line, MATRIX* exp, MATRIX* act) {

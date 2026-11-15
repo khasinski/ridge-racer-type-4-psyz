@@ -84,8 +84,10 @@ static int dma_dispatching;
 void* DMACallback(int dma, void (*func)()) {
     if (dma < 0 || dma >= 7)
         return NULL;
+    Psyz_KernelLockInterrupts();
     void (*previous)(void) = dma_callbacks[dma];
     dma_callbacks[dma] = func;
+    Psyz_KernelUnlockInterrupts();
     return (void*)previous;
 }
 
@@ -94,9 +96,12 @@ void* DMACallback(int dma, void (*func)()) {
 void Psyz_DmaComplete(unsigned channel) {
     if (channel >= 7)
         return;
+    Psyz_KernelLockInterrupts();
     dma_pending |= 1u << channel;
-    if (dma_dispatching)
+    if (dma_dispatching) {
+        Psyz_KernelUnlockInterrupts();
         return;
+    }
     dma_dispatching = 1;
     while (dma_pending) {
         unsigned next = 0;
@@ -108,6 +113,7 @@ void Psyz_DmaComplete(unsigned channel) {
             callback();
     }
     dma_dispatching = 0;
+    Psyz_KernelUnlockInterrupts();
 }
 
 int InitTAP(char* bufA, long lenA, char* bufB, long lenB) {

@@ -1,6 +1,7 @@
 #include <common.h>
 #include <libcd.h>
 #include "libcd_stream.h"
+#include "libcd_lock.h"
 
 CdlLOC previous_frame_location;
 s32 next_frameid;
@@ -22,9 +23,13 @@ void data_ready_callback(void) {
 }
 
 s32 StGetBackloc(CdlLOC* loc) {
+    CD_LOCK();
     if (StMode) {
+        CD_UNLOCK();
         return -1;
     }
     CdIntToPos(CdPosToInt(&previous_frame_location) + 1, loc);
-    return next_frameid;
+    s32 frame = next_frameid;
+    CD_UNLOCK();
+    return frame;
 }

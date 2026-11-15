@@ -67,7 +67,7 @@ static u16 PackColor(int r, int g, int b, bool mask) {
 }
 
 /* Shared native RGB555 destination semantics; caller owns addressing. */
-static bool NativeDestinationWrite(u16 *out,u16 src,bool semi,int abr,
+static inline bool NativeDestinationWrite(u16 *out,u16 src,bool semi,int abr,
     bool set_mask_bit,bool preserve_masked) {
     if (preserve_masked && (*out & 0x8000)) {
         return false;
@@ -212,7 +212,10 @@ static void NativeStep(u32* attr, const u32* step, int count) {
         attr[i] += step[i] * (u32)count;
 }
 
-static void NativePixel(const NativePoly* p, int x, int y, const u32* attr) {
+/* Polygon spans have already clipped their destination. Sprites and lines
+ * still use WritePixel, whose coordinate checks they need. */
+static inline void NativePixel(const NativePoly* p, int x, int y,
+                              const u32* attr, u16* out) {
     int r = p->gouraud ? (int)(attr[0] >> 24) : p->r;
     int g = p->gouraud ? (int)(attr[1] >> 24) : p->g;
     int b = p->gouraud ? (int)(attr[2] >> 24) : p->b;
@@ -229,28 +232,41 @@ static void NativePixel(const NativePoly* p, int x, int y, const u32* attr) {
         int d = p->dither ? dither[y & 3][x & 3] : 0;
         color = PackColor((r + d) >> 3, (g + d) >> 3, (b + d) >> 3, false);
     }
-    WritePixel(x, y, color, blend, p->abr);
+    NativeDestinationWrite(out, color, blend, p->abr, set_mask_bit,
+                           preserve_masked);
 }
 
 static void NativeSpan(const NativePoly* p, int y, int x_start, int x_bound,
                        const u32* line_attr) {
     int width = x_bound - x_start;
     int x = Sign11(x_start);
-    if (x < draw_area_start.x) {
-        int delta = draw_area_start.x - x;
+    if (y < draw_area_start.y || y > draw_area_end.y || y < 0 || y >= VRAM_H)
+        return;
+    const int left = draw_area_start.x > 0 ? draw_area_start.x : 0;
+    const int right = draw_area_end.x < VRAM_W - 1 ? draw_area_end.x : VRAM_W - 1;
+    if (x < left) {
+        int delta = left - x;
         x_start += delta;
         x += delta;
         width -= delta;
     }
-    if (x + width > draw_area_end.x + 1)
-        width = draw_area_end.x + 1 - x;
+    if (x + width > right + 1)
+        width = right + 1 - x;
     if (width <= 0)
         return;
+    u16* out = &vram[y * VRAM_W + x];
+    if (!p->textured && !p->gouraud && !p->dither && !p->semi &&
+        !preserve_masked) {
+        const u16 color = PackColor(p->r >> 3, p->g >> 3, p->b >> 3, set_mask_bit);
+        for (int i = 0; i < width; i++)
+            out[i] = color;
+        return;
+    }
     u32 attr[5];
     memcpy(attr, line_attr, sizeof(attr));
     NativeStep(attr, p->dx, x_start);
     do {
-        NativePixel(p, x, y, attr);
+        NativePixel(p, x, y, attr, out++);
         x++;
         NativeStep(attr, p->dx, 1);
     } while (--width > 0);

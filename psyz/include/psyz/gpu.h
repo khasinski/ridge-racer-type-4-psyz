@@ -91,6 +91,13 @@ void Psyz_GpuResetSpriteAtlases(void);
 /* Presentation switch; native VRAM remains unchanged. */
 /* Optional display-only midpoint geometry; simulation and native VRAM stay original. */
 int Psyz_GpuSetFrameInterpolation(int enabled);
+/* 0: native presentation; 60/120: geometry samples at an independent rate.
+ * Set the native frame duration before BeginInterpolationFrame. */
+int Psyz_GpuSetPresentationRate(unsigned fps);
+void Psyz_GpuSetPresentationInterval(unsigned fields);
+/* Cooperative output service during long CPU geometry passes; never runs
+ * game logic, consumes packets or invokes the settings overlay. */
+void Psyz_GpuPollPresentation(void);
 int Psyz_GpuGetFrameInterpolation(void);
 int Psyz_GpuGetFrameInterpolationRequested(void);
 float Psyz_GpuGetPresentedFps(void);
@@ -106,6 +113,9 @@ void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigne
  * of the frame shown and the one before), RGB like
  * Psyz_VideoAllocRenderedFrame; NULL without one. */
 unsigned char *Psyz_VideoAllocMidpointFrame(int *w,int *h);
+/* Diagnostic readback of a generated 60/120 Hz sample and its fraction.
+ * NULL for an unavailable index. Uses the last prepared display buffer. */
+unsigned char *Psyz_VideoAllocInterpolationSample(unsigned sample, float *fraction, int *w, int *h);
 void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b);
 void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b);
 void Psyz_GpuSetInterpolationCamera(int x,int y);

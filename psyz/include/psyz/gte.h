@@ -23,6 +23,11 @@ extern "C" {
  */
 unsigned int Psyz_GteDataRead(unsigned reg);
 
+/* Native extended-distance rendering: project full transformed coordinates
+ * and retain their depths for AVSZ. The default (0) preserves PS1 limits.
+ * Returns the previous setting so render passes can restore it. */
+int Psyz_GteSetExtendedProjection(int enabled);
+
 /**
  * @brief Write a GTE data register (COP2 data)
  *

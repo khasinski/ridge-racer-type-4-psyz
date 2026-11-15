@@ -1653,6 +1653,12 @@ void Draw_FlushBuffer(void) {
 }
 
 int Psyz_GpuSetFrameInterpolation(int enabled){(void)enabled;return -1;}
+int Psyz_GpuSetPresentationRate(unsigned fps){(void)fps;return -1;}
+void Psyz_GpuSetPresentationInterval(unsigned fields){(void)fields;}
+void Psyz_GpuPollPresentation(void) {}
+unsigned char* Psyz_VideoAllocHiddenDisplay(int* w,int* h){if(w)*w=0;if(h)*h=0;return NULL;}
+unsigned char* Psyz_VideoAllocInterpolationSample(unsigned s,float* f,int* w,int* h){(void)s;(void)f;if(w)*w=0;if(h)*h=0;return NULL;}
+static void PlatformBackend_PresentationPoll(void) {}
 int Psyz_GpuGetFrameInterpolation(void){return 0;}
 int Psyz_GpuGetFrameInterpolationRequested(void){return 0;}
 float Psyz_GpuGetPresentedFps(void){return 0.0f;}
