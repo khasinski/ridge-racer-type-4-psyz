@@ -29,6 +29,61 @@ typedef struct {
 static CdlCB CD_cbread = NULL;
 static volatile CD_READ_ATTR ReadAttr = {0};
 
+/* The LIBCD of Ridge Racer Type 4 ends a read with a Pause whose completion
+ * (cd_read_restore_sync, as the sync callback) gives the caller's sync
+ * callback back: until then the read is not over, so CdReadSync reports it
+ * busy, and CdRead and CdReadBreak wait for it (up to 121 vblanks). */
+static volatile int read_pause_pending;
+
+#ifdef __psyz
+// The Pause's completion interrupt, handled before a poller sees it.
+static volatile int read_pause_irq_owed;
+
+static void read_pause_irq(void) {
+    if (read_pause_irq_owed) {
+        read_pause_irq_owed = 0;
+        Psyz_CdCpu(CD_DONE_IRQ_CYCLES);
+    }
+}
+#endif
+
+static void cd_read_restore_sync(u_char intr, u_char* result) {
+    CdSyncCallback(ReadAttr.sync_callback);
+    read_pause_pending = 0;
+#ifdef __psyz
+    read_pause_irq_owed = 1;
+#endif
+}
+
+// The read's ending Pause, after the ready and data callbacks are restored.
+static void cd_read_end(void) {
+    CdSyncCallback(cd_read_restore_sync);
+    CdControlF(CdlPause, NULL);
+    read_pause_pending = 1;
+}
+
+// Waits for the ending Pause of the previous read; 0 on a timeout, which
+// gives the sync callback back without it.
+static int cd_read_wait_pause(void) {
+    int start = VSync(-1);
+    while (read_pause_pending) {
+        if ((unsigned)(VSync(-1) - start) >= 121) {
+            CD_LOCK();
+            CdSyncCallback(ReadAttr.sync_callback);
+            read_pause_pending = 0;
+            CD_UNLOCK();
+            return 0;
+        }
+#ifdef __psyz
+        Psyz_CdPollQuery();
+#endif
+    }
+#ifdef __psyz
+    read_pause_irq();
+#endif
+    return 1;
+}
+
 #ifdef __psyz
 // The buffer advances by the 32-bit words of a sector, not host u_longs.
 #define ADVANCE_SECTOR() \
@@ -81,12 +136,11 @@ void cb_read(u_char intr, u_char* result) {
         ReadAttr.remaining = -1;
     }
     if (ReadAttr.remaining == 0 || VSync(-1) > ReadAttr.start_time + 1200) {
-        CdSyncCallback(ReadAttr.sync_callback);
         CdReadyCallback(ReadAttr.ready_callback);
         if (ReadAttr.read_mode & 1) {
             CdDataCallback(ReadAttr.data_callback);
         }
-        CdControlF(CdlPause, NULL);
+        cd_read_end();
         if (CD_cbread) {
             CD_cbread(
                 ReadAttr.remaining == 0 ? CdlComplete : CdlDiskError, result);
@@ -99,12 +153,11 @@ void cb_data(void) {
     ReadAttr.remaining--;
     ReadAttr.pos++;
     if (ReadAttr.remaining == 0) {
-        CdSyncCallback(ReadAttr.sync_callback);
         CdReadyCallback(ReadAttr.ready_callback);
         if (ReadAttr.read_mode & 1) {
             CdDataCallback(ReadAttr.data_callback);
         }
-        CdControlF(CdlPause, NULL);
+        cd_read_end();
         if (CD_cbread != NULL) {
             CD_cbread(CdlComplete, (u_char*)ReadAttr.result);
         }
@@ -163,22 +216,34 @@ int cd_read_retry(int mode) {
     return remaining;
 }
 
+// Ends the read in progress with its Pause, waited for; a read already
+// ending only has its Pause waited for.
 void CdReadBreak(void) {
     CD_LOCK();
     if (ReadAttr.read_mode & 1) {
         CdDataSync(0);
     }
     ReadAttr.remaining = 0;
-    CdSyncCallback(ReadAttr.sync_callback);
+    CD_UNLOCK();
+    if (read_pause_pending) {
+        cd_read_wait_pause();
+        return;
+    }
+    CD_LOCK();
     CdReadyCallback(ReadAttr.ready_callback);
     if (ReadAttr.read_mode & 1) {
         CdDataCallback(ReadAttr.data_callback);
     }
-    CdControlF(CdlPause, NULL);
+    cd_read_end();
     CD_UNLOCK();
+    cd_read_wait_pause();
 }
 
 int CdRead(int sectors, u_long* buf, int mode) {
+    cd_read_wait_pause();
+#ifdef __psyz
+    Psyz_CdCpu(CD_READ_CYCLES);
+#endif
     CD_LOCK();
     ReadAttr.mode = mode;
     switch (ReadAttr.mode & (CdlModeSize0 | CdlModeSize1)) {
@@ -227,9 +292,18 @@ int CdReadSync(int mode, u_char* result) {
             ret = ReadAttr.remaining;
         }
         CD_UNLOCK();
-    } while (mode == 0 && ret > 0);
+        // mode 0 also waits for the read's ending Pause
+    } while (mode == 0 && (ret > 0 || (ret == 0 && read_pause_pending)));
 
     CdReady(1, result);
+    if (ret == 0 && read_pause_pending) {
+        ret = 1;
+    }
+#ifdef __psyz
+    if (ret == 0) {
+        read_pause_irq();
+    }
+#endif
     return ret;
 }
 

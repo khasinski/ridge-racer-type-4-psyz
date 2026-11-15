@@ -1,5 +1,11 @@
 #include <common.h>
 #include <libcd.h>
+#ifdef __psyz
+#include "libcd_stream.h"
+#define SEARCH_TIME(cycles) Psyz_CdCpu(cycles)
+#else
+#define SEARCH_TIME(cycles)
+#endif
 
 typedef union {
     int addr;
@@ -107,10 +113,12 @@ out:
         if (file_[i].name[0] == '\0') {
             break;
         }
+        SEARCH_TIME(CD_SEARCH_CMP_CYCLES);
         if (_cmp(file_[i].name, buf)) {
             if (CD_debug >= 2) {
                 printf("%s:  found\n", buf);
             }
+            SEARCH_TIME(CD_SEARCH_FOUND_CYCLES);
             *fp = file_[i];
             return &file_[i];
         }
@@ -142,6 +150,7 @@ s32 CD_newmedia(void) {
         }
         return 0;
     }
+    SEARCH_TIME(CD_SEARCH_PVD_CYCLES);
     (&pathTableLBA)->i = ((IsoPVD*)load_buf_)->pathTableLBA.i;
     if (cd_read(1, pathTableLBA.addr, load_buf_) != 1) {
         if (CD_debug > 0) {
@@ -179,6 +188,7 @@ s32 CD_newmedia(void) {
     } while (0);
 
     cached_dir_num_ = 0;
+    SEARCH_TIME(CD_SEARCH_PATH_TABLE_CYCLES);
     if (CD_debug > 1) {
         printf("CD_newmedia: %d dir entries found\n", i);
     }
@@ -255,6 +265,7 @@ s32 CD_cachefile(s32 dirNum) {
         }
     }
     cached_dir_num_ = dirNum;
+    SEARCH_TIME(CD_SEARCH_DIR_CYCLES);
     if (i < CdlMAXFILE) {
         file_[i].name[0] = '\0';
     }

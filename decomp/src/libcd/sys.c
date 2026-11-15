@@ -117,7 +117,14 @@ CdlCB CdReadyCallback(CdlCB func) {
     return prev;
 }
 
+#ifdef __psyz
+#include "libcd_stream.h"
+#endif
+
 static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
+#ifdef __psyz
+    Psyz_CdCpu(CD_CONTROL_CYCLES);
+#endif
     CdlCB old = CdSyncCallback(NULL);
     int count = 4;
 
@@ -130,6 +137,11 @@ static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
             !CD_cw(CdlSetloc, param, result, 0)) {
             CdSyncCallback(old);
             if (!CD_cw(com, param, result, arg3)) {
+#ifdef __psyz
+                if (!arg3) {
+                    Psyz_CdCpu(CD_CONTROL_RETURN_CYCLES);
+                }
+#endif
                 return 0;
             }
         }

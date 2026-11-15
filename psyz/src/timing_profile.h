@@ -137,11 +137,13 @@ enum {
      * DuckStation [field] 414793b. */
     SPU_DMA_CLOCKS_PER_BYTE = 8,
     /* SpuClearReverbWorkArea: the setup of each 1 KiB chunk (_spu_t's
-     * waits, the DMA event) besides its DMA: 97 chunks took 1.27M clocks
-     * in SsInit. [call] 686859c (the recompiler takes 22% less than the
-     * interpreter for the whole call at boot, 170.5k / 219.7k, but not per
-     * chunk) */
-    SPU_CLEAR_CHUNK_CYCLES = 3070,
+     * waits, the DMA event) besides its DMA: its 97 chunks take 1.219M
+     * clocks in SsInit on the recompiler [mark] (the entry of the next
+     * function, as CD_CW_ISSUE_CYCLES). */
+    SPU_CLEAR_CHUNK_CYCLES = 4376,
+    /* SpuInit (cold): _spu_init's resets and waits and SpuStart, 29.2k up
+     * to SsInit's SpuClearReverbWorkArea [mark] */
+    SPU_INIT_CYCLES = 29230,
     /* SpuIsTransferCompleted(SPU_TRANSFER_PEEK) while the DMA runs, and
      * Psyz_SpuDmaWait's step: a poll's time in ns. [unrecorded] dd07ccc */
     SPU_TRANSFER_POLL_NS = 1000,
@@ -155,6 +157,9 @@ enum {
      * scaled by the recompiler / interpreter clocks of the attract cycle's
      * ticks (5923 / 6340) [rec ratio]. */
     SS_TICK_CYCLES = 5895,
+    /* _SsInit: the voice and state registers and _SsVmInit, 35.2k up to
+     * the caller's next call (SoundSystemInit) [mark] */
+    SS_INIT_CYCLES = 35204,
     /* SsUtAllKeyOff: a SpuSetVoiceAttr per voice, 21.8k for 24 voices [rec]
      * in a Time Attack run's menus (interpreter: 22.8k, f8ddd9d); the menu
      * sound bank loads after the title end on DuckStation's field [field]. */
@@ -195,6 +200,33 @@ enum {
     /* Another drive query in a busy loop (CdSync, CdReady, CdReadSync),
      * interrupts included. [unrecorded] 8080ec2 */
     CD_POLL_NS = 2000,
+    /* LIBCD's CD_cw around a command: from its call to the command
+     * register write, and from the acknowledge (the interrupt, the result
+     * read, the return) to the caller; and the completion interrupt's
+     * handling before a wait for it returns (Init, Pause). CD_init's own
+     * setup before its first command (the controller's registers and
+     * ResetCallback). Entry-to-entry clocks of the boot's commands on
+     * DuckStation's recompiler [mark] (DUCKSTATION_CD_TRACE, a stub at each
+     * function entry writing root counter 2 before SsStart). */
+    CD_CW_ISSUE_CYCLES = 480,
+    CD_CW_ACK_CYCLES = 2620,
+    CD_DONE_IRQ_CYCLES = 2120,
+    CD_INIT_CYCLES = 4680,
+    /* CdControl, CdControlF, CdControlB around CD_cw: before it, and from
+     * its return after an acknowledge to the caller [mark] */
+    CD_CONTROL_CYCLES = 80,
+    CD_CONTROL_RETURN_CYCLES = 150,
+    /* CdRead's setup up to its first command, the call included [mark] */
+    CD_READ_CYCLES = 770,
+    /* CdSearchFile on a new disc, after each read (the read's return
+     * included): the volume descriptor, the path table, the directory's
+     * file records; then each name compared, and the found file's return
+     * to the caller's next call [mark] */
+    CD_SEARCH_PVD_CYCLES = 3215,
+    CD_SEARCH_PATH_TABLE_CYCLES = 2561,
+    CD_SEARCH_DIR_CYCLES = 14047,
+    CD_SEARCH_CMP_CYCLES = 747,
+    CD_SEARCH_FOUND_CYCLES = 2699,
     /* An MDEC macroblock (a block in the mono depths) leaves the decoder
      * about every 101 us with its DMA (2688 cycles per macroblock in
      * DuckStation's model and the DMA): the game's 320x176 movie frames,

@@ -574,12 +574,14 @@ static void* drive_bell(void) {
 }
 
 /* Blocks until emulated time `until_us`, as a PS1 waiting on the drive.
- * The interrupt handlers' time owed so far stays owed, as on DuckStation for
- * the waits CD_cw makes (the attract demo start keeps it). In a LIBCD
- * polling loop (`poll`: CdSync(0), CdReady(0)) the handlers that come
+ * The interrupt handlers' time owed so far stays owed (CD_cw's wait for
+ * the acknowledge). In a LIBCD polling loop (`poll`: CdSync(0), CdReady(0)
+ * and CD_cw's CD_sync(0) for the previous command) the handlers that come
  * meanwhile run within the wait instead, and so does the time owed by the
  * work before it unless that outlasts the wait: on DuckStation the pause
- * that ends a movie (CdControlB) returns as the drive finishes it. */
+ * that ends a movie (CdControlB) returns as the drive finishes it, and
+ * SoundSystemInit's SsStart follows its CdReset's Demute by 0.2 ms after
+ * a 0.8 s Init. */
 static void drive_wait_until_mode(uint64_t until_us, int poll) {
     if (drive_is_instant()) {
         return;
@@ -622,6 +624,25 @@ static void drive_wait_until(uint64_t until_us) {
 
 static void drive_poll_until(uint64_t until_us) {
     drive_wait_until_mode(until_us, 1);
+}
+
+// PS1 CPU time of LIBCD's own code (timing_profile.h).
+static void drive_cpu(unsigned cycles) {
+    if (!drive_is_instant()) {
+        Psyz_SpendCycles(cycles);
+    }
+}
+
+void Psyz_CdCpu(unsigned cycles) { drive_cpu(cycles); }
+
+/* LIBCD's CD_sync(0) loop until a command completes: when it had to wait,
+ * the completion's interrupt is handled before the loop sees it. */
+static void drive_wait_done(uint64_t done_us) {
+    if (drive_is_instant() || drive_now() >= done_us) {
+        return;
+    }
+    drive_poll_until(done_us);
+    drive_cpu(CD_DONE_IRQ_CYCLES);
 }
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
@@ -1468,6 +1489,7 @@ int CD_init(void) {
     ResetCallback();
     InterruptCallback(2, &callback);
     Psyz_KernelUnlockInterrupts();
+    drive_cpu(CD_INIT_CYCLES);
     CD_cw(CdlNop, 0, nop_result, 0);
     if (CdStatus() & CdlStatShellOpen) {
         CD_cw(CdlNop, 0, nop_result, 0);
@@ -1543,7 +1565,7 @@ int CD_sync(int mode, u_char* result) {
         Psyz_KernelLockInterrupts();
         uint64_t done = drive.done_us;
         Psyz_KernelUnlockInterrupts();
-        drive_poll_until(done);
+        drive_wait_done(done);
         Psyz_CdServiceDrive();
     } else {
         Psyz_CdPollQuery();
@@ -1932,8 +1954,9 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelLockInterrupts();
     uint64_t previous_done = drive.done_us;
     Psyz_KernelUnlockInterrupts();
-    drive_wait_until(previous_done);
+    drive_wait_done(previous_done);
     Psyz_CdServiceDrive();
+    drive_cpu(CD_CW_ISSUE_CYCLES);
     Psyz_KernelLockInterrupts();
     CD_com = com; // CdLastCom
     command_ack_us = drive_now();
@@ -1959,6 +1982,7 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelUnlockInterrupts();
     if (!arg3) {
         drive_wait_until(ack);
+        drive_cpu(CD_CW_ACK_CYCLES);
     }
     return ret;
 }
