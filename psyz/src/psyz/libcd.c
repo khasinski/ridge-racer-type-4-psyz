@@ -419,12 +419,23 @@ static uint64_t drive_sector_us(void) { return ticks_us(drive_sector_ticks()); }
 
 static uint64_t drive_rate(void) { return drive_double_speed() ? 150 : 75; }
 
+/* The mechanism's geometry counts absolute sectors from the start of the
+ * disc (DuckStation's LBA); a position here (CdPosToInt) is that minus the
+ * 2 second pregap, so the start of the disc is -DRIVE_PREGAP. */
+#define DRIVE_PREGAP 150
+
+// The track before `lba` (`spt` sectors back), not before the disc start.
+static int drive_track_back(int lba, int spt) {
+    return lba + DRIVE_PREGAP >= spt ? lba - spt : -DRIVE_PREGAP;
+}
+
 // Sectors per revolution at a position (the 71 minute table).
 static int drive_sectors_per_track(int lba) {
     static const unsigned char spt_end[][2] = {
         {0, 8},   {4, 9},   {7, 10},  {11, 11}, {16, 12}, {23, 13},
         {27, 14}, {32, 15}, {39, 16}, {44, 17}, {52, 18}, {60, 19},
         {67, 20}, {74, 21}, {255, 22}};
+    lba += DRIVE_PREGAP;
     int mm = lba > 0 ? lba / (75 * 60) : 0;
     for (int i = 0; i < LEN(spt_end); i++) {
         if (mm <= spt_end[i][0]) {
@@ -434,18 +445,87 @@ static int drive_sectors_per_track(int lba) {
     return 22;
 }
 
+/* Every seek takes another 0.5-1 ms. DuckStation draws it from a
+ * xoroshiro128++ generator seeded with 0x4B435544 at power-on, one draw per
+ * seek time it computes (GetTicksForSeek: a seek, a read or play that starts
+ * without one, an Init that moves the head); the port makes the same draws
+ * in the same order. The BIOS's boot reads before the game made
+ * DRIVE_BOOT_SEEK_DRAWS of them (fast boot, SCPH-1001: SYSTEM.CNF and the
+ * executable, each a SeekL and a ReadN). */
+#define DRIVE_SEEK_SEED 0x4B435544u
+#define DRIVE_BOOT_SEEK_DRAWS 12
+static uint64_t seek_rng[2];
+static int seek_rng_ready;
+
+static uint64_t splitmix64(uint64_t* x) {
+    uint64_t z = (*x += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+static uint64_t rotl64(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+
+static uint64_t seek_rng_next(void) {
+    uint64_t s0 = seek_rng[0], s1 = seek_rng[1];
+    uint64_t result = rotl64(s0 + s1, 17) + s0;
+    s1 ^= s0;
+    seek_rng[0] = rotl64(s0, 49) ^ s1 ^ (s1 << 21);
+    seek_rng[1] = rotl64(s1, 28);
+    return result;
+}
+
+static uint64_t seek_rng_draw(void) {
+    const uint64_t low = DRIVE_CLOCK / 2000, n = DRIVE_CLOCK / 1000 - low;
+    const uint64_t max_allowed = (UINT64_MAX / n) * n;
+    for (;;) {
+        uint64_t x = seek_rng_next();
+        if (x <= max_allowed) {
+            return low + x % n;
+        }
+    }
+}
+
+static int drive_trace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("PSYZ_CD_TRACE") != NULL;
+    }
+    return trace;
+}
+
+static uint64_t drive_seek_jitter(int from, int to) {
+    static unsigned draws = DRIVE_BOOT_SEEK_DRAWS;
+    if (!seek_rng_ready) {
+        uint64_t x = DRIVE_SEEK_SEED;
+        seek_rng[0] = splitmix64(&x);
+        seek_rng[1] = splitmix64(&x);
+        for (int i = 0; i < DRIVE_BOOT_SEEK_DRAWS; i++) {
+            seek_rng_draw();
+        }
+        seek_rng_ready = 1;
+    }
+    uint64_t jitter = seek_rng_draw();
+    if (drive_trace()) {
+        // absolute sectors, as DuckStation's DUCKSTATION_CD_TRACE prints them
+        fprintf(stderr, "cd seek draw %u from %d to %d jitter %" PRIu64 "\n",
+                ++draws, from + DRIVE_PREGAP, to + DRIVE_PREGAP, jitter);
+    }
+    return jitter;
+}
+
 // Time for the head to reach `to` from `from`, including a spin-up and the
 // rest of a speed change.
 static uint64_t drive_seek_ticks(int from, int to) {
     uint64_t ticks = 0;
     if (!drive.motor_on) {
         ticks += DRIVE_CLOCK; // spin-up, 1 second
-        from = 0;
+        from = -DRIVE_PREGAP;
     }
     unsigned diff = (unsigned)(to > from ? to - from : from - to);
     uint64_t per_sector = drive_sector_ticks();
     int spt = drive_sectors_per_track(from);
-    int tjump = from >= spt ? from - spt : 0;
+    int tjump = drive_track_back(from, spt);
     if (from < to && diff <= (unsigned)spt) {
         // just ahead: the mech reads on until the sector comes up
         ticks += per_sector * (diff > 2 ? diff : 2);
@@ -454,9 +534,9 @@ static uint64_t drive_seek_ticks(int from, int to) {
         unsigned n = (unsigned)(to - tjump);
         ticks += per_sector * (n > 1 ? n : 1);
     } else if (diff < 7200) {
-        double minutes = (double)from / (75 * 60);
+        float minutes = (float)(from + DRIVE_PREGAP) / (75 * 60);
         minutes = minutes < 1 ? 1 : minutes > 72 ? 72 : minutes;
-        unsigned switch_point = (unsigned)(330.0f + (-63.1333f * logf((float)minutes)));
+        unsigned switch_point = (unsigned)(330.0f + (-63.1333f * logf(minutes)));
         ticks += (uint64_t)((diff < switch_point ? 0.05f : 0.1f) * DRIVE_CLOCK);
     } else {
         // sled seek: about 0.2 s, up to 0.9 s across the whole disc
@@ -467,8 +547,7 @@ static uint64_t drive_seek_ticks(int from, int to) {
                         variable * ((float)diff / max_lba) * (1.0f - log_weight);
         ticks += (uint64_t)(seconds * DRIVE_CLOCK);
     }
-    ticks += DRIVE_CLOCK * 3 / 4000; // 0.5-1 ms of servo settling
-    return ticks;
+    return ticks + drive_seek_jitter(from, to);
 }
 
 static uint64_t drive_now(void) { return Psyz_KernelNowUs(); }
@@ -1141,7 +1220,7 @@ static int drive_read_position(uint64_t now) {
 
 static void drive_hold(int lba, int subq, int offset, uint64_t at) {
     drive.hold_lba = lba;
-    drive.hold_subq = subq < 0 ? 0 : subq;
+    drive.hold_subq = subq < -DRIVE_PREGAP ? -DRIVE_PREGAP : subq;
     drive.hold_offset = offset;
     drive.hold_us = at;
 }
@@ -1151,7 +1230,7 @@ static void drive_hold(int lba, int subq, int offset, uint64_t at) {
 static int drive_hold_subq(uint64_t now) {
     int spt = drive_sectors_per_track(drive.hold_lba);
     int hold = drive.hold_lba + drive.hold_offset;
-    int tjump = hold >= spt ? hold - spt : 0;
+    int tjump = drive_track_back(hold, spt);
     int64_t passed =
         now > drive.hold_us
             ? (int64_t)((now - drive.hold_us) * drive_rate() / 1000000)
@@ -1232,7 +1311,7 @@ static void drive_stop_reading(uint64_t ack_us) {
     }
     if (data_read_active) {
         int spt = drive_sectors_per_track(lba);
-        drive_hold(lba, lba >= spt ? lba - spt : 0, 2, ack_us);
+        drive_hold(lba, drive_track_back(lba, spt), 2, ack_us);
     } else {
         drive_hold(lba, lba, 0, ack_us);
     }
@@ -1699,12 +1778,32 @@ static void drive_poll(unsigned ns) {
 }
 
 static unsigned poll_millicycles; // a poll's clock fraction, reset by CdInit
+static uint64_t poll_deadline_ns;  // real-time clock: where the polls have reached
 
+/* The poll is a wait, not work the host does in its own time: on a
+ * real-time clock it is spent too, or a game's retry count (4,000,000 polls
+ * in the movie player) runs out before the drive's first sector arrives. */
 void Psyz_CdPollDrive(void) {
     if (!drive_is_instant()) {
         poll_millicycles += ST_POLL_MILLICYCLES;
-        Psyz_SpendCycles(poll_millicycles / 1000);
-        poll_millicycles %= 1000;
+        if (Psyz_KernelOfflineClock()) {
+            Psyz_SpendCycles(poll_millicycles / 1000);
+            poll_millicycles %= 1000;
+        } else {
+            /* The host's own time for the poll counts towards it: a loop
+             * keeps one deadline (restarted when it is a millisecond
+             * stale, a new wait) and only waits while it is ahead. */
+            uint64_t ns = (uint64_t)poll_millicycles * 1000000 / DRIVE_CLOCK;
+            poll_millicycles -= (unsigned)(ns * DRIVE_CLOCK / 1000000);
+            uint64_t now_ns = drive_now() * 1000;
+            if (poll_deadline_ns + 1000000 < now_ns) {
+                poll_deadline_ns = now_ns;
+            }
+            poll_deadline_ns += ns;
+            while (drive_now() * 1000 < poll_deadline_ns) {
+                Psyz_KernelPoll();
+            }
+        }
     }
     Psyz_CdServiceDrive();
 }
@@ -1845,11 +1944,7 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive.sync_cb_due = 1;
     drive_update_status(drive_now());
     int ret = CD_command(com, param, result, arg3);
-    static int trace = -1;
-    if (trace < 0) {
-        trace = getenv("PSYZ_CD_TRACE") != NULL;
-    }
-    if (trace) {
+    if (drive_trace()) {
         // emulated time, command, Setloc position, completion, read timing
         fprintf(stderr,
                 "cd %" PRIu64 " %s pos %d ret %d done %" PRIu64
@@ -2025,8 +2120,8 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             uint64_t seek = drive_init_was_double
                                 ? (uint64_t)(0.7 * DRIVE_CLOCK)
                                 : 0;
-            if (drive_seek_from(ack) != 0) {
-                seek += drive_seek_ticks(drive_seek_from(ack), 0);
+            if (drive_seek_from(ack) != -DRIVE_PREGAP) {
+                seek += drive_seek_ticks(drive_seek_from(ack), -DRIVE_PREGAP);
             }
             ticks = seek > ticks ? seek : ticks;
         } else {
@@ -2043,7 +2138,7 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
         if (!drive_is_instant()) {
             drive.done_us = ack + ticks_us(ticks);
         }
-        drive_hold(0, 0, 0, drive.done_us);
+        drive_hold(-DRIVE_PREGAP, -DRIVE_PREGAP, 0, drive.done_us);
         drive.speed_us = drive.done_us;
         break;
     }
@@ -2191,7 +2286,6 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3) {
             return -1;
         }
         t = btoi(param[0]);
-        abs_sector;
         if (t == 0) {
             abs_sector = lead_out_sector();
         } else if (t < 1 || t > g_track_count || !g_tracks[t - 1].is_valid) {
