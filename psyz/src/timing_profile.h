@@ -177,13 +177,11 @@ enum {
     CLEAR_OTAG_R_CYCLES = 330,
     LOAD_IMAGE_CYCLES = 830,
     DRAW_SYNC_CYCLES = 246, // an idle GPU queue
-    /* DrawOTag's list DMA, which stalls the CPU: DuckStation's linked-list
-     * DMA takes 8 clocks to read a node's header and 5 more to set up a
-     * packet's block, and the RAM's 17 clocks per 16 words of it
-     * (dma.cpp, bus.h GetDMARAMTickCount). An empty 704-entry table takes
-     * 5.6k: on DuckStation a Grand Prix menu frame's DrawOTag returns 1.4k
-     * clocks after its call (one DMA slice) where the old fit, 61 a node
-     * of the empty head, took 43k. [model] */
+    /* The GPU's list DMA (gpu_timing.c), which stalls the CPU while it
+     * moves data: DuckStation's linked-list DMA takes 8 clocks to read a
+     * node's header and 5 more to set up a packet's block, and the RAM's
+     * 17 clocks per 16 words of it (dma.cpp, bus.h GetDMARAMTickCount), in
+     * 1000-clock slices, and moves on as the GPU takes the commands. [model] */
     DRAW_OTAG_NODE_CYCLES = 8,
     DRAW_OTAG_BLOCK_CYCLES = 5,
     /* AddPrim/AddPrims, SetSemiTrans/SetShadeTex, and the primitive setters

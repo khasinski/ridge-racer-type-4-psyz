@@ -8,6 +8,7 @@
 #include "../draw.h"
 #include "../internal.h"
 #include "gpudump.h"
+#include "gpu_timing.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -420,9 +421,11 @@ static int is_packed_command_stream(const u32* words, int count) {
 
 static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
+    Psyz_GpuTimingBegin();
     if (sizeof(u_long) == 4) {
         // fast path for 32-bit systems
         while (1) {
+            Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
             if (env->len > 0) {
                 DispatchPackets((u_long*)env->code, (int)env->len);
             }
@@ -434,6 +437,7 @@ static void GPU_Enqueue(u_long* packets) {
 #ifdef __EMSCRIPTEN__
         Draw_FlushBuffer();
 #endif
+        Psyz_GpuTimingEnd();
         return;
     }
     while (1) {
@@ -466,12 +470,14 @@ static void GPU_Enqueue(u_long* packets) {
                 for(u_long i=0;i<env->len;++i)Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]);
             }
         }
+        Psyz_GpuTimingNode(&queue_buf[queue_len], (int)env->len);
         queue_len += (int)env->len;
         if (isendprim(env)) {
             break;
         }
         env = (DR_ENV*)nextPrim(env);
     }
+    Psyz_GpuTimingEnd();
 }
 
 // Weird fix due to addque2 calling the callback with two u_long params

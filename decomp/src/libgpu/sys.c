@@ -133,6 +133,8 @@ int D_800B8A44 = 0;
 #include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 #define GPU_TIME(cycles) Psyz_SpendCycles(cycles)
+void Psyz_GpuTimingWait(void);
+void Psyz_GpuTimingImage(unsigned words);
 #define GPU_BIOS_MEMCPY_CYCLES(bytes) \
     (BIOS_COPY_CYCLES + BIOS_COPY_BYTE_CYCLES * (bytes))
 #define GPU_DMA_CYCLES(words) ((words) + ((words) + 15) / 16)
@@ -254,6 +256,11 @@ int DrawSync(int mode) {
         GPU_printf("DrawSync(%d)...\n", mode);
     }
     GPU_TIME(DRAW_SYNC_CYCLES);
+#ifdef __psyz
+    if (mode == 0) {
+        Psyz_GpuTimingWait(); // until the GPU has drawn what it was given
+    }
+#endif
     return D_800B8920->sync(mode);
 }
 
@@ -290,10 +297,12 @@ int ClearImage2(RECT* rect, u8 r, u8 g, u8 b) {
 
 int LoadImage(RECT* rect, u_long* p) {
     checkRECT("LoadImage", rect);
-    GPU_TIME(LOAD_IMAGE_CYCLES +
-             (rect->w > 0 && rect->h > 0
-                  ? GPU_DMA_CYCLES(((unsigned)rect->w * rect->h + 1) / 2)
-                  : 0));
+    GPU_TIME(LOAD_IMAGE_CYCLES);
+#ifdef __psyz
+    if (rect->w > 0 && rect->h > 0) {
+        Psyz_GpuTimingImage(((unsigned)rect->w * rect->h + 1) / 2);
+    }
+#endif
     return D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->dws,
                                (u_long)rect, sizeof(RECT), (u_long)p);
 }
@@ -367,37 +376,13 @@ void DrawPrim(void* p) {
     D_800B8920->cwb((u32*)&((P_TAG*)p)->r0, len);
 }
 
-#ifdef __psyz
-/* The list DMA DrawOTag starts stalls the CPU for each node it reads, as
- * DuckStation's DMA does: a header read (DRAW_OTAG_NODE_CYCLES), and for a
- * packet with data its block setup and the RAM's 17 clocks per 16 words
- * (DRAW_OTAG_BLOCK_CYCLES). The GPU's FIFO paces it, so on the console part
- * of it comes while the GPU draws; it is all spent here. */
-enum { DRAW_OTAG_NODES_MAX = 0x40000 };
-static unsigned DrawOTagListCycles(OT_TYPE* p) {
-    unsigned n = 0, cycles = 0;
-    while (p && n < DRAW_OTAG_NODES_MAX) {
-        unsigned words = getlen(p);
-        n++;
-        cycles += DRAW_OTAG_NODE_CYCLES;
-        if (words) {
-            cycles += DRAW_OTAG_BLOCK_CYCLES + words + (words + 15) / 16;
-        }
-        if (isendprim(p)) {
-            break;
-        }
-        p = (OT_TYPE*)nextPrim(p);
-    }
-    return cycles;
-}
-#endif
 
 void DrawOTag(OT_TYPE* p) {
     if (info.level >= 2) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
 #ifdef __psyz
-    GPU_TIME(DRAW_OTAG_CYCLES + DrawOTagListCycles(p));
+    GPU_TIME(DRAW_OTAG_CYCLES); // its list DMA: gpu_timing.c
 #else
     GPU_TIME(DRAW_OTAG_CYCLES);
 #endif

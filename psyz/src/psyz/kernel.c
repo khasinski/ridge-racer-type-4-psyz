@@ -269,6 +269,69 @@ unsigned long long Psyz_EmulatedClocks(void) {
            (uint64_t)AtomicLoad(&interrupt_debt);
 }
 
+uint64_t Psyz_KernelNowNs(void) {
+    if (!UsesAudioClock()) {
+        return KernelNowUs() * 1000;
+    }
+    return AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
+}
+
+/* CPU stalls at their times (Psyz_KernelStallAt): a small queue, the
+ * earliest posted as a timed callback. */
+enum { STALLS_MAX = 8192 };
+static struct {
+    uint64_t at_ns;
+    unsigned clocks;
+} stalls[STALLS_MAX];
+static unsigned stall_head, stall_len; // a ring, in time order
+static void StallFire(void);
+
+static void StallPost(void) {
+    if (stall_len) {
+        Psyz_KernelPostAt(stalls[stall_head].at_ns / 1000, StallFire);
+    }
+}
+
+static void StallFire(void) {
+    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + 999;
+    unsigned owed = 0;
+    while (stall_len && stalls[stall_head].at_ns <= now) {
+        owed += stalls[stall_head].clocks;
+        stall_head = (stall_head + 1) % STALLS_MAX;
+        stall_len--;
+    }
+    if (owed) {
+        AtomicAdd(&interrupt_debt, (long)owed);
+    }
+    StallPost();
+}
+
+void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks) {
+    if (!UsesAudioClock() || !clocks) {
+        return;
+    }
+    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
+    if (at_ns <= now) {
+        AtomicAdd(&interrupt_debt, (long)clocks);
+        return;
+    }
+    if (stall_len) {
+        unsigned last = (stall_head + stall_len - 1) % STALLS_MAX;
+        if (stalls[last].at_ns >= at_ns || stall_len == STALLS_MAX) {
+            // out of order or full: fold into the latest (it comes later)
+            stalls[last].clocks += clocks;
+            return;
+        }
+    }
+    unsigned slot = (stall_head + stall_len) % STALLS_MAX;
+    stalls[slot].at_ns = at_ns;
+    stalls[slot].clocks = clocks;
+    stall_len++;
+    if (stall_len == 1) {
+        StallPost();
+    }
+}
+
 /* CPU work: the interrupts that come meanwhile (and those owed by native
  * work before it) make it last longer. Inside a handler it lengthens the
  * handler. Offline clock only: on a real-time clock the native work takes

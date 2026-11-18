@@ -29,6 +29,7 @@ set(PSYZ_SOURCES
     src/psyz/dma.c
     src/psyz/libapi.c
     src/psyz/kernel.c
+    src/psyz/gpu_timing.c
     src/psyz/libetc.c
     src/psyz/libpad.c
     src/psyz/pad.c

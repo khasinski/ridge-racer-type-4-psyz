@@ -35,6 +35,7 @@ void psyz_log(unsigned level, const char* file, unsigned line, const char* func,
     (void)fmt;
 }
 long GetVideoMode(void) { return 0; }
+int Psyz_CardChainInstalled(void) { return 0; }
 static unsigned calls;
 static long tick(void) {
     calls++;

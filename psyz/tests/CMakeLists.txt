@@ -15,6 +15,7 @@ set(PSYZ_TEST_SOURCES
     test_libsnd.c
     test_mdec.c
     test_link.c
+    test_gpu_timing.c
     frontbuffer_psyz.c
 )
 

@@ -141,6 +141,12 @@ int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
 // time (the rest is spent elsewhere, e.g. inside a wait that counts it).
 // Offline clock only.
 void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged);
+// The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
+// thread from then on, like a handler's time. Offline clock only.
+void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);
+// The offline clock's position in ns (the time spent but not yet mixed
+// included; not the handlers' time owed).
+uint64_t Psyz_KernelNowNs(void);
 // PSYZ_PAD_TRACE: clocks from the latest such exception to at_ns, and
 // its handlers' clocks; 0 when there was none before.
 int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
