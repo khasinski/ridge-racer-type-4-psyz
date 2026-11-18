@@ -363,21 +363,27 @@ void DrawPrim(void* p) {
 }
 
 #ifdef __psyz
-/* The list DMA DrawOTag starts walks the ordering table: until the first
- * packet with data it only reads headers, and the CPU waits for it
- * (DRAW_OTAG_NODE_CYCLES a node); from there the GPU's FIFO paces it and
- * the CPU runs on. */
-enum { DRAW_OTAG_NODES_MAX = 0x10000 };
-static unsigned DrawOTagEmptyNodes(OT_TYPE* p) {
-    unsigned n = 0;
-    while (p && n < DRAW_OTAG_NODES_MAX && getlen(p) == 0) {
+/* The list DMA DrawOTag starts stalls the CPU for each node it reads, as
+ * DuckStation's DMA does: a header read (DRAW_OTAG_NODE_CYCLES), and for a
+ * packet with data its block setup and the RAM's 17 clocks per 16 words
+ * (DRAW_OTAG_BLOCK_CYCLES). The GPU's FIFO paces it, so on the console part
+ * of it comes while the GPU draws; it is all spent here. */
+enum { DRAW_OTAG_NODES_MAX = 0x40000 };
+static unsigned DrawOTagListCycles(OT_TYPE* p) {
+    unsigned n = 0, cycles = 0;
+    while (p && n < DRAW_OTAG_NODES_MAX) {
+        unsigned words = getlen(p);
         n++;
+        cycles += DRAW_OTAG_NODE_CYCLES;
+        if (words) {
+            cycles += DRAW_OTAG_BLOCK_CYCLES + words + (words + 15) / 16;
+        }
         if (isendprim(p)) {
             break;
         }
         p = (OT_TYPE*)nextPrim(p);
     }
-    return n;
+    return cycles;
 }
 #endif
 
@@ -386,7 +392,7 @@ void DrawOTag(OT_TYPE* p) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
 #ifdef __psyz
-    GPU_TIME(DRAW_OTAG_CYCLES + DRAW_OTAG_NODE_CYCLES * DrawOTagEmptyNodes(p));
+    GPU_TIME(DRAW_OTAG_CYCLES + DrawOTagListCycles(p));
 #else
     GPU_TIME(DRAW_OTAG_CYCLES);
 #endif

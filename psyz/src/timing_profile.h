@@ -30,6 +30,10 @@
  *            land on DuckStation's fields, in runs without breakpoints.
  *   [model]  taken from DuckStation's device model (its source), not
  *            measured.
+ *   [exc]    exception-to-return clocks of an interrupt on DuckStation's
+ *            recompiler: stubs at the exception vector and at the BIOS's
+ *            returns (rfe) log the tick (the game's tools/port/ds_frames.py
+ *            DSF_EXC=1), less the stubs' own clocks; the median.
  *   [unrecorded] no measurement is recorded for it (a poll or spin step
  *            whose exact length has not decided a field so far).
  *
@@ -136,11 +140,15 @@ enum {
     CLEAR_OTAG_R_CYCLES = 330,
     LOAD_IMAGE_CYCLES = 830,
     DRAW_SYNC_CYCLES = 246, // an idle GPU queue
-    /* DrawOTag's list DMA over the table's empty head, which the CPU waits
-     * for: 43.4k for an empty 704-entry table (a movie frame). [call]
-     * 50d481f; the title after the opening movie then starts on
-     * DuckStation's field [field]. */
-    DRAW_OTAG_NODE_CYCLES = 61,
+    /* DrawOTag's list DMA, which stalls the CPU: DuckStation's linked-list
+     * DMA takes 8 clocks to read a node's header and 5 more to set up a
+     * packet's block, and the RAM's 17 clocks per 16 words of it
+     * (dma.cpp, bus.h GetDMARAMTickCount). An empty 704-entry table takes
+     * 5.6k: on DuckStation a Grand Prix menu frame's DrawOTag returns 1.4k
+     * clocks after its call (one DMA slice) where the old fit, 61 a node
+     * of the empty head, took 43k. [model] */
+    DRAW_OTAG_NODE_CYCLES = 8,
+    DRAW_OTAG_BLOCK_CYCLES = 5,
     /* AddPrim/AddPrims, SetSemiTrans/SetShadeTex, and the primitive setters
      * (SetPolyF3 .. SetLineG4, the same few stores as SetSprt). [call]
      * 686859c */
@@ -229,6 +237,17 @@ enum {
      * DuckStation's recompiler [mark] (DUCKSTATION_CD_TRACE, a stub at each
      * function entry writing root counter 2 before SsStart). */
     CD_CW_ISSUE_CYCLES = 480,
+    /* The drive's interrupts as exceptions, from the exception to its
+     * return: a data sector's INT1 (LIBCD's handler, CdRead's callback and
+     * its CdGetSector), a command's acknowledge and a second response.
+     * They hide a vblank that comes meanwhile from the BIOS chains (libapi.c
+     * Psyz_VSyncBlank). A sector's is handler time; an acknowledge's and a
+     * completion's are spent by CD_cw and the waits (CD_CW_ACK_CYCLES,
+     * CD_DONE_IRQ_CYCLES). [exc] the Grand Prix menus' loads (stubs at the
+     * exception vector and its returns, less their own clocks) */
+    CD_DATA_IRQ_CLOCKS = 4100,
+    CD_ACK_IRQ_CLOCKS = 2750,
+    CD_DONE_IRQ_CLOCKS = 2750,
     CD_CW_ACK_CYCLES = 2620,
     CD_DONE_IRQ_CYCLES = 2120,
     CD_INIT_CYCLES = 4680,

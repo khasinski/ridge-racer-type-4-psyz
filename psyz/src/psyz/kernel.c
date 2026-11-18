@@ -359,9 +359,23 @@ static void DeliverLocked(unsigned int desc, unsigned int spec) {
  * tested for it and before that last read is handled and acknowledged
  * there: the chain handlers (libpad's exchange, the BIOS card driver's
  * turn) never see that blank (Psyz_KernelBlankInDispatch). */
-static uint64_t dispatch_ns;
-static unsigned dispatch_cycles;
+enum { DISPATCH_RING = 8 };
+static struct {
+    uint64_t ns;
+    unsigned cycles;
+} dispatches[DISPATCH_RING];
+static unsigned dispatch_next;
 static int dispatch_seen;
+
+static void RecordDispatch(uint64_t at_ns, unsigned cycles) {
+    if (!UsesAudioClock()) {
+        return;
+    }
+    dispatches[dispatch_next].ns = at_ns;
+    dispatches[dispatch_next].cycles = cycles;
+    dispatch_next = (dispatch_next + 1) % DISPATCH_RING;
+    dispatch_seen = 1;
+}
 
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
@@ -381,32 +395,62 @@ static void ServiceLine(int line, uint64_t at_ns) {
     if (irq_callbacks[line]) {
         irq_callbacks[line]();
     }
-    if (line != IRQ_VBLANK && UsesAudioClock()) {
-        dispatch_ns = at_ns;
-        dispatch_cycles = (unsigned)(AtomicLoad(&interrupt_debt) - debt);
-        dispatch_seen = 1;
+    if (line != IRQ_VBLANK) {
+        RecordDispatch(at_ns, (unsigned)(AtomicLoad(&interrupt_debt) - debt));
     }
+}
+
+void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged) {
+    if (!UsesAudioClock()) {
+        return;
+    }
+    Psyz_KernelInterruptCycles(charged);
+    RecordDispatch(at_ns, cycles);
+}
+
+// The latest recorded dispatch that began by at_ns.
+static int LatestDispatch(uint64_t at_ns) {
+    int best = -1;
+    for (int i = 0; i < DISPATCH_RING; i++) {
+        if (dispatches[i].cycles && dispatches[i].ns <= at_ns &&
+            (best < 0 || dispatches[i].ns > dispatches[best].ns)) {
+            best = i;
+        }
+    }
+    return best;
 }
 
 int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
                             unsigned* cycles) {
-    if (!dispatch_seen || at_ns < dispatch_ns) {
+    int i = dispatch_seen ? LatestDispatch(at_ns) : -1;
+    if (i < 0) {
         return 0;
     }
-    uint64_t clocks = (at_ns - dispatch_ns) * SYSTEM_CLOCK_HZ / 1000000000u;
+    uint64_t clocks =
+        (at_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
     *since_clocks = clocks > UINT32_MAX ? UINT32_MAX : (unsigned)clocks;
-    *cycles = dispatch_cycles;
+    *cycles = dispatches[i].cycles;
     return 1;
 }
 
 int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
                                unsigned exit_clocks) {
-    if (!dispatch_seen || !UsesAudioClock() || blank_ns < dispatch_ns ||
-        dispatch_cycles <= exit_clocks) {
+    if (!dispatch_seen || !UsesAudioClock()) {
         return 0;
     }
-    uint64_t clocks = (blank_ns - dispatch_ns) * SYSTEM_CLOCK_HZ / 1000000000u;
-    return clocks > test_clocks && clocks <= dispatch_cycles - exit_clocks;
+    for (int i = 0; i < DISPATCH_RING; i++) {
+        if (dispatches[i].ns > blank_ns ||
+            dispatches[i].cycles <= exit_clocks) {
+            continue;
+        }
+        uint64_t clocks =
+            (blank_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
+        if (clocks > test_clocks &&
+            clocks <= dispatches[i].cycles - exit_clocks) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void DrainPosted(void) {

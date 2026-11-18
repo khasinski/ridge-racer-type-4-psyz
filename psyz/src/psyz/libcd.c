@@ -1695,9 +1695,23 @@ static void start_data_read(void) {
     CD_status |= CdlStatRead;
 }
 
+static uint64_t command_ack_us; // CD_cw
+
+// The drive's interrupt for a sector, a command's acknowledge or its
+// completion: the exception's window for the vblanks it hides from the
+// BIOS chains, and the handler time not spent elsewhere (timing_profile.h).
+static void drive_irq(uint64_t at_us, unsigned cycles, unsigned charged) {
+    if (!drive_is_instant()) {
+        Psyz_KernelDispatch(at_us * 1000, cycles, charged);
+    }
+}
+
 static void deliver_data_sector(void) {
     int sector = data_sector_number;
     drive_delivered++;
+    // its INT1: drive_start_us + n periods, rounded up as drive_schedule
+    uint64_t irq_us = drive_start_us +
+        (drive_delivered * 1000000 + drive_rate() - 1) / drive_rate();
     if (read_data_sector(sector) < 0) {
         data_read_active = 0;
         CD_status &= ~CdlStatRead;
@@ -1707,7 +1721,11 @@ static void deliver_data_sector(void) {
         return;
     }
     data_sector_number = sector + 1;
-    if (is_played_audio_sector() || !CD_cbready) {
+    if (is_played_audio_sector()) {
+        return;
+    }
+    drive_irq(irq_us, CD_DATA_IRQ_CLOCKS, CD_DATA_IRQ_CLOCKS);
+    if (!CD_cbready) {
         return;
     }
     u_char result[8] = {(u_char)CD_status};
@@ -1732,6 +1750,9 @@ static void service_sync_callback(void) {
         return;
     }
     drive.sync_cb_due = 0;
+    if (drive.done_us != command_ack_us) {
+        drive_irq(drive.done_us, CD_DONE_IRQ_CLOCKS, 0); // a second response
+    }
     if (CD_cbsync) {
         u_char result[8];
         memcpy(result, last_result, sizeof(result));
@@ -1979,6 +2000,7 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     drive_schedule();
     uint64_t ack = command_ack_us;
+    drive_irq(ack, CD_ACK_IRQ_CLOCKS, 0); // CD_CW_ACK_CYCLES has its time
     Psyz_KernelUnlockInterrupts();
     if (!arg3) {
         drive_wait_until(ack);
