@@ -40,6 +40,7 @@ static long last_chan;
  * same at run time. Formatting a card makes it formatted. There is no
  * multi-tap, so its extra slots time out like an empty port. */
 static int card_slot_state[2] = {-1, -1};
+static int card_new[2] = {1, 1}; // the cards' "new card" FLAG bit (below)
 
 static int card_env_lists(const char* name, int slot) {
     const char* list = getenv(name);
@@ -70,6 +71,9 @@ int Psyz_CardSlotState(int port) {
 
 void Psyz_CardSetSlotState(int port, int state) {
     if (port >= 0 && port <= 1) {
+        if (state != PSYZ_CARD_NONE && state != Psyz_CardSlotState(port)) {
+            card_new[port] = 1; // another card: its FLAG says new
+        }
         card_slot_state[port] = state;
     }
 }
@@ -128,7 +132,19 @@ typedef struct {
     int parse;     // the directory is parsed a vblank after the last read
     int sector;    // the last transfer moves a frame (CARD_SECTOR_CLOCKS)
     int answering; // that frame is still on the wire
+    int kind;      // CARD_KIND_*: an info, a write
 } CardRequest;
+
+/* A card's FLAG byte has a "new card" bit, set when the card is powered or
+ * inserted and cleared by its first write: _card_info on such a card
+ * answers EvSpNEW, and the game then clears it (_card_clear writes frame
+ * 0x3F) and loads the directory. _bu_init writes 0x3F after reading a
+ * formatted card's directory; an unformatted card keeps the bit
+ * (DuckStation's FLAG, DUCKSTATION_CARD_TRACE: a blank card's first command
+ * sends 0x08, a write clears it; an unformatted card is written first by the
+ * game's _card_clear). */
+enum { CARD_KIND_INFO = 1, CARD_KIND_WRITE = 2 };
+static int card_next_kind; // the kind of the next request (card_request_sectors)
 
 static struct {
     int running;      // StartCARD .. StopCARD
@@ -137,9 +153,10 @@ static struct {
     int parse_port;   // a directory read, finished at the next vblank
     int raw_port;     // a raw command waiting for its port (-1: none)
     int raw_state;    // 0 none, 1 waiting, 2 transferred, 3 answered
+    int raw_late;     // a new card answers a vblank later
     uint64_t last_vblank_us;
     CardRequest req[2];
-} card_drv = {0, 0, -1, -1, -1, 0, 0, {{0}}};
+} card_drv = {0, 0, -1, -1, -1, 0, 0, 0, {{0}}};
 
 // PSYZ_CARD_TRACE=1 logs the driver's work at each vblank.
 static int card_trace(void) {
@@ -164,12 +181,18 @@ static unsigned card_result(const CardRequest* r) {
     int state = card_chan_state(r->chan);
     return state == PSYZ_CARD_NONE                    ? EvSpTIMOUT
            : r->load && state == PSYZ_CARD_UNFORMATTED ? EvSpNEW
+           : (r->kind & CARD_KIND_INFO) && card_new[(r->chan >> 4) & 1] ? EvSpNEW
                                                        : EvSpIOE;
 }
 
 static void card_finish(int port, unsigned spec) {
     CardRequest* r = &card_drv.req[port];
     int raise = r->raise;
+    int state = card_chan_state(r->chan);
+    if ((r->kind & CARD_KIND_WRITE) && state != PSYZ_CARD_NONE &&
+        !(r->load && state == PSYZ_CARD_UNFORMATTED)) {
+        card_new[port] = 0;
+    }
     r->transfers = 0;
     r->answering = 0;
     Psyz_KernelInterruptCycles(CARD_FINISH_ISR_CLOCKS);
@@ -199,7 +222,7 @@ static void card_sector_done1(void) { card_sector_done(1); }
  * handler takes the SIO there and libpad makes no exchange (DuckStation:
  * that vblank's exception is 4.9k clocks, libpad's flag stays clear). */
 int Psyz_CardRawEndsAt(int turn) {
-    return card_drv.running && turn && card_drv.raw_state == 2;
+    return card_drv.running && turn && card_drv.raw_state == 2 && !card_drv.raw_late;
 }
 
 void Psyz_CardVBlank(int turn) {
@@ -211,7 +234,14 @@ void Psyz_CardVBlank(int turn) {
         return;
     }
     if (card_drv.raw_state == 2) {
-        card_drv.raw_state = 3;
+        // a card whose FLAG says new answers the raw access a vblank later
+        // (DuckStation: an unformatted card's probe before _card_clear,
+        // fields 270-273, against 280-282 after it)
+        if (card_drv.raw_late) {
+            card_drv.raw_late = 0;
+        } else {
+            card_drv.raw_state = 3;
+        }
     }
     if (card_drv.parse_port >= 0) {
         // the parse's vblank is the other port's turn too (DuckStation
@@ -239,6 +269,9 @@ void Psyz_CardVBlank(int turn) {
     }
     if (card_drv.raw_state == 1 && card_drv.raw_port == port) {
         card_drv.raw_state = 2;
+        card_drv.raw_late = card_drv.raw_port >= 0 && card_drv.raw_port < 2 &&
+                            card_new[card_drv.raw_port] &&
+                            Psyz_CardSlotState(card_drv.raw_port) != PSYZ_CARD_NONE;
         return;
     }
     CardRequest* r = &card_drv.req[port];
@@ -293,8 +326,13 @@ static long card_request_sectors(long chan, int transfers, int raise, int load,
         return 0;
     }
     last_chan = chan;
+    int kind = card_next_kind;
+    card_next_kind = 0;
     if (card_is_instant()) {
-        CardRequest r = {chan, 0, raise, load, 0, 0, 0};
+        CardRequest r = {chan, 0, raise, load, 0, 0, 0, kind};
+        if ((kind & CARD_KIND_WRITE) && card_chan_state(chan) == PSYZ_CARD_FORMATTED) {
+            card_new[(chan >> 4) & 1] = 0;
+        }
         if (raise == CARD_RAISE_SW) {
             Psyz_KernelRaise(SwCARD, card_result(&r));
         } else if (raise) {
@@ -313,6 +351,7 @@ static long card_request_sectors(long chan, int transfers, int raise, int load,
     r->parse = parse;
     r->sector = sector;
     r->answering = 0;
+    r->kind = kind;
     return 1;
 }
 
@@ -326,7 +365,10 @@ static void card_wait(int port) {
     }
 }
 
-long _card_info(long chan) { return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0); }
+long _card_info(long chan) {
+    card_next_kind = CARD_KIND_INFO;
+    return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
+}
 
 long _card_load(long chan) {
     return card_request(chan, CARD_LOAD_TRANSFERS, CARD_RAISE_BOTH, 1, 1);
@@ -342,6 +384,7 @@ void _bu_init(void) {
         return;
     }
     for (int port = 0; port < 2; port++) {
+        card_next_kind = CARD_KIND_WRITE; // frame 0x3F after the directory
         if (card_request((long)port << 4, CARD_BU_INIT_TRANSFERS,
                          CARD_RAISE_NONE, 1, 0)) {
             card_wait(port);
@@ -386,11 +429,16 @@ int Psyz_CardRawSync(int wait) {
 void _new_card(void) {}
 
 static void card_spend_fields(unsigned fields);
-enum { CARD_FORMAT_FIELDS = 149 };
 
-// A card is a host directory; formatting empties it, taking the BIOS's time
-// to write the directory (149 fields on DuckStation, PAL). There is no
-// multi-tap.
+/* Formatting writes and reads back frames 1..0x23 (directory and broken
+ * frame list) and then frame 0, a frame per turn of the port: 72 transfers
+ * from the port's first turn after the call, synchronously (DuckStation,
+ * DUCKSTATION_CARD_TRACE: frames written at 3048..3189 and read at
+ * 3050..3191 for a call at 3046). Without a running driver it takes their
+ * fields on the clock. The card's directory becomes empty. There is no
+ * multi-tap. */
+enum { CARD_FORMAT_TRANSFERS = 2 * 36 };
+
 long _card_format(long chan) {
     char fs[] = "bu00:";
     if (!validate_chan(chan) || (chan & 15)) {
@@ -400,11 +448,21 @@ long _card_format(long chan) {
         return 0;
     }
     fs[2] = (char)('0' + (chan >> 4));
-    card_spend_fields(CARD_FORMAT_FIELDS);
-    if (!format(fs)) {
+    if (!card_is_instant()) {
+        card_next_kind = CARD_KIND_WRITE;
+        if (card_drv.running &&
+            card_request_sectors(chan, CARD_FORMAT_TRANSFERS, CARD_RAISE_NONE, 0, 0, 1)) {
+            card_wait((int)(chan >> 4));
+        } else {
+            card_next_kind = 0;
+            card_spend_fields(CARD_FORMAT_TRANSFERS * 2); // two fields a transfer
+        }
+    }
+    if (Psyz_CardSlotState((int)(chan >> 4)) == PSYZ_CARD_NONE || !format(fs)) {
         return 0;
     }
     card_slot_state[chan >> 4] = PSYZ_CARD_FORMATTED;
+    card_new[chan >> 4] = 0;
     return 1;
 }
 
@@ -437,6 +495,7 @@ static void card_driver_reset(int running) {
     card_drv.parse_port = -1;
     card_drv.raw_port = -1;
     card_drv.raw_state = 0;
+    card_drv.raw_late = 0;
     card_drv.last_vblank_us = Psyz_KernelNowUs();
 }
 
@@ -519,6 +578,7 @@ long _card_write(long chan, long block, unsigned char* buf) {
     LOG_ONCE("raw sectors are not emulated, only the completion event");
     (void)block;
     (void)buf;
+    card_next_kind = CARD_KIND_WRITE;
     return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
 }
 
@@ -592,8 +652,9 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
     }
     int transfers = card_file_transfers(bytes, write);
     if (card_drv.running && validate_chan(chan) &&
-        card_request_sectors(chan, transfers, async ? CARD_RAISE_SW : CARD_RAISE_NONE,
-                             0, 0, 1)) {
+        (card_next_kind = write ? CARD_KIND_WRITE : 0,
+         card_request_sectors(chan, transfers, async ? CARD_RAISE_SW : CARD_RAISE_NONE,
+                              0, 0, 1))) {
         if (!async) {
             card_wait((int)(chan >> 4));
         }

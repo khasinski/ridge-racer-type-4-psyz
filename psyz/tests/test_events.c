@@ -1156,6 +1156,29 @@ ZTEST(events, card_load_with_card_raises_ioe) {
     zexpect_s32_eq(CARD_IOE, card_poll(card_sw, 180));
 }
 
+// A card inserted after _bu_init has its "new card" FLAG bit set: _card_info
+// answers EvSpNEW until a write (_card_clear writes frame 0x3F) clears it.
+ZTEST(events, inserted_card_is_new_until_written) {
+    card_start();
+    if (card_info(CARD_SLOT_1) != CARD_IOE) {
+        zskip("slot 1 has no card ready");
+    }
+    card_poll(card_hw, 0);
+    Psyz_CardSetSlotState(0, PSYZ_CARD_NONE);
+    zexpect_s32_eq(CARD_TIMOUT, card_info(CARD_SLOT_1));
+    card_poll(card_hw, 0);
+    Psyz_CardSetSlotState(0, PSYZ_CARD_FORMATTED);
+    zexpect_s32_eq(CARD_NEW, card_info(CARD_SLOT_1));
+    card_poll(card_hw, 0);
+    zexpect_s32_eq(CARD_NEW, card_info(CARD_SLOT_1));
+    card_poll(card_hw, 0);
+    zassert_s32_eq(1, _card_clear(CARD_SLOT_1));
+    zexpect_s32_eq(CARD_IOE, card_poll(card_sw, 180));
+    card_poll(card_hw, 0);
+    zexpect_s32_eq(CARD_IOE, card_info(CARD_SLOT_1));
+    card_poll(card_hw, 0);
+}
+
 static int card_vblanks_until_event(const long* events) {
     for (int n = 0; n <= 8; n++) {
         for (int i = 0; i < CARD_SPECS; i++) {
