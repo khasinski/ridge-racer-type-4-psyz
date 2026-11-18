@@ -132,9 +132,6 @@ unsigned Psyz_KernelTakeInterruptCycles(void);
 // takes that vblank and the chain handlers miss it. Offline clock only.
 int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
                                unsigned exit_clocks);
-// The same, for a blank at most `until` clocks after the exception began.
-int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
-                                   unsigned exit_clocks, unsigned until);
 // An interrupt the kernel does not dispatch itself (a device model's: CD,
 // DMA) began at at_ns and its exception takes `cycles` (the window of
 // Psyz_KernelBlankInDispatch); `charged` of them become interrupt handler

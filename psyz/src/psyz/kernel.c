@@ -516,12 +516,6 @@ int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
 
 int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
                                unsigned exit_clocks) {
-    return Psyz_KernelBlankInDispatchUpTo(blank_ns, test_clocks, exit_clocks,
-                                          UINT32_MAX);
-}
-
-int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
-                                   unsigned exit_clocks, unsigned until) {
     if (!dispatch_seen || !UsesAudioClock()) {
         return 0;
     }
@@ -532,8 +526,7 @@ int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
         }
         uint64_t clocks =
             (blank_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
-        if (clocks > test_clocks &&
-            clocks <= dispatches[i].cycles - exit_clocks && clocks <= until) {
+        if (clocks > test_clocks && clocks <= dispatches[i].cycles - exit_clocks) {
             return 1;
         }
     }

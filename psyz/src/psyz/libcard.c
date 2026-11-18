@@ -214,8 +214,11 @@ void Psyz_CardVBlank(int turn) {
         card_drv.raw_state = 3;
     }
     if (card_drv.parse_port >= 0) {
+        // the parse's vblank is the other port's turn too (DuckStation
+        // selects port 0 again two turns after its last read)
         int port = card_drv.parse_port;
         card_drv.parse_port = -1;
+        card_drv.port ^= 1;
         card_finish(port, card_result(&card_drv.req[port]));
         return;
     }

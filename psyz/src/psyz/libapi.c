@@ -121,9 +121,8 @@ void Psyz_VSyncBlank(void) {
         !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
                                     LIBETC_DISPATCH_EXIT_CLOCKS);
     int card_turn =
-        !Psyz_KernelBlankInDispatchUpTo(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
-                                        LIBETC_DISPATCH_EXIT_CLOCKS,
-                                        BIOS_CHAIN_CARD_UNTIL_CLOCKS);
+        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
+                                    LIBETC_DISPATCH_EXIT_CLOCKS);
     int raw_end = Psyz_CardRawEndsAt(card_turn);
     if (raw_end) {
         pad_exchange = 0;

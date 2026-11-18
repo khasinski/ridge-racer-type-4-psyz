@@ -128,16 +128,13 @@ enum {
      * to _padIntPad) libpad misses a blank 1056 to 2607 clocks after a
      * sequencer interrupt that does not tick, or from 1056 clocks after one
      * that does to 62 clocks after the tick returns; the card driver's
-     * handler misses those from 1197 clocks on. [field] VS menus, 20000
-     * attract fields */
+     * handler misses those from 1197 clocks on, through a ticking one's
+     * tick too (blanks 3.2k and 7.4k into one, the opening's port vsyncs
+     * 397 and 431: no vblank exception follows and the driver's port
+     * alternation skips that turn). [field] VS menus, 20000 attract
+     * fields */
     BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
     BIOS_CHAIN_CARD_TEST_CLOCKS = 1197,
-    /* ... but a blank later than this into a ticking sequencer interrupt
-     * (the tick runs inside it) still gets its card turn: the driver's
-     * alternation on DuckStation goes on through a blank 3.1k clocks into
-     * one (the boot's card polling, field 397) and shifts at one 7.4k into
-     * it (431); 2600 is where a non-ticking one's window ends. [field] */
-    BIOS_CHAIN_CARD_UNTIL_CLOCKS = 2600,
     LIBETC_DISPATCH_EXIT_CLOCKS = 243,
 };
 
