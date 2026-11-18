@@ -276,6 +276,23 @@ uint64_t Psyz_KernelNowNs(void) {
     return AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
 }
 
+void Psyz_KernelWaitUntilNs(uint64_t at_ns) {
+    if (!UsesAudioClock()) {
+        return;
+    }
+    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns +
+                   (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u / SYSTEM_CLOCK_HZ;
+    if (at_ns <= now) {
+        return;
+    }
+    if (OwnsKernel()) { // in a handler: it lengthens the handler
+        Psyz_KernelInterruptCycles(
+            (unsigned)((at_ns - now) * SYSTEM_CLOCK_HZ / 1000000000u));
+        return;
+    }
+    Psyz_SpendTime((unsigned)(at_ns - now));
+}
+
 /* CPU stalls at their times (Psyz_KernelStallAt): a small queue, the
  * earliest posted as a timed callback. */
 enum { STALLS_MAX = 8192 };

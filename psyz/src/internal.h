@@ -147,6 +147,10 @@ void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);
 // The offline clock's position in ns (the time spent but not yet mixed
 // included; not the handlers' time owed).
 uint64_t Psyz_KernelNowNs(void);
+// A busy wait until at_ns on the CPU's clock (the handlers' time owed
+// counted): interrupts meanwhile fall within it. In a handler it
+// lengthens the handler. Offline clock only.
+void Psyz_KernelWaitUntilNs(uint64_t at_ns);
 // PSYZ_PAD_TRACE: clocks from the latest such exception to at_ns, and
 // its handlers' clocks; 0 when there was none before.
 int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,

@@ -16,6 +16,11 @@ uint64_t Psyz_GpuTimingIdleNs(void);
 void Psyz_GpuTimingReset(void);
 // DrawSync(0): the CPU waits until then.
 void Psyz_GpuTimingWait(void);
+// When a list given at now_ns starts (DrawOTag), with the previous
+// transfer done at dma_free_ns and the GPU busy until gpu_end_ns; *cpu_waits
+// is set when the CPU waits for that (an idle queue, the GPU still busy).
+uint64_t Psyz_GpuListStartNs(uint64_t now_ns, uint64_t dma_free_ns,
+                             uint64_t gpu_end_ns, int* cpu_waits);
 // GPU ticks of GP0 commands (DuckStation's costs), updating the draw state.
 uint64_t Psyz_GpuCommandTicks(const u_long* words, int n);
 #endif

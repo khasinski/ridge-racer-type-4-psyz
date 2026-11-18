@@ -16,13 +16,15 @@
  *   clocks a node header, 5 more and the RAM's 17 per 16 words a packet,
  *   in 1000-clock slices with 100 clocks for the CPU between them.
  * - The next transfer (a DrawOTag queued behind another) starts when the
- *   previous one is done; DrawSync(0) returns when the GPU is idle.
+ *   previous one is done; with none in progress libgpu waits for the GPU
+ *   to go idle before it starts one, as DrawSync(0) does.
  *
  * The CPU's stalls are owed at the times the DMA makes them
  * (Psyz_KernelStallAt), so a frame whose GPU is still busy with the work
  * before its DrawOTag loses the DMA's time later, while the GPU takes the
  * list, as on the console. Offline clock only. */
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <psyz/system.h>
 #include "../internal.h"
@@ -298,12 +300,50 @@ static void dma_stall(unsigned clocks) {
 
 static int timing_on(void) { return Psyz_KernelOfflineClock(); }
 
+/* PSYZ_GPU_TRACE=1: each list's start, size and modelled end on stderr. */
+static int gpu_trace(void) {
+    static int t = -1;
+    if (t < 0) {
+        const char* v = getenv("PSYZ_GPU_TRACE");
+        t = v && *v == '1';
+    }
+    return t;
+}
+static unsigned list_nodes, list_words;
+static uint64_t list_ticks;
+
+uint64_t Psyz_GpuListStartNs(uint64_t now_ns, uint64_t dma_free_ns,
+                             uint64_t gpu_end_ns, int* cpu_waits) {
+    // libgpu starts a transfer once the GPU is idle (GPUSTAT bit 26), so
+    // the CPU waits for the drawing before it (DuckStation: a movie
+    // frame's DrawOTag returns 43k clocks after its call, its PutDrawEnv's
+    // fill still drawing; at boot 1.4k, the fill done). While the transfer
+    // before is still in progress libgpu queues this one instead and its
+    // DMA callback starts it later: only an idle queue waits.
+    *cpu_waits = 0;
+    if (dma_free_ns > now_ns)
+        return gpu_end_ns > dma_free_ns ? gpu_end_ns : dma_free_ns;
+    if (gpu_end_ns > now_ns) {
+        *cpu_waits = 1;
+        return gpu_end_ns;
+    }
+    return now_ns;
+}
+
 void Psyz_GpuTimingBegin(void) {
     if (!timing_on()) return;
     uint64_t now = now_ns();
     g.active = 1;
-    g.dma_ns = now > g.dma_free_ns ? now : g.dma_free_ns;
+    int cpu_waits;
+    g.dma_ns = Psyz_GpuListStartNs(now, g.dma_free_ns, g.gpu_end_ns, &cpu_waits);
     g.slice = 0;
+    if (cpu_waits) Psyz_KernelWaitUntilNs(g.dma_ns);
+    list_nodes = list_words = 0;
+    list_ticks = 0;
+    if (gpu_trace())
+        fprintf(stderr, "gpu: list at %llu dma %llu gpu_end %llu\n",
+                (unsigned long long)now, (unsigned long long)g.dma_ns,
+                (unsigned long long)g.gpu_end_ns);
 }
 
 void Psyz_GpuTimingNode(const u_long* words, int n) {
@@ -319,6 +359,9 @@ void Psyz_GpuTimingNode(const u_long* words, int n) {
     }
     dma_stall(DRAW_OTAG_BLOCK_CYCLES + (unsigned)n + ((unsigned)n + 15) / 16);
     uint64_t ticks = Psyz_GpuCommandTicks(words, n);
+    list_nodes++;
+    list_words += (unsigned)n;
+    list_ticks += ticks;
     uint64_t start = g.gpu_end_ns > g.dma_ns ? g.gpu_end_ns : g.dma_ns;
     g.gpu_end_ns = start + clocks_ns((ticks + 1) / 2);
 }
@@ -327,6 +370,10 @@ void Psyz_GpuTimingEnd(void) {
     if (!g.active) return;
     g.active = 0;
     g.dma_free_ns = g.dma_ns;
+    if (gpu_trace())
+        fprintf(stderr, "gpu: end packets %u words %u ticks %llu dma_end %llu gpu_end %llu\n",
+                list_nodes, list_words, (unsigned long long)list_ticks,
+                (unsigned long long)g.dma_ns, (unsigned long long)g.gpu_end_ns);
 }
 
 void Psyz_GpuTimingImage(unsigned words) {

@@ -60,3 +60,19 @@ ZTEST(gpu_timing, line_takes_its_longer_side) {
     u_long w[] = {0x40FFFFFF, 0x00000000, 0x00030014};
     zexpect_s32_eq(21, (int)ticks(w, 3));
 }
+
+
+ZTEST(gpu_timing, a_list_waits_for_an_idle_gpu) {
+    int waits;
+    // the GPU idle: at once
+    zexpect_s32_eq(1000, (int)Psyz_GpuListStartNs(1000, 500, 800, &waits));
+    zexpect_s32_eq(0, waits);
+    // still drawing: the CPU waits for it (libgpu polls GPUSTAT)
+    zexpect_s32_eq(5000, (int)Psyz_GpuListStartNs(1000, 500, 5000, &waits));
+    zexpect_s32_eq(1, waits);
+    // a transfer in progress: queued behind it, the CPU goes on
+    zexpect_s32_eq(5000, (int)Psyz_GpuListStartNs(1000, 3000, 5000, &waits));
+    zexpect_s32_eq(0, waits);
+    zexpect_s32_eq(3000, (int)Psyz_GpuListStartNs(1000, 3000, 2000, &waits));
+    zexpect_s32_eq(0, waits);
+}
