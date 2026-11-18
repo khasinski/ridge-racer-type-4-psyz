@@ -136,16 +136,21 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
 // its handlers' clocks; 0 when there was none before.
 int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
                             unsigned* cycles);
-// libpad's controller driver runs at each vblank (PadStartCom, libetc.c).
+// libpad (libpad.c): its handler runs at each vblank once PadStartCom ran;
+// Psyz_LibpadVBlank is that handler, and Psyz_LibpadExchanged tells whether
+// a port's controller answered at it and the halfwords of the packet it
+// received to the end (0 when the exchange failed).
 int Psyz_PadDriverRunning(void);
-// libpad's actuator data (PadSetAct / PadSetActAlign) and the exchange at
-// each blank, before the frames are refreshed (pad.c).
-void Psyz_PadsSetActuators(int port, const unsigned char* data, int len);
-void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align);
-void Psyz_PadsExchange(int port, const char* published);
-// What a port's receive buffer holds: libpad's buffer once PadStartCom ran,
-// else the latest frame (libapi.c).
-void Psyz_PadsReceived(int port, char* dst);
+void Psyz_LibpadVBlank(void);
+int Psyz_LibpadExchanged(int port, int* halfwords);
+// The controllers' side of the serial exchange (pad.c): the byte a
+// controller answers to @p in with the input of @p frame, and whether it
+// ACKs it; deselecting the port ends its command.
+int Psyz_PadsTransfer(int port, const char* frame, unsigned char in,
+                      unsigned char* out);
+void Psyz_PadsDeselect(int port);
+// The frame a port's controller answers with at this blank (libapi.c).
+const char* Psyz_PadsFrame(int port);
 
 // The BIOS memory card driver's work at a vblank (libcard.c); turn 0: a
 // vblank its handler misses.

@@ -30,6 +30,7 @@ set(PSYZ_SOURCES
     src/psyz/libapi.c
     src/psyz/kernel.c
     src/psyz/libetc.c
+    src/psyz/libpad.c
     src/psyz/pad.c
     src/psyz/libgpu.c
     src/psyz/gpudump.c

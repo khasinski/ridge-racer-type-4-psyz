@@ -24,10 +24,14 @@ extern "C" {
  *                 (0x00 released .. 0xFF); its buttons are Start, the D-pad,
  *                 A (Circle's bit), B (Triangle's) and R (R1's), the other
  *                 bits read released
- *   JogCon        dial position (16-bit, little endian), then the rotation
- *                 since the last frame (1 forward, 2 back) with the motor
- *                 command of the exchange before in the high nibble
- * A DUAL SHOCK or JogCon in digital mode sends the digital pad's frame. */
+ *   JogCon        dial position (16-bit, little endian); byte 6 (the
+ *                 rotation since the last poll, 1 forward, 2 back, and the
+ *                 last motor command in the high nibble) is the
+ *                 controller's own
+ * A frame is what the controller sends to a poll in its full mode. A DUAL
+ * SHOCK or JogCon keeps its own mode (digital, analog, configuration) and
+ * answers libpad's commands byte by byte; in digital mode it sends the
+ * digital pad's answer with the frame's buttons. */
 typedef enum {
     PSYZ_CTRL_ERROR = 0x00,         /**< Failed to set controller param */
     PSYZ_CTRL_QUERY_KIND = 0x00,    /**< Query current kind without changing it */
@@ -154,14 +158,16 @@ typedef struct {
 int Psyz_PadsBuildFrame(int port, PsyzControllerKind kind,
                         const PsyzPadInput* input, char* frame);
 
-/** DUAL SHOCK / JogCon mode (libpad PadSetMainMode); reset by a new kind. */
+/** DUAL SHOCK / JogCon mode, as its mode button or libpad's PadSetMainMode
+ * sets it; a new kind starts in analog (JogCon) mode. */
 void Psyz_PadsSetDigitalMode(int port, int digital);
 int Psyz_PadsDigitalMode(int port);
 
 /**
- * @brief Host rumble for the actuator bytes libpad sent at the last exchange
+ * @brief Host rumble for the motor bytes the controller last received
  *
- * DUAL SHOCK: the large motor drives @p low, the small one @p high; JogCon:
+ * DUAL SHOCK: the large motor drives @p low, the small one @p high (bytes
+ * libpad sends through its actuator gates, mapped by command 0x4D); JogCon:
  * the dial motor's strength drives both. Values are 0..0xFFFF.
  */
 void Psyz_PadsGetRumble(int port, unsigned* low, unsigned* high);

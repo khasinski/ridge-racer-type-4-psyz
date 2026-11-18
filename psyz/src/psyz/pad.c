@@ -1,8 +1,10 @@
-/* Controller frames of the emulated PS1 controllers.
+/* Controller frames and the byte-level answers of the emulated PS1
+ * controllers.
  *
  * The platform layer samples the host (buttons, sticks, triggers) into a
- * PsyzPadInput; Psyz_PadsBuildFrame turns it into the receive buffer the
- * controller kind sends, byte for byte as on the console:
+ * PsyzPadInput; Psyz_PadsBuildFrame turns it into the frame the controller
+ * kind sends when it is polled (command 0x42), byte for byte as on the
+ * console:
  *   https://psx-spx.consoledev.net/controllersandmemorycards/
  *
  * Analog inputs that the host only approximates (a stick for the neGcon
@@ -10,13 +12,14 @@
  * through a response curve with DuckStation's parameters (dead zone,
  * saturation, linearity, scaling), so values tuned there carry over.
  *
- * The DUAL SHOCK and the JogCon have two modes. They start in their analog
- * (JogCon) mode, as DuckStation's do; libpad's PadSetMainMode switches the
- * mode (Psyz_PadsSetDigitalMode). Selecting another kind resets it.
- *
- * libpad also sends the actuator bytes at every exchange (PadSetAct,
- * PadSetActAlign): Psyz_PadsExchange reads them so the platform layer can
- * drive host rumble and the JogCon reports its last motor command. */
+ * libpad (libpad.c) talks to the controllers a byte at a time
+ * (Psyz_PadsTransfer), and they answer as DuckStation's do
+ * (digital_controller.cpp, analog_controller.cpp, negcon.cpp, jogcon.cpp):
+ * a digital pad, neGcon or analog stick only to the poll; the DUAL SHOCK
+ * and the JogCon also to the configuration commands 0x43 to 0x4D, with
+ * their own mode, configuration mode and motor mapping. They start in their
+ * analog (JogCon) mode, as DuckStation's do for this kind of game;
+ * selecting another kind resets them. */
 
 #include <psyz.h>
 #include <psyz/input.h>
@@ -39,17 +42,39 @@ static PsyzAxisResponse responses[PSYZ_PAD_AXIS_COUNT] = {
     {0.0f, 1.0f, 0.0f, 1.0f, 0xFF},
 };
 
-static struct {
+enum {
+    CTRL_IDLE = 0,  // waiting for the 0x01 address byte
+    CTRL_READY = 1, // addressed, waiting for the command byte
+    CTRL_COMMAND = 2,
+};
+
+typedef struct {
     PsyzControllerKind kind; // kind the state below belongs to
-    int digital_mode;        // DUAL SHOCK / JogCon switched to digital mode
-    const unsigned char* act_data; // PadSetAct buffer
-    int act_len;
-    unsigned char act_align[6]; // PadSetActAlign table (0xFF: not sent)
-    int act_aligned;
-    unsigned char sent[6];  // actuator bytes of the latest exchange
-    short dial;             // JogCon dial of the latest published frame
-    unsigned char jog_cmd;  // JogCon motor command of the exchange before
-} pads[2];
+    // DUAL SHOCK / JogCon
+    int analog;         // analog (JogCon) mode, else digital
+    int config;         // configuration mode (ID 0xF3)
+    int dualshock;      // DUAL SHOCK: entered configuration mode once
+    int locked;         // DUAL SHOCK: mode locked by 0x44
+    unsigned char status;        // second byte of every answer
+    unsigned char rumble_cfg[6]; // 0x4D: motor of each actuator byte
+    unsigned char motor[2];      // small, large (JogCon: command byte)
+    signed char last_steering;   // JogCon dial at the poll before
+    unsigned char last_motor;    // JogCon motor command (high nibble)
+    // the transfer in progress
+    int state, command, step, len;
+    unsigned char rx[8], tx[PSYZ_PAD_BUF_LEN];
+} Controller;
+
+static Controller pads[2];
+
+static void ResetController(int port) {
+    PsyzControllerKind kind = pads[port].kind;
+    memset(&pads[port], 0, sizeof(pads[port]));
+    pads[port].kind = kind;
+    pads[port].analog = 1;
+    pads[port].status = 0x5A;
+    memset(pads[port].rumble_cfg, 0xFF, sizeof(pads[port].rumble_cfg));
+}
 
 static int ValidPort(int port) { return port >= 0 && port < LEN(pads); }
 
@@ -138,26 +163,28 @@ static void PutButtons(char* frame, unsigned released) {
     frame[3] = (char)(released & 0xFF);
 }
 
+static int HasModes(PsyzControllerKind kind) {
+    return kind == PSYZ_CTRL_ANALOG_PAD || kind == PSYZ_CTRL_JOGCON;
+}
+
+/* A port without host input reports disconnected for a moment: the
+ * controller (its mode, its motor mapping) is still the same one. */
+static void TrackKind(int port, PsyzControllerKind kind) {
+    if (kind != PSYZ_CTRL_DISCONNECTED && pads[port].kind != kind) {
+        pads[port].kind = kind;
+        ResetController(port);
+    }
+}
+
+/* The mode button of a DUAL SHOCK / JogCon: digital or analog mode. */
 void Psyz_PadsSetDigitalMode(int port, int digital) {
     if (ValidPort(port)) {
-        pads[port].digital_mode = digital != 0;
+        pads[port].analog = digital == 0;
     }
 }
 
 int Psyz_PadsDigitalMode(int port) {
-    return ValidPort(port) && pads[port].digital_mode;
-}
-
-/* A port without host input reports disconnected for a moment: the
- * controller (its mode, the JogCon's dial) is still the same one. */
-static void TrackKind(int port, PsyzControllerKind kind) {
-    if (kind != PSYZ_CTRL_DISCONNECTED && pads[port].kind != kind) {
-        pads[port].kind = kind;
-        pads[port].digital_mode = 0;
-        pads[port].dial = 0;
-        pads[port].jog_cmd = 0;
-        memset(pads[port].sent, 0, sizeof(pads[port].sent));
-    }
+    return ValidPort(port) && HasModes(pads[port].kind) && !pads[port].analog;
 }
 
 int Psyz_PadsBuildFrame(int port, PsyzControllerKind kind,
@@ -174,10 +201,6 @@ int Psyz_PadsBuildFrame(int port, PsyzControllerKind kind,
         return 0;
     }
     pressed = in->buttons & 0xFFFF;
-    if ((kind == PSYZ_CTRL_ANALOG_PAD || kind == PSYZ_CTRL_JOGCON) &&
-        pads[port].digital_mode) {
-        kind = PSYZ_CTRL_DIGITAL_PAD;
-    }
     frame[1] = (char)kind;
     switch (kind) {
     case PSYZ_CTRL_DIGITAL_PAD:
@@ -205,20 +228,15 @@ int Psyz_PadsBuildFrame(int port, PsyzControllerKind kind,
         return 0;
     }
     case PSYZ_CTRL_JOGCON: {
-        // The dial's 16-bit position, from the host axis as DuckStation
-        // turns a half axis into it (-128..127); byte 6 holds the rotation
-        // since the frame before (1 forward, 2 back) and the motor command
-        // of the exchange before in its high nibble.
+        // The dial's position, from the host axis as DuckStation turns a
+        // half axis into it (-128..127), sign-extended to 16 bits; the
+        // controller adds the rotation and its motor command (byte 6).
         float s = SteeringValue(in);
         int half = (int)((s < 0.0f ? -s : s) * 255.0f);
         short dial = (short)(s < 0.0f ? -((half + 1) / 2) : half / 2);
-        unsigned char rotation = dial > pads[port].dial   ? 1
-                                 : dial < pads[port].dial ? 2
-                                                          : 0;
         PutButtons(frame, ~pressed);
         frame[4] = (char)(dial & 0xFF);
         frame[5] = (char)((dial >> 8) & 0xFF);
-        frame[6] = (char)(rotation | (pads[port].jog_cmd << 4));
         return 0;
     }
     default:
@@ -226,67 +244,333 @@ int Psyz_PadsBuildFrame(int port, PsyzControllerKind kind,
     }
 }
 
-void Psyz_PadsSetActuators(int port, const unsigned char* data, int len) {
-    if (ValidPort(port)) {
-        pads[port].act_data = data;
-        pads[port].act_len = data && len > 0 ? len : 0;
+
+/* ---- the controllers' side of the serial exchange ---- */
+
+static int FrameConnected(const char* frame) {
+    return frame[0] == 0 && (unsigned char)frame[1] != PSYZ_CTRL_DISCONNECTED;
+}
+
+static unsigned char IdByte(const Controller* c) {
+    switch (c->kind) {
+    case PSYZ_CTRL_ANALOG_PAD:
+        return c->config ? 0xF3 : c->analog ? 0x73 : 0x41;
+    case PSYZ_CTRL_JOGCON:
+        return c->config ? 0xF3 : c->analog ? 0xE3 : 0x41;
+    default:
+        return (unsigned char)c->kind;
     }
 }
 
-void Psyz_PadsSetActuatorAlign(int port, const unsigned char* align) {
-    if (!ValidPort(port)) {
-        return;
-    }
-    if (!align) {
-        pads[port].act_aligned = 0;
-        return;
-    }
-    memcpy(pads[port].act_align, align, sizeof(pads[port].act_align));
-    pads[port].act_aligned = 1;
+static int AnswerLength(unsigned char id) {
+    unsigned halfwords = id & 0xF;
+    return 2 + 2 * (int)(halfwords ? halfwords : 16);
 }
 
-void Psyz_PadsExchange(int port, const char* published) {
-    unsigned char sent[6];
-
-    if (!ValidPort(port)) {
-        return;
+/* DUAL SHOCK in digital mode: the left stick works the D-pad
+ * (DuckStation's AnalogDPadInDigitalMode, on by default). */
+static unsigned char DualShockButtonsLow(const Controller* c,
+                                         const char* frame) {
+    unsigned char b = (unsigned char)frame[2];
+    if (!c->analog && !c->config) {
+        unsigned char lx = (unsigned char)frame[6], ly = (unsigned char)frame[7];
+        if (lx <= 64)
+            b &= (unsigned char)~0x80; // Left
+        if (lx >= 191)
+            b &= (unsigned char)~0x20; // Right
+        if (ly <= 64)
+            b &= (unsigned char)~0x10; // Up
+        if (ly >= 191)
+            b &= (unsigned char)~0x40; // Down
     }
-    memset(sent, 0, sizeof(sent));
-    if (pads[port].act_aligned && pads[port].act_data) {
-        for (int i = 0; i < LEN(sent); i++) {
-            unsigned a = pads[port].act_align[i];
-            if (a < (unsigned)pads[port].act_len) {
-                sent[i] = pads[port].act_data[a];
+    return b;
+}
+
+static void DualShockPoll(Controller* c, const char* frame) {
+    c->tx[0] = IdByte(c);
+    c->tx[1] = c->status;
+    c->tx[2] = DualShockButtonsLow(c, frame);
+    c->tx[3] = (unsigned char)frame[3];
+    for (int i = 4; i < 8; i++) {
+        c->tx[i] = c->analog || c->config ? (unsigned char)frame[i] : 0;
+    }
+}
+
+static void JogConMotor(Controller* c, unsigned char value) {
+    c->motor[0] = value;
+    c->last_motor = value >> 4;
+}
+
+static void JogConPoll(Controller* c, const char* frame) {
+    signed char steering = (signed char)frame[4];
+    unsigned char rotation = steering > c->last_steering   ? 1
+                             : steering < c->last_steering ? 2
+                                                           : 0;
+    c->tx[2] = (unsigned char)frame[2];
+    c->tx[3] = (unsigned char)frame[3];
+    c->tx[4] = (unsigned char)steering;
+    c->tx[5] = steering < 0 ? 0xFF : 0x00;
+    c->tx[6] = (unsigned char)(rotation | (c->last_motor << 4));
+    c->last_steering = steering;
+}
+
+static void ConfigReply(Controller* c, const unsigned char* tail) {
+    c->tx[0] = IdByte(c);
+    c->tx[1] = c->status;
+    memcpy(&c->tx[2], tail, 6);
+}
+
+static const unsigned char kZeros[6];
+
+/* The command byte: 0 when the controller does not take it (no ACK). */
+static int StartCommand(Controller* c, unsigned char cmd, const char* frame) {
+    c->command = cmd;
+    switch (c->kind) {
+    case PSYZ_CTRL_ANALOG_PAD:
+        if (cmd == 0x42) {
+            DualShockPoll(c, frame);
+        } else if (cmd == 0x43) {
+            if (!c->config)
+                DualShockPoll(c, frame);
+            else
+                ConfigReply(c, kZeros);
+        } else if (c->config && cmd >= 0x44 && cmd <= 0x4D &&
+                   ((1u << (cmd - 0x44)) & 0x30F)) {
+            static const unsigned char r47[6] = {0, 0, 2, 0, 1, 0};
+            unsigned char r45[6] = {1, 2, 0, 2, 1, 0};
+            r45[2] = (unsigned char)c->analog;
+            ConfigReply(c, cmd == 0x45 ? r45 : cmd == 0x47 ? r47 : kZeros);
+            if (cmd == 0x44) {
+                memset(c->rumble_cfg, 0xFF, sizeof(c->rumble_cfg));
+                c->motor[0] = c->motor[1] = 0;
             }
+        } else {
+            return 0;
+        }
+        c->len = AnswerLength(IdByte(c) == 0xF3 ? 0x73 : IdByte(c));
+        return 1;
+    case PSYZ_CTRL_JOGCON:
+        memset(c->tx, 0, 8);
+        if (cmd == 0x42 || (c->analog && cmd == 0x43)) {
+            c->tx[0] = IdByte(c);
+            c->tx[1] = c->status;
+            JogConPoll(c, frame);
+        } else if (c->config && cmd >= 0x44 && cmd <= 0x4D &&
+                   ((1u << (cmd - 0x44)) & 0x30F)) {
+            static const unsigned char r47[6] = {0, 0, 2, 0, 1, 0};
+            unsigned char r45[6] = {1, 2, 0, 1, 1, 0};
+            r45[2] = (unsigned char)c->analog;
+            ConfigReply(c, cmd == 0x45 ? r45 : cmd == 0x47 ? r47 : kZeros);
+            if (cmd == 0x44) {
+                memset(c->rumble_cfg, 0xFF, sizeof(c->rumble_cfg));
+                JogConMotor(c, 0);
+            }
+        } else {
+            return 0;
+        }
+        c->len = c->analog ? 8 : 4;
+        return 1;
+    default:
+        // digital pad, neGcon, analog stick or a frame set as it is: the
+        // poll only, answered with the frame
+        if (cmd != 0x42) {
+            return 0;
+        }
+        c->tx[0] = (unsigned char)frame[1];
+        c->tx[1] = 0x5A;
+        memcpy(&c->tx[2], &frame[2], PSYZ_PAD_BUF_LEN - 2);
+        c->len = AnswerLength(c->tx[0]);
+        if (c->len > PSYZ_PAD_BUF_LEN) {
+            c->len = PSYZ_PAD_BUF_LEN;
+        }
+        return 1;
+    }
+}
+
+/* The byte the controller received at c->step of its command. */
+static void CommandByte(Controller* c, unsigned char in) {
+    int step = c->step;
+    if (step < (int)sizeof(c->rx)) {
+        c->rx[step] = in;
+    }
+    if (c->kind == PSYZ_CTRL_ANALOG_PAD) {
+        switch (c->command) {
+        case 0x42:
+            if (c->dualshock) {
+                if (step >= 2 && step < 7 && c->rumble_cfg[step - 2] <= 1)
+                    c->motor[c->rumble_cfg[step - 2]] = in;
+            } else if (step == 3) {
+                // the SCPH-1150's legacy small motor
+                c->motor[0] =
+                    (c->rx[2] & 0xC0) == 0x40 && (c->rx[3] & 1) ? 0xFF : 0;
+            }
+            break;
+        case 0x43:
+            if (step == c->len - 1) {
+                c->config = c->rx[2] == 1;
+                if (c->config) {
+                    c->dualshock = 1;
+                    c->status = 0x5A;
+                }
+            }
+            break;
+        case 0x44:
+            if (step == 2 && in <= 1)
+                c->analog = in;
+            else if (step == 3 && (in == 2 || in == 3))
+                c->locked = in == 3;
+            break;
+        case 0x46:
+            if (step == 2 && in <= 1) {
+                static const unsigned char act[2][4] = {{1, 2, 0, 0x0A},
+                                                        {1, 1, 1, 0x14}};
+                memcpy(&c->tx[4], act[in], 4);
+            }
+            break;
+        case 0x47:
+            if (step == 2 && in != 0)
+                memset(&c->tx[4], 0, 4);
+            break;
+        case 0x4C:
+            if (step == 2 && in <= 1)
+                c->tx[5] = in ? 0x07 : 0x04;
+            break;
+        case 0x4D:
+            if (step >= 2 && step < 7) {
+                c->tx[step] = c->rumble_cfg[step - 2];
+                c->rumble_cfg[step - 2] = in;
+            } else if (step == 7) {
+                int small = 0, large = 0;
+                for (int i = 0; i < 6; i++) {
+                    small |= c->rumble_cfg[i] == 0;
+                    large |= c->rumble_cfg[i] == 1;
+                }
+                if (!small)
+                    c->motor[0] = 0;
+                if (!large)
+                    c->motor[1] = 0;
+            }
+            break;
+        }
+    } else if (c->kind == PSYZ_CTRL_JOGCON) {
+        switch (c->command) {
+        case 0x42:
+            if (step >= 2 && step < 7 && c->rumble_cfg[step - 2] == 0)
+                JogConMotor(c, in);
+            break;
+        case 0x43:
+            c->config = c->rx[2] == 1 && c->analog;
+            if (c->config)
+                c->status = 0x5A;
+            break;
+        case 0x44:
+            if (step == 2 && in <= 1) {
+                c->analog = in;
+                c->config = c->config && c->analog;
+            }
+            break;
+        case 0x46:
+            if (step == 2 && in <= 1) {
+                static const unsigned char act[2][4] = {{1, 2, 0, 0x0A},
+                                                        {1, 1, 1, 0x14}};
+                memcpy(&c->tx[4], act[in], 4);
+            }
+            break;
+        case 0x47:
+            if (step == 2 && in != 0)
+                memset(&c->tx[4], 0, 4);
+            break;
+        case 0x4C:
+            if (step == 2 && in == 0)
+                c->tx[5] = 0x04;
+            else if (step == 2 && in == 1)
+                c->tx[4] = 0x03;
+            break;
+        case 0x4D:
+            if (step >= 2 && step < 7) {
+                c->tx[step] = c->rumble_cfg[step - 2];
+                c->rumble_cfg[step - 2] = in;
+            } else if (!memchr(c->rumble_cfg, 0, sizeof(c->rumble_cfg))) {
+                JogConMotor(c, 0);
+            }
+            break;
         }
     }
-    if (published && (unsigned char)published[0] == 0 &&
-        (unsigned char)published[1] == PSYZ_CTRL_JOGCON) {
-        pads[port].dial =
-            (short)((unsigned char)published[4] |
-                    ((unsigned)(unsigned char)published[5] << 8));
+}
+
+int Psyz_PadsTransfer(int port, const char* frame, unsigned char in,
+                      unsigned char* out) {
+    Controller* c;
+    int ack;
+
+    *out = 0xFF;
+    if (!ValidPort(port) || !frame) {
+        return 0;
     }
-    // the frame after this exchange reports the command of the one before
-    pads[port].jog_cmd = pads[port].sent[0] >> 4;
-    memcpy(pads[port].sent, sent, sizeof(sent));
+    c = &pads[port];
+    switch (c->state) {
+    case CTRL_IDLE:
+        if (in != 0x01 || !FrameConnected(frame)) {
+            return 0;
+        }
+        TrackKind(port, Psyz_PadsSetKind(port, 0, PSYZ_CTRL_QUERY_KIND));
+        if ((unsigned char)frame[1] != (unsigned char)c->kind &&
+            (unsigned char)frame[1] != PSYZ_CTRL_DIGITAL_PAD) {
+            // a frame of another kind than the port's: answer it as it is
+            TrackKind(port, (PsyzControllerKind)(unsigned char)frame[1]);
+        }
+        if (c->kind == PSYZ_CTRL_JOGCON) {
+            memset(c->rx, 0, sizeof(c->rx));
+        }
+        c->state = CTRL_READY;
+        return 1;
+    case CTRL_READY:
+        c->step = 0;
+        if (!StartCommand(c, in, frame)) {
+            c->state = CTRL_IDLE;
+            return 0;
+        }
+        c->state = CTRL_COMMAND;
+        break;
+    default:
+        break;
+    }
+    CommandByte(c, in);
+    *out = c->tx[c->step];
+    c->step++;
+    ack = c->step < c->len;
+    if (!ack) {
+        c->state = CTRL_IDLE;
+        c->step = 0;
+        if (c->kind == PSYZ_CTRL_ANALOG_PAD) {
+            memset(c->rx, 0, sizeof(c->rx));
+        }
+    }
+    return ack;
+}
+
+void Psyz_PadsDeselect(int port) {
+    if (ValidPort(port)) {
+        pads[port].state = CTRL_IDLE;
+        pads[port].step = 0;
+    }
 }
 
 void Psyz_PadsGetRumble(int port, unsigned* low, unsigned* high) {
     unsigned lo = 0, hi = 0;
 
-    if (ValidPort(port) && pads[port].act_aligned) {
-        const unsigned char* sent = pads[port].sent;
-        switch (pads[port].kind) {
+    if (ValidPort(port)) {
+        const Controller* c = &pads[port];
+        switch (c->kind) {
         case PSYZ_CTRL_ANALOG_PAD:
-            // DUAL SHOCK: byte 0 the small motor (bit 0 on), byte 1 the
-            // large motor's speed
-            hi = (sent[0] & 1) ? 0xFFFF : 0;
-            lo = sent[1] * 0x101u;
+            // the small motor runs or not, the large one at its speed
+            hi = c->motor[0] ? 0xFFFF : 0;
+            lo = c->motor[1] * 0x101u;
             break;
         case PSYZ_CTRL_JOGCON: {
-            // JogCon: the dial motor turns (command 1 right, 2 left, 3
-            // holding) at strength 0..15
-            unsigned cmd = sent[0] >> 4, strength = sent[0] & 0xF;
+            // the dial motor turns (command 1 right, 2 left, 3 holding)
+            // at strength 0..15
+            unsigned cmd = c->motor[0] >> 4, strength = c->motor[0] & 0xF;
             if (cmd >= 1 && cmd <= 3) {
                 lo = hi = strength * 0x1111u;
             }
