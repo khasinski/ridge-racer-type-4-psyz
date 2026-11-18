@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <psyz.h>
 #include <psyz/log.h>
 #include <kernel.h>
@@ -134,9 +135,11 @@ void Psyz_VSyncBlank(void) {
     if (PadTrace()) {
         unsigned since = 0, cycles = 0;
         int seen = Psyz_KernelLastDispatch(blank_ns, &since, &cycles);
-        fprintf(stderr, "pad: blank %u exchange %d card %d dispatch %d +%u/%u\n",
+        fprintf(stderr,
+                "pad: blank %u exchange %d card %d dispatch %d +%u/%u at %" PRIu64
+                "\n",
                 (unsigned)Psyz_VideoVSync(-1), pad_exchange, card_turn, seen,
-                since, cycles);
+                since, cycles, blank_ns);
     }
     Psyz_CardVBlank(card_turn);
     if (g_PsyzVsyncCb)

@@ -178,6 +178,16 @@ void Psyz_SpendTime(unsigned ns);
 void Psyz_SpendCycles(unsigned cycles);
 
 /**
+ * @brief The emulated clock in system clocks (33.8688 MHz) since the start
+ *
+ * Offline clock (PSYZ_AUDIO_CLOCK=video) only, 0 otherwise: the position of
+ * the main thread's work on the PS1 timeline, with the time spent but not
+ * yet mixed and the interrupt handlers' time not yet taken. For timing
+ * diagnostics (where a routine starts against the vblanks).
+ */
+unsigned long long Psyz_EmulatedClocks(void);
+
+/**
  * @brief Complete MDEC output transfers at once
  *
  * By default the MDEC takes its PS1 time per macroblock and an output

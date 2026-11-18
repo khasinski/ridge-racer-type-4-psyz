@@ -260,6 +260,15 @@ static void SpendNs(uint64_t ns) {
     }
 }
 
+unsigned long long Psyz_EmulatedClocks(void) {
+    if (!UsesAudioClock()) {
+        return 0;
+    }
+    uint64_t ns = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
+    return ns * SYSTEM_CLOCK_HZ / 1000000000u +
+           (uint64_t)AtomicLoad(&interrupt_debt);
+}
+
 /* CPU work: the interrupts that come meanwhile (and those owed by native
  * work before it) make it last longer. Inside a handler it lengthens the
  * handler. Offline clock only: on a real-time clock the native work takes
