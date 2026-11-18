@@ -26,6 +26,13 @@ int Psyz_AudioWaitUs(uint64_t us) {
     (void)us;
     return 0;
 }
+int Psyz_AudioWaitNs(uint64_t ns) {
+    (void)ns;
+    return 0;
+}
+void Psyz_AudioMixTo(uint64_t at_ns) { (void)at_ns; }
+uint64_t Psyz_AudioNextBlankNs(void) { return UINT64_MAX; }
+void Psyz_AudioBlankDue(void) {}
 void psyz_log(unsigned level, const char* file, unsigned line, const char* func,
               const char* fmt, ...) {
     (void)level;

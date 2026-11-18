@@ -345,8 +345,9 @@ int MDEC_out_sync(void) {
         uint64_t now = Psyz_KernelNowUs();
         uint64_t due = mdec.out_us;
         Psyz_KernelUnlockInterrupts();
-        int advanced = due > now && Psyz_AudioWaitUs(due - now) &&
-                       Psyz_KernelNowUs() != now;
+        uint64_t now_ns = Psyz_KernelNowNs();
+        int advanced = due > now && Psyz_AudioWaitNs(due * 1000 - now_ns) &&
+                       Psyz_KernelNowNs() != now_ns;
         Psyz_KernelLockInterrupts();
         if (advanced || !mdec.out_pending || mdec.out_us != due)
             continue;

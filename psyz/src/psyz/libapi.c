@@ -113,8 +113,9 @@ static int PadTrace(void) {
  * exchange and the BIOS card driver no turn at that vblank
  * (BIOS_CHAIN_*_TEST_CLOCKS, LIBETC_DISPATCH_EXIT_CLOCKS: timing_profile.h). */
 void Psyz_VSyncBlank(void) {
-    last_blank_us = Psyz_KernelNowUs();
-    uint64_t blank_ns = last_blank_us * 1000 + Psyz_AudioBlankLagNs();
+    // on the offline clock the blank's exact time: it runs there
+    uint64_t blank_ns = Psyz_KernelNowNs();
+    last_blank_us = blank_ns / 1000;
     Psyz_GpuCrtcBlank();
     int pad_exchange =
         Psyz_PadDriverRunning() &&
@@ -218,7 +219,7 @@ static unsigned int WaitBlank(unsigned int now) {
         /* The handlers that ran during the wait were the polling loop's
          * time: only one still running at the blank delays what follows. */
         Psyz_KernelTakeInterruptCycles();
-        uint64_t at_ns = Psyz_KernelNowUs() * 1000;
+        uint64_t at_ns = Psyz_KernelNowNs();
         unsigned since = 0, cycles = 0;
         if (Psyz_KernelLastDispatch(at_ns, &since, &cycles) && cycles > since) {
             Psyz_KernelInterruptCycles(cycles - since);

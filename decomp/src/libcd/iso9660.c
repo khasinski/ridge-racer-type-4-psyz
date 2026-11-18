@@ -138,6 +138,7 @@ s32 CD_newmedia(void) {
     unsigned char* pathTablePtr;
     int i;
 
+    SEARCH_TIME(CD_SEARCH_NEWMEDIA_CYCLES);
     if (cd_read(1, 0x10, load_buf_) != 1) {
         if (CD_debug > 0) {
             printf("CD_newmedia: Read error in cd_read(PVD)\n");

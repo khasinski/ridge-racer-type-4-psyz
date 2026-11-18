@@ -35,9 +35,12 @@ uint64_t Psyz_KernelNowUs(void);
 // it advances only as samples are mixed, never by itself.
 int Psyz_KernelOfflineClock(void);
 
-// Offline sample clock and root-counter deadlines; no host-time advancement.
-unsigned Psyz_KernelAudioBatch(unsigned maximum);
-void Psyz_KernelAdvanceAudio(unsigned frames);
+// Offline clock (kernel.c): the CPU's position advances to at_ns, running
+// the kernel's deadlines and the platform's blanks on the way at their
+// times and mixing the audio up to each (the platform's waits call it).
+void Psyz_KernelAdvanceToNs(uint64_t at_ns);
+// The next kernel deadline on the offline clock (UINT64_MAX: none).
+uint64_t Psyz_KernelNextDeadlineNs(void);
 void Psyz_KernelPauseHostClock(int paused);
 void Psyz_KernelSetHostClockSpeed(unsigned speed);
 
@@ -56,6 +59,7 @@ void Psyz_KernelPost(void (*fn)(void));
 // completing after its PS1 time); Psyz_KernelCancel drops a pending one.
 // A callback has one deadline: posting it again moves it.
 void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
+void Psyz_KernelPostAtNs(uint64_t at_ns, void (*fn)(void));
 void Psyz_KernelCancel(void (*fn)(void));
 
 /* Host-side state the SDK's initialisation resets, besides the PS1 state the
@@ -88,13 +92,18 @@ void Psyz_CdServiceDrive(void);
 void Psyz_CdPollDrive(void);
 void Psyz_CdPollQuery(void);
 
-// Offline clock only: mixes `us` of emulated time without a VBlank, for a
-// native busy wait on a device that runs on that clock. Returns 0 (and does
-// nothing) on a real-time clock, where the time passes by itself.
+// Offline clock only: spends `us` (`ns`) of emulated time, for a native
+// busy wait on a device that runs on that clock; blanks it crosses happen in
+// it. Returns 0 (and does nothing) on a real-time clock, where the time
+// passes by itself, or while the clock is paused.
 int Psyz_AudioWaitUs(uint64_t us);
-// Offline clock: how long after the latest blank's sample boundary the
-// console's blank came (its field lengths are not whole samples).
-uint64_t Psyz_AudioBlankLagNs(void);
+int Psyz_AudioWaitNs(uint64_t ns);
+// The platform's side of the offline clock (Psyz_KernelAdvanceToNs): mixes
+// the samples due by at_ns; the time of the next blank (UINT64_MAX while a
+// VSync waits for it itself); the blank that time has reached.
+void Psyz_AudioMixTo(uint64_t at_ns);
+uint64_t Psyz_AudioNextBlankNs(void);
+void Psyz_AudioBlankDue(void);
 // A blank that came due during such a wait (offline clock, SDL platform):
 // counts it in VSync(-1) and runs its VSync work (Psyz_VSyncBlank).
 void Psyz_VideoWaitBlank(void);

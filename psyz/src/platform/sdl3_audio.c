@@ -32,14 +32,8 @@ void Sdl3Audio_SetSpeed(unsigned speed) {
 
 static SDL_Mutex* mutex;
 static bool video_clock, video_paused;
-static unsigned video_remainder;
 static bool video_pal;
-/* Offline clock: samples left in the current field, until the next blank. A
- * native busy wait (Psyz_AudioWaitUs) spends part of a field, or crosses
- * blanks; VSync(0) then mixes only the rest of the field. */
-static unsigned field_frames_left;
-static unsigned field_frames_total; // the current field's length
-static unsigned wait_fraction; // carried sub-sample part of waited time
+static void OfflineClockReset(void);
 
 /* The capture callback runs under its own mutex, not the SPU's: it may call
  * the SPU and audio APIs, and replacing it still waits for a running call. */
@@ -106,10 +100,8 @@ int Psyz_AudioInit(void) {
         if (!mutex)
             return -1;
         video_paused = false;
-        video_remainder = 0;
         video_pal = false;
-        field_frames_left = 0;
-        wait_fraction = 0;
+        OfflineClockReset();
         is_audio_init = true;
         return 0;
     }
@@ -198,87 +190,137 @@ int Psyz_AudioIsPaused(void) {
 }
 
 /* SDL backend clock for offline runs. Queries and wall time never consume
- * samples. A field lasts 3413 x 263 (NTSC) or 3406 x 314 (PAL) GPU clocks,
- * 451584/715909 or 451584/709379 system clocks each, and a 44100 Hz sample
- * 768 system clocks: 897619 * 588 / 715909 (about 737.24) or
- * 1069484 * 588 / 709379 (about 886.49) samples, the fraction carried. */
-#define FIELD_SAMPLES_NTSC (897619u * 588u)
-#define FIELD_DIVISOR_NTSC 715909u
-#define FIELD_SAMPLES_PAL (1069484u * 588u)
-#define FIELD_DIVISOR_PAL 709379u
+ * samples. A field lasts 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks,
+ * 451584/709379 or 451584/715909 system clocks each: 1069484e9 / 53203425
+ * or 897619e9 / 53693175 ns (75 system clocks are 451584 / 33868800 s),
+ * about 886.49 or 737.24 samples of 44100 Hz.
+ *
+ * The time is the kernel's: the CPU's position (Psyz_KernelAdvanceToNs),
+ * which stops at each blank (Psyz_AudioNextBlankNs, Psyz_AudioBlankDue)
+ * and mixes the samples due by then (Psyz_AudioMixTo). The blanks come at
+ * their exact times, ns + rem / FIELD_DIVISOR ns, not on samples. With the
+ * kernel on a real-time clock (a test that selects PSYZ_AUDIO_CLOCK=video
+ * after startup) this file keeps that position itself. */
+#define FIELD_NS_PAL 1069484000000000ull
+#define FIELD_DIVISOR_PAL 53203425u
+#define FIELD_NS_NTSC 897619000000000ull
+#define FIELD_DIVISOR_NTSC 53693175u
+#define FIELD_LINES_PAL 314u
+#define FIELD_LINES_NTSC 263u
 #define FIELD_FRAMES_MAX 887 // a PAL field, rounded up
 
-/* Device interrupts fire while samples are mixed (Psyz_KernelAdvanceAudio);
- * a wait inside one spends no further time. */
-static int mixing;
+/* An exact time: ns + rem / div ns. */
+typedef struct {
+    uint64_t ns;
+    uint64_t rem, div;
+} ExactTime;
 
-// Mixes frames (at most FIELD_FRAMES_MAX) into samples; holds the mutex.
-static void MixOfflineFrames(short* samples, unsigned frames) {
-    unsigned offset = 0;
-    mixing++;
-    while (offset < frames) {
-        unsigned batch = Psyz_KernelAudioBatch(frames - offset);
-        Psyz_SpuPullSamples(samples + offset * 2, (int)batch);
-        Psyz_KernelAdvanceAudio(batch);
-        offset += batch;
-    }
-    mixing--;
+static uint64_t mix_origin_ns; // the clock's time at Psyz_AudioInit
+static uint64_t mixed_frames;  // samples mixed since then
+static uint64_t own_ns;        // the position when the kernel's is real time
+static ExactTime last_blank, next_blank;
+static bool field_open; // next_blank is set (the field after a VSync's blank
+                        // starts at the first wait, with the mode of then)
+static bool vsync_waiting; // VSync(0) runs the clock to its blank itself
+
+static uint64_t ClockNowNs(void) {
+    return Psyz_KernelOfflineClock() ? Psyz_KernelNowNs() : own_ns;
 }
 
-// Mixes frames under the mutex, then captures them outside it.
+static void OfflineClockReset(void) {
+    uint64_t now = ClockNowNs();
+    mix_origin_ns = now;
+    mixed_frames = 0;
+    last_blank = (ExactTime){now, 0, 1};
+    field_open = false;
+    vsync_waiting = false;
+}
+
+static ExactTime ExactAdd(ExactTime t, uint64_t num, uint64_t div) {
+    if (t.div != div) { // a change of standard: the phase from the ns
+        t.rem = t.div > 1 ? t.rem * div / t.div : 0;
+        t.div = div;
+    }
+    t.ns += num / div;
+    t.rem += num % div;
+    if (t.rem >= div) {
+        t.rem -= div;
+        t.ns++;
+    }
+    return t;
+}
+
+static void OpenField(void) {
+    next_blank = video_pal ? ExactAdd(last_blank, FIELD_NS_PAL, FIELD_DIVISOR_PAL)
+                           : ExactAdd(last_blank, FIELD_NS_NTSC, FIELD_DIVISOR_NTSC);
+    field_open = true;
+}
+
+// Mixes frames (at most FIELD_FRAMES_MAX) under the mutex, then captures
+// them outside it.
 static void MixAndCapture(unsigned frames) {
     short samples[2 * FIELD_FRAMES_MAX];
     SDL_LockMutex(mutex);
-    MixOfflineFrames(samples, frames);
+    Psyz_SpuPullSamples(samples, (int)frames);
     SDL_UnlockMutex(mutex);
     Capture(samples, (int)frames);
 }
 
-int Psyz_AudioWaitForTimer(void) {
-    if (!is_audio_init || !video_clock || video_paused)
-        return 0;
-    MixAndCapture(Psyz_KernelAudioBatch(FIELD_FRAMES_MAX));
-    return 1;
-}
-
-/* The blanks come on sample boundaries, the carried fraction of a sample
- * before the console's: field_end_fraction / field_end_divisor samples for
- * the current field, blank_fraction for the field the latest blank ended
- * (Psyz_AudioBlankLagNs). */
-static unsigned field_end_fraction, blank_fraction;
-static unsigned field_end_divisor = 1, blank_divisor = 1;
-
-static void EndField(void) {
-    blank_fraction = field_end_fraction;
-    blank_divisor = field_end_divisor;
-}
-
-/* Length of the next field in samples, the fraction carried. */
-static unsigned NextFieldFrames(bool pal) {
-    if (pal != video_pal)
-        video_remainder = 0;
-    video_pal = pal;
-    unsigned divisor = pal ? FIELD_DIVISOR_PAL : FIELD_DIVISOR_NTSC;
-    video_remainder += pal ? FIELD_SAMPLES_PAL : FIELD_SAMPLES_NTSC;
-    unsigned frames = video_remainder / divisor;
-    video_remainder %= divisor;
-    field_end_fraction = video_remainder;
-    field_end_divisor = divisor;
-    return frames;
-}
-
-uint64_t Psyz_AudioBlankLagNs(void) {
-    if (!is_audio_init || !video_clock) {
-        return 0;
+/* The samples due by at_ns: sample n (from 1) is mixed once the clock
+ * reaches its end, n / 44100 s after Psyz_AudioInit; an SPU write between
+ * two sample times reaches the next sample. One call mixes in batches of
+ * at most a field. */
+void Psyz_AudioMixTo(uint64_t at_ns) {
+    if (!is_audio_init || !video_clock || at_ns <= mix_origin_ns)
+        return;
+    uint64_t due = (at_ns - mix_origin_ns) * PSYZ_SPU_SAMPLE_RATE / 1000000000u;
+    while (mixed_frames < due) {
+        uint64_t batch = due - mixed_frames;
+        if (batch > FIELD_FRAMES_MAX)
+            batch = FIELD_FRAMES_MAX;
+        MixAndCapture((unsigned)batch);
+        mixed_frames += batch;
     }
-    return (uint64_t)blank_fraction * 1000000000u /
-           ((uint64_t)blank_divisor * PSYZ_SPU_SAMPLE_RATE);
+}
+
+// Runs the clock to at_ns: the kernel's, or this file's own.
+static void ClockAdvanceTo(uint64_t at_ns) {
+    if (Psyz_KernelOfflineClock()) {
+        Psyz_KernelAdvanceToNs(at_ns);
+        return;
+    }
+    while (at_ns > own_ns) {
+        uint64_t blank = Psyz_AudioNextBlankNs();
+        uint64_t to = blank < at_ns ? blank : at_ns;
+        Psyz_AudioMixTo(to);
+        own_ns = to;
+        if (to == blank && blank != UINT64_MAX)
+            Psyz_AudioBlankDue();
+    }
+}
+
+static bool ClockRunning(void) {
+    return is_audio_init && video_clock && !video_paused;
+}
+
+uint64_t Psyz_AudioNextBlankNs(void) {
+    if (!ClockRunning() || vsync_waiting)
+        return UINT64_MAX;
+    if (!field_open)
+        OpenField();
+    return next_blank.ns;
 }
 
 /* A native busy wait spends emulated time as a PS1 spinning on a device
  * would: blanks it crosses happen during the wait (Psyz_VideoWaitBlank:
  * counter, VSync interrupt), so the field count stays on the same clock as
  * the root counters, the CD drive and the mixed audio. */
+void Psyz_AudioBlankDue(void) {
+    last_blank = next_blank;
+    OpenField();
+    Psyz_VideoWaitBlank();
+}
+
 /* The offline clock runs from the first blank, not only once the game
  * initialises sound: root counters and the CD drive use it from boot. */
 static void StartOfflineClock(void) {
@@ -286,32 +328,25 @@ static void StartOfflineClock(void) {
         Psyz_AudioInit();
 }
 
-int Psyz_AudioWaitUs(uint64_t us) {
+int Psyz_AudioWaitNs(uint64_t ns) {
     StartOfflineClock();
-    if (!is_audio_init || !video_clock || video_paused)
+    if (!ClockRunning())
         return 0;
-    if (mixing)
-        return 1;
-    uint64_t scaled = us * PSYZ_SPU_SAMPLE_RATE + wait_fraction;
-    uint64_t frames = scaled / 1000000;
-    wait_fraction = (unsigned)(scaled % 1000000);
-    while (frames) {
-        if (!field_frames_left)
-            field_frames_left = field_frames_total = NextFieldFrames(video_pal);
-        unsigned batch = field_frames_left;
-        if (batch > FIELD_FRAMES_MAX)
-            batch = FIELD_FRAMES_MAX;
-        if (batch > frames)
-            batch = (unsigned)frames;
-        MixAndCapture(batch);
-        frames -= batch;
-        field_frames_left -= batch;
-        if (!field_frames_left) {
-            EndField();
-            field_frames_left = field_frames_total = NextFieldFrames(video_pal);
-            Psyz_VideoWaitBlank();
-        }
-    }
+    ClockAdvanceTo(ClockNowNs() + ns);
+    return 1;
+}
+
+int Psyz_AudioWaitUs(uint64_t us) { return Psyz_AudioWaitNs(us * 1000); }
+
+/* Runs the clock until the next timer interrupt, at most a field's samples
+ * on (an idle program waiting for its sequencer). */
+int Psyz_AudioWaitForTimer(void) {
+    if (!ClockRunning())
+        return 0;
+    uint64_t now = ClockNowNs();
+    uint64_t at = now + (uint64_t)FIELD_FRAMES_MAX * 1000000000u / PSYZ_SPU_SAMPLE_RATE;
+    uint64_t next = Psyz_KernelNextDeadlineNs();
+    ClockAdvanceTo(next > now && next < at ? next : at);
     return 1;
 }
 
@@ -327,48 +362,43 @@ int Psyz_AudioWaitUs(uint64_t us) {
 void Psyz_AudioDisplayRangeChanged(
     unsigned y1, unsigned y2, unsigned new_y1, unsigned new_y2) {
     StartOfflineClock();
-    if (!is_audio_init || !video_clock || video_paused || mixing)
+    if (!ClockRunning())
         return;
-    /* Exact positions in units of 1 / (divisor * lines) samples, so that a
-     * line is FIELD_SAMPLES units: the beam's line now, from the console's
-     * blank (the latest blank's boundary plus its carried fraction). */
-    const uint64_t total = video_pal ? 314 : 263;
+    /* Exact positions in units of 1 / div ns, a line being line_u of them:
+     * the beam's line now, from the console's latest blank. */
+    const uint64_t total = video_pal ? FIELD_LINES_PAL : FIELD_LINES_NTSC;
     const uint64_t div = video_pal ? FIELD_DIVISOR_PAL : FIELD_DIVISOR_NTSC;
-    const uint64_t line_u = video_pal ? FIELD_SAMPLES_PAL : FIELD_SAMPLES_NTSC;
-    const uint64_t field_u = line_u * total;
+    const uint64_t field_u = video_pal ? FIELD_NS_PAL : FIELD_NS_NTSC;
+    const uint64_t line_u = field_u / total;
     y1 = y1 < total ? y1 : (unsigned)total;
     y2 = y2 < total ? y2 : (unsigned)total;
     new_y1 = new_y1 < total ? new_y1 : (unsigned)total;
     new_y2 = new_y2 < total ? new_y2 : (unsigned)total;
-    uint64_t elapsed = field_frames_left ? field_frames_total - field_frames_left : 0;
-    uint64_t lag_u = blank_divisor > 1 ? (uint64_t)blank_fraction * div * total / blank_divisor : 0;
-    uint64_t since_u = elapsed * div * total;
-    since_u = since_u > lag_u ? since_u - lag_u : 0;
+    uint64_t now = ClockNowNs();
+    ExactTime blank = last_blank;
+    if (blank.div != div)
+        blank = ExactAdd(blank, 0, div);
+    uint64_t since_u = 0;
+    if (now > blank.ns) {
+        since_u = (now - blank.ns) * div;
+        since_u = since_u > blank.rem ? since_u - blank.rem : 0;
+    }
+    since_u %= field_u;
     uint64_t pos_u = ((uint64_t)y2 * line_u + since_u) % field_u;
     unsigned current = (unsigned)(pos_u / line_u);
     int was_blank = current < y1 || current >= y2;
     int is_blank = current < new_y1 || current >= new_y2;
+    ExactTime from = {now, 0, div};
     if (!was_blank && is_blank) {
-        blank_fraction = 0; // the beam leaves the new range at once
+        last_blank = from; // the beam leaves the new range at once
         Psyz_VideoWaitBlank();
         pos_u = (uint64_t)new_y2 * line_u;
     }
     uint64_t end_u = (uint64_t)new_y2 * line_u;
     uint64_t left_u = end_u > pos_u ? end_u - pos_u : end_u + field_u - pos_u;
-    uint64_t frames = left_u / (div * total);
-    uint64_t fraction = left_u % (div * total);
-    if (frames < 1) {
-        frames = 1;
-        fraction = 0;
-    }
-    if (frames > FIELD_FRAMES_MAX)
-        frames = FIELD_FRAMES_MAX;
-    field_frames_left = field_frames_total = (unsigned)frames;
-    // the console's blank comes the fraction after the boundary; the fields
-    // after it carry that phase
-    field_end_fraction = (unsigned)(fraction / total);
-    field_end_divisor = (unsigned)div;
-    video_remainder = field_end_fraction;
+    // the fields after it carry the phase of this blank
+    next_blank = ExactAdd(from, left_u, div);
+    field_open = true;
 }
 
 /* The display mode's PAL bit changed (GP1(08h), a GPU reset): fields from
@@ -378,21 +408,22 @@ void Psyz_AudioVideoModeChanged(int pal) {
     StartOfflineClock();
     if (!is_audio_init || !video_clock)
         return;
-    if ((bool)pal != video_pal)
-        video_remainder = 0;
     video_pal = pal;
 }
 
 /* A blank VSync(0) waited for: the rest of the current field. */
 void Sdl3Audio_VBlank(bool pal) {
     StartOfflineClock();
-    if (!is_audio_init || !video_clock || video_paused)
+    if (!ClockRunning())
         return;
-    if (!field_frames_left || pal != video_pal)
-        field_frames_left = field_frames_total = NextFieldFrames(pal);
-    MixAndCapture(field_frames_left);
-    field_frames_left = 0;
-    EndField();
+    if (!field_open || pal != video_pal) {
+        video_pal = pal;
+        OpenField();
+    }
+    ExactTime blank = next_blank;
+    vsync_waiting = true;
+    ClockAdvanceTo(blank.ns);
+    vsync_waiting = false;
+    last_blank = blank;
+    field_open = false;
 }
-
-

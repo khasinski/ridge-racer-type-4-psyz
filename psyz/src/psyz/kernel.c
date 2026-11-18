@@ -88,8 +88,8 @@ static inline void AtomicAdd(AtomicWord* p, long v) {
 #define DOT_CLOCK_HZ 6711647 // GPU clock / 8, the 320 pixel wide modes
 #define HBLANK_NTSC_HZ 15732 // GPU clock / 3413 (NTSC) or / 3406 (PAL)
 #define HBLANK_PAL_HZ 15620
-#define MIN_PERIOD_US 32      // faster timers would only spin the host
-#define MAX_CATCHUP_US 200000 // ticks owed past a longer host stall are lost
+#define MIN_PERIOD_NS 32000      // faster timers would only spin the host
+#define MAX_CATCHUP_NS 200000000 // ticks owed past a longer host stall are lost
 
 enum {
     IRQ_VBLANK,
@@ -115,14 +115,16 @@ typedef struct {
     long (*handler)();
 } Event;
 
+/* Times in ns; the exact time is ns + frac_acc / clock_hz ns (a period is
+ * target / clock_hz s, period_ns and period_frac / clock_hz ns). */
 typedef struct {
-    uint64_t last_us;   // when the count last restarted from 0
-    uint64_t next_us;   // when the count reaches the target
-    uint32_t period_us; // 0 until SetRCnt
+    uint64_t last_ns;   // when the count last restarted from 0
+    uint64_t next_ns;   // when the count reaches the target
+    uint64_t period_ns; // 0 until SetRCnt
     uint32_t period_frac;
     uint32_t frac_acc;
+    uint32_t last_frac;
     uint32_t clock_hz;
-    uint32_t ticks_per_us_q15;
     uint32_t target;
     int irq;
 } RootCounter;
@@ -153,7 +155,7 @@ static unsigned irq_saved_mask;
 static int callbacks_running = 1;
 static long rcnt_auto_ack[4] = {1, 1, 1, 1};
 static RootCounter counters[3];
-static AtomicTime poll_deadline_us;
+static AtomicTime poll_deadline_ns;
 
 static PendingEvent pending[32];
 static int pending_len;
@@ -167,10 +169,19 @@ static void VSyncDispatch(void);
 static void (*irq_callbacks[IRQ_COUNT])(void) = {VSyncDispatch};
 
 /* Offline playback owns emulated time. Host scheduling must not change AKAO
- * timer counts or positions within the mixed PCM stream. Fixed at startup. */
+ * timer counts or positions within the mixed PCM stream. Fixed at startup.
+ *
+ * The offline clock is the CPU's position, cpu_ns: every reading of the time
+ * (Psyz_KernelNowUs/NowNs, Psyz_EmulatedClocks), every deadline (root
+ * counters, timed completions, CPU stalls) and the blanks are on it. Time
+ * passes only in the main thread's waits and spends (Psyz_KernelAdvanceToNs),
+ * which stop at each deadline and blank on the way and run it there, at its
+ * exact time; the audio is mixed up to the CPU's position before each
+ * (whole samples, the SPU's own rate), so it follows the clock and never
+ * sets it. */
 static AtomicWord audio_clock = -1;
-static AtomicTime audio_time_us;
-static unsigned audio_time_fraction;
+static AtomicTime cpu_ns;
+static int advancing; // inside Psyz_KernelAdvanceToNs: a nested wait spends nothing
 static AtomicWord host_clock_paused;
 static AtomicWord host_clock_speed = 1;
 /* Kernel time = wall time * speed - offset (modulo 2^64). */
@@ -188,11 +199,18 @@ static int UsesAudioClock(void) {
 
 static uint64_t KernelNowUs(void) {
     if (UsesAudioClock())
-        return AtomicTimeLoad(&audio_time_us);
+        return AtomicTimeLoad(&cpu_ns) / 1000;
     if (AtomicLoad(&host_clock_paused))
         return AtomicTimeLoad(&host_clock_frozen_us);
     return Psyz_OsNowUs() * (uint64_t)AtomicLoad(&host_clock_speed) -
            AtomicTimeLoad(&host_clock_offset_us);
+}
+
+// The kernel's time in ns: the CPU's position, or the host clock's us.
+static uint64_t KernelNowNs(void) {
+    if (UsesAudioClock())
+        return AtomicTimeLoad(&cpu_ns);
+    return KernelNowUs() * 1000;
 }
 
 /* Emulated time for devices that run on their own clock (the CD drive): the
@@ -236,17 +254,11 @@ void Psyz_SpendTime(unsigned ns) {
     }
 }
 
-static uint64_t spend_carry_ns;
 static uint64_t spend_deadline_ns;
 static uint64_t spend_cycle_carry; // clocks * 1e9 not yet spent, below one ns
 static void SpendNs(uint64_t ns) {
     if (UsesAudioClock()) {
-        spend_carry_ns += ns;
-        if (spend_carry_ns >= 1000) {
-            uint64_t us = spend_carry_ns / 1000;
-            spend_carry_ns %= 1000;
-            Psyz_AudioWaitUs(us);
-        }
+        Psyz_AudioWaitNs(ns);
         return;
     }
     // A deadline already passed (other work ran since) restarts from now.
@@ -264,23 +276,18 @@ unsigned long long Psyz_EmulatedClocks(void) {
     if (!UsesAudioClock()) {
         return 0;
     }
-    uint64_t ns = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
+    uint64_t ns = AtomicTimeLoad(&cpu_ns);
     return ns * SYSTEM_CLOCK_HZ / 1000000000u +
            (uint64_t)AtomicLoad(&interrupt_debt);
 }
 
-uint64_t Psyz_KernelNowNs(void) {
-    if (!UsesAudioClock()) {
-        return KernelNowUs() * 1000;
-    }
-    return AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
-}
+uint64_t Psyz_KernelNowNs(void) { return KernelNowNs(); }
 
 void Psyz_KernelWaitUntilNs(uint64_t at_ns) {
     if (!UsesAudioClock()) {
         return;
     }
-    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns +
+    uint64_t now = AtomicTimeLoad(&cpu_ns) +
                    (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u / SYSTEM_CLOCK_HZ;
     if (at_ns <= now) {
         return;
@@ -293,26 +300,20 @@ void Psyz_KernelWaitUntilNs(uint64_t at_ns) {
     Psyz_SpendTime((unsigned)(at_ns - now));
 }
 
-/* CPU stalls at their times (Psyz_KernelStallAt): a small queue, the
- * earliest posted as a timed callback. */
+/* CPU stalls at their times (Psyz_KernelStallAt): a small queue in time
+ * order, its head one of the kernel's deadlines (ServiceTimers). */
 enum { STALLS_MAX = 8192 };
 static struct {
     uint64_t at_ns;
     unsigned clocks;
 } stalls[STALLS_MAX];
 static unsigned stall_head, stall_len; // a ring, in time order
-static void StallFire(void);
+static void LowerPollDeadline(uint64_t at_ns);
 
-static void StallPost(void) {
-    if (stall_len) {
-        Psyz_KernelPostAt(stalls[stall_head].at_ns / 1000, StallFire);
-    }
-}
-
-static void StallFire(void) {
-    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + 999;
+// The stalls due by now_ns become handler time owed.
+static void ServiceStalls(uint64_t now_ns) {
     unsigned owed = 0;
-    while (stall_len && stalls[stall_head].at_ns <= now) {
+    while (stall_len && stalls[stall_head].at_ns <= now_ns) {
         owed += stalls[stall_head].clocks;
         stall_head = (stall_head + 1) % STALLS_MAX;
         stall_len--;
@@ -320,14 +321,13 @@ static void StallFire(void) {
     if (owed) {
         AtomicAdd(&interrupt_debt, (long)owed);
     }
-    StallPost();
 }
 
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks) {
     if (!UsesAudioClock() || !clocks) {
         return;
     }
-    uint64_t now = AtomicTimeLoad(&audio_time_us) * 1000 + spend_carry_ns;
+    uint64_t now = AtomicTimeLoad(&cpu_ns);
     if (at_ns <= now) {
         AtomicAdd(&interrupt_debt, (long)clocks);
         return;
@@ -345,7 +345,7 @@ void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks) {
     stalls[slot].clocks = clocks;
     stall_len++;
     if (stall_len == 1) {
-        StallPost();
+        LowerPollDeadline(at_ns);
     }
 }
 
@@ -357,10 +357,13 @@ void Psyz_SpendCycles(unsigned cycles) {
     if (!UsesAudioClock()) {
         return; // the host's own time stands for it on a real-time clock
     }
-    if (OwnsKernel()) {
+    if (OwnsKernel() && in_interrupt) {
         Psyz_KernelInterruptCycles(cycles);
         return;
     }
+    /* The main thread's work, also while it holds the kernel lock (a
+     * library's section the interrupts must not enter, a critical
+     * section): the interrupts that come wait for its end. */
     do {
         uint64_t scaled = (uint64_t)cycles * 1000000000u + spend_cycle_carry;
         spend_cycle_carry = scaled % SYSTEM_CLOCK_HZ;
@@ -443,16 +446,18 @@ enum { DISPATCH_RING = 8 };
 static struct {
     uint64_t ns;
     unsigned cycles;
+    int device; // a device model's interrupt (Psyz_KernelDispatch)
 } dispatches[DISPATCH_RING];
 static unsigned dispatch_next;
 static int dispatch_seen;
 
-static void RecordDispatch(uint64_t at_ns, unsigned cycles) {
+static void RecordDispatch(uint64_t at_ns, unsigned cycles, int device) {
     if (!UsesAudioClock()) {
         return;
     }
     dispatches[dispatch_next].ns = at_ns;
     dispatches[dispatch_next].cycles = cycles;
+    dispatches[dispatch_next].device = device;
     dispatch_next = (dispatch_next + 1) % DISPATCH_RING;
     dispatch_seen = 1;
 }
@@ -487,7 +492,7 @@ static void ServiceLine(int line, uint64_t at_ns) {
             stall_head = (stall_head + 1) % STALLS_MAX;
             stall_len--;
         }
-        RecordDispatch(at_ns, window);
+        RecordDispatch(at_ns, window, 0);
     }
 }
 
@@ -496,7 +501,7 @@ void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged) {
         return;
     }
     Psyz_KernelInterruptCycles(charged);
-    RecordDispatch(at_ns, cycles);
+    RecordDispatch(at_ns, cycles, 1);
 }
 
 // The latest recorded dispatch that began by at_ns.
@@ -536,7 +541,12 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
         }
         uint64_t clocks =
             (blank_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
-        if (clocks > test_clocks && clocks <= dispatches[i].cycles - exit_clocks) {
+        /* the BIOS's root counter handlers come before the chains' vblank
+         * tests in a root counter's exception, not in a device's */
+        unsigned test = dispatches[i].device && test_clocks > BIOS_RCNT_CHAIN_CYCLES
+                            ? test_clocks - BIOS_RCNT_CHAIN_CYCLES
+                            : test_clocks;
+        if (clocks > test && clocks <= dispatches[i].cycles - exit_clocks) {
             return 1;
         }
     }
@@ -574,7 +584,7 @@ static void ServicePending(void) {
             while (!(ready & (1u << line))) {
                 line++;
             }
-            ServiceLine(line, KernelNowUs() * 1000);
+            ServiceLine(line, KernelNowNs());
         } else if (pending_len > 0) {
             PendingEvent ev = pending[0];
             pending_len--;
@@ -794,24 +804,29 @@ static unsigned CounterClock(int i, long mode) {
     }
 }
 
-static int IsDue(uint64_t deadline_us, uint64_t now_us) {
-    return now_us >= deadline_us;
-}
+static int IsDue(uint64_t deadline, uint64_t now) { return now >= deadline; }
 
 static void CounterStep(RootCounter* c) {
-    c->last_us = c->next_us;
-    c->next_us += c->period_us;
+    c->last_ns = c->next_ns;
+    c->last_frac = c->frac_acc;
+    c->next_ns += c->period_ns;
     c->frac_acc += c->period_frac;
     if (c->frac_acc >= c->clock_hz) {
         c->frac_acc -= c->clock_hz;
-        c->next_us++;
+        c->next_ns++;
     }
 }
 
-static void CounterRestart(RootCounter* c, uint64_t now_us) {
-    c->last_us = now_us;
-    c->next_us = now_us + c->period_us;
-    c->frac_acc = 0;
+// The count restarts from 0 at now_ns plus frac / clock_hz ns.
+static void CounterRestart(RootCounter* c, uint64_t now_ns, uint32_t frac) {
+    c->last_ns = now_ns;
+    c->last_frac = frac;
+    c->next_ns = now_ns + c->period_ns;
+    c->frac_acc = frac + c->period_frac;
+    if (c->frac_acc >= c->clock_hz) {
+        c->frac_acc -= c->clock_hz;
+        c->next_ns++;
+    }
 }
 
 /* One-shot device completions on the emulated clock (an MDEC transfer, an
@@ -824,13 +839,29 @@ static void CounterRestart(RootCounter* c, uint64_t now_us) {
  * hang the waiter, so it stops the program. */
 #define TIMED_MAX 16
 static struct {
-    uint64_t at_us;
+    uint64_t at_ns;
     void (*fn)(void);
 } timed[TIMED_MAX];
 static int timed_len;
 
 static void StartIrqThread(void);
+
+// A deadline at at_ns: the next service comes by then.
+static void LowerPollDeadline(uint64_t at_ns) {
+    StartIrqThread();
+    KernelLock();
+    if (at_ns < AtomicTimeLoad(&poll_deadline_ns)) {
+        AtomicTimeStore(&poll_deadline_ns, at_ns);
+    }
+    KernelUnlock();
+    Psyz_OsBellRing(bell_irq);
+}
+
 void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void)) {
+    Psyz_KernelPostAtNs(at_us * 1000, fn);
+}
+
+void Psyz_KernelPostAtNs(uint64_t at_ns, void (*fn)(void)) {
     StartIrqThread();
     KernelLock();
     int slot = 0;
@@ -844,11 +875,11 @@ void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void)) {
     if (slot == timed_len) {
         timed_len++;
     }
-    timed[slot].at_us = at_us;
+    timed[slot].at_ns = at_ns;
     timed[slot].fn = fn;
-    uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
-    if (at_us < deadline) {
-        AtomicTimeStore(&poll_deadline_us, at_us);
+    uint64_t deadline = AtomicTimeLoad(&poll_deadline_ns);
+    if (at_ns < deadline) {
+        AtomicTimeStore(&poll_deadline_ns, at_ns);
     }
     KernelUnlock();
     Psyz_OsBellRing(bell_irq);
@@ -866,20 +897,20 @@ void Psyz_KernelCancel(void (*fn)(void)) {
 }
 
 // Fires the due one-shot completions, earliest first; returns 1 with the
-// next one's time in *next_us when some remain.
-static int ServiceTimed(uint64_t now, uint64_t* next_us) {
+// next one's time in *next_ns when some remain.
+static int ServiceTimed(uint64_t now, uint64_t* next_ns) {
     for (;;) {
         int first = -1;
         for (int i = 0; i < timed_len; i++) {
-            if (first < 0 || timed[i].at_us < timed[first].at_us) {
+            if (first < 0 || timed[i].at_ns < timed[first].at_ns) {
                 first = i;
             }
         }
         if (first < 0) {
             return 0;
         }
-        if (!IsDue(timed[first].at_us, now) || in_critical_section) {
-            *next_us = timed[first].at_us;
+        if (!IsDue(timed[first].at_ns, now) || in_critical_section) {
+            *next_ns = timed[first].at_ns;
             return 1;
         }
         void (*fn)(void) = timed[first].fn;
@@ -889,25 +920,23 @@ static int ServiceTimed(uint64_t now, uint64_t* next_us) {
 }
 
 // Fires every timer interrupt that came due. Returns 0 when no timer is
-// triggered, otherwise 1 with the earliest deadline in *deadline_us.
-static int ServiceTimers(uint64_t* deadline_us) {
+// triggered, otherwise 1 with the earliest deadline in *deadline_ns.
+static int ServiceTimers(uint64_t* deadline_ns) {
     int triggered = 0;
     KernelLock();
-    uint64_t now = KernelNowUs();
+    uint64_t now = KernelNowNs();
     in_interrupt = 1;
     for (int i = 0; i < LEN(counters); i++) {
         RootCounter* c = &counters[i];
         unsigned bit = 1u << (IRQ_RCNT0 + i);
-        if (!c->period_us || !c->irq) {
+        if (!c->period_ns || !c->irq) {
             continue;
         }
-        if (now > c->next_us && now - c->next_us > MAX_CATCHUP_US) {
-            CounterRestart(c, now);
+        if (now > c->next_ns && now - c->next_ns > MAX_CATCHUP_NS) {
+            CounterRestart(c, now, 0);
         }
-        while (IsDue(c->next_us, now)) {
-            // the exact due time, with the carried fraction of a microsecond
-            uint64_t due_ns =
-                c->next_us * 1000 + (uint64_t)c->frac_acc * 1000 / c->clock_hz;
+        while (IsDue(c->next_ns, now)) {
+            uint64_t due_ns = c->next_ns; // its exact time, to the ns
             CounterStep(c);
             if (irq_mask & bit) {
                 ServiceLine(IRQ_RCNT0 + i, due_ns);
@@ -915,20 +944,26 @@ static int ServiceTimers(uint64_t* deadline_us) {
                 irq_latched |= bit;
             }
         }
-        if (!triggered || c->next_us < *deadline_us) {
-            *deadline_us = c->next_us;
+        if (!triggered || c->next_ns < *deadline_ns) {
+            *deadline_ns = c->next_ns;
+            triggered = 1;
+        }
+    }
+    if (UsesAudioClock()) {
+        ServiceStalls(now);
+        if (stall_len && (!triggered || stalls[stall_head].at_ns < *deadline_ns)) {
+            *deadline_ns = stalls[stall_head].at_ns;
             triggered = 1;
         }
     }
     uint64_t timed_next;
     if (ServiceTimed(now, &timed_next) &&
-        (!triggered || timed_next < *deadline_us)) {
-        *deadline_us = timed_next;
+        (!triggered || timed_next < *deadline_ns)) {
+        *deadline_ns = timed_next;
         triggered = 1;
     }
     in_interrupt = 0;
-    AtomicTimeStore(
-        &poll_deadline_us, triggered ? *deadline_us : now + INT32_MAX);
+    AtomicTimeStore(&poll_deadline_ns, triggered ? *deadline_ns : UINT64_MAX);
     ServicePending();
     KernelUnlock();
     return triggered;
@@ -941,9 +976,9 @@ static void IrqThread(void) {
             Psyz_OsBellWait(bell_irq, PSYZ_OS_FOREVER);
             continue;
         }
-        uint64_t now = KernelNowUs();
+        uint64_t now = KernelNowNs();
         if (deadline > now) {
-            uint64_t left = deadline - now;
+            uint64_t left = (deadline - now + 999) / 1000;
             Psyz_OsBellWait(
                 bell_irq, (uint32_t)(left < INT32_MAX ? left : INT32_MAX));
         }
@@ -1004,39 +1039,62 @@ void Psyz_KernelSetHostClockSpeed(unsigned speed) {
 void Psyz_KernelPoll(void) {
     uint64_t deadline;
     if (!AtomicLoad(&irq_thread_state) || OwnsKernel() ||
-        (!UsesAudioClock() &&
-         !IsDue(AtomicTimeLoad(&poll_deadline_us), KernelNowUs()))) {
+        !IsDue(AtomicTimeLoad(&poll_deadline_ns), KernelNowNs())) {
         return;
     }
     ServiceTimers(&deadline);
 }
 
-/* Keep a timer edge between sample batches, rather than moving every AKAO
- * update to the video-frame boundary. These endpoints are private to SDL. */
-unsigned Psyz_KernelAudioBatch(unsigned maximum) {
-    if (!UsesAudioClock())
-        return maximum;
-    Psyz_KernelPoll();
-    if (!AtomicLoad(&irq_thread_state))
-        return maximum;
-    uint64_t deadline = AtomicTimeLoad(&poll_deadline_us);
-    uint64_t now = AtomicTimeLoad(&audio_time_us);
-    if (deadline <= now)
-        return 1;
-    uint64_t until =
-        (deadline - now) * PSYZ_SPU_SAMPLE_RATE - audio_time_fraction;
-    uint64_t frames = (until + 999999) / 1000000;
-    return frames < maximum ? (unsigned)(frames ? frames : 1) : maximum;
+/* The offline clock's only advance: from the CPU's position to at_ns, the
+ * kernel's deadlines (the main thread's, outside a handler or critical
+ * section, where they can run) and the platform's blanks on the way each
+ * run at their own time, a deadline before a blank at the same time. The
+ * audio is mixed up to each. A wait inside one of them (a handler's) spends
+ * no time: the handler's time is owed instead. */
+void Psyz_KernelAdvanceToNs(uint64_t at_ns) {
+    if (!UsesAudioClock() || advancing) {
+        return;
+    }
+    advancing = 1;
+    for (;;) {
+        uint64_t now = AtomicTimeLoad(&cpu_ns);
+        uint64_t next = UINT64_MAX;
+        if (AtomicLoad(&irq_thread_state) && !OwnsKernel()) {
+            next = AtomicTimeLoad(&poll_deadline_ns);
+        }
+        uint64_t blank = Psyz_AudioNextBlankNs();
+        uint64_t at = next < blank ? next : blank;
+        if (at > at_ns) {
+            break;
+        }
+        if (at > now) {
+            Psyz_AudioMixTo(at);
+            AtomicTimeStore(&cpu_ns, at);
+        }
+        if (next <= blank) {
+            uint64_t deadline;
+            ServiceTimers(&deadline);
+        } else {
+            Psyz_AudioBlankDue();
+        }
+    }
+    if (at_ns > AtomicTimeLoad(&cpu_ns)) {
+        Psyz_AudioMixTo(at_ns);
+        AtomicTimeStore(&cpu_ns, at_ns);
+    }
+    advancing = 0;
 }
 
-void Psyz_KernelAdvanceAudio(unsigned frames) {
-    if (!UsesAudioClock())
-        return;
-    uint64_t fraction = audio_time_fraction + (uint64_t)frames * 1000000;
-    AtomicTimeStore(&audio_time_us, AtomicTimeLoad(&audio_time_us) +
-                                        fraction / PSYZ_SPU_SAMPLE_RATE);
-    audio_time_fraction = (unsigned)(fraction % PSYZ_SPU_SAMPLE_RATE);
-    Psyz_KernelPoll();
+/* The next kernel deadline (offline clock), for a wait that runs until a
+ * timer fires; UINT64_MAX when there is none. It services the kernel's
+ * queues first, which also drops a stale earlier deadline (a counter set
+ * again later). */
+uint64_t Psyz_KernelNextDeadlineNs(void) {
+    if (!UsesAudioClock() || !AtomicLoad(&irq_thread_state) || OwnsKernel()) {
+        return UINT64_MAX;
+    }
+    uint64_t deadline;
+    return ServiceTimers(&deadline) ? deadline : UINT64_MAX;
 }
 
 long SetRCnt(long spec, unsigned short target, long mode) {
@@ -1049,39 +1107,29 @@ long SetRCnt(long spec, unsigned short target, long mode) {
     KernelLock();
     RootCounter* c = &counters[i];
     uint32_t clock = CounterClock(i, mode);
-    // target * 1000000 / clock split in two steps to stay within 32 bits
-    uint32_t scaled = (target ? target : 0x10000) * 15625u;
-    uint32_t rem = scaled % clock * 64;
+    uint64_t scaled = (uint64_t)(target ? target : 0x10000) * 1000000000u;
     c->clock_hz = clock;
     c->target = target ? target : 0x10000;
-    c->period_us = scaled / clock * 64 + rem / clock;
-    c->period_frac = rem % clock;
-    if (c->period_us < MIN_PERIOD_US) {
-        c->period_us = MIN_PERIOD_US;
+    c->period_ns = scaled / clock;
+    c->period_frac = (uint32_t)(scaled % clock);
+    if (c->period_ns < MIN_PERIOD_NS) {
+        c->period_ns = MIN_PERIOD_NS;
         c->period_frac = 0;
     }
-    c->ticks_per_us_q15 = clock / 15625 * 512 + clock % 15625 * 512 / 15625;
     c->irq = (mode & RCntMdINTR) != 0;
-    /* The count starts at the mode write, within the microsecond: the first
-     * target comes a period after it, to the clock (SetRCnt's own code up to
-     * that write is SET_RCNT_CYCLES, spent before). */
-    uint64_t start_ns = KernelNowUs() * 1000;
+    /* The count starts at the mode write: the first target comes a period
+     * after it, to the clock (SetRCnt's own code up to that write is
+     * SET_RCNT_CYCLES, spent before). On the offline clock that is the main
+     * thread's position with the handlers' time owed (inside a critical
+     * section it is owed). */
+    uint64_t start_ns = KernelNowNs();
     if (UsesAudioClock()) {
-        // the main thread's position: the time spent but not yet mixed and
-        // the handlers' time owed (inside a critical section it is owed)
-        start_ns += spend_carry_ns +
-                    (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u /
-                        SYSTEM_CLOCK_HZ;
+        start_ns += (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u /
+                    SYSTEM_CLOCK_HZ;
     }
-    CounterRestart(c, start_ns / 1000);
-    c->frac_acc += (uint32_t)(start_ns % 1000 * clock / 1000);
-    if (c->frac_acc >= c->clock_hz) {
-        c->frac_acc -= c->clock_hz;
-        c->next_us++;
-    }
-    AtomicTimeStore(&poll_deadline_us, c->last_us);
+    CounterRestart(c, start_ns, 0);
     KernelUnlock();
-    Psyz_OsBellRing(bell_irq);
+    LowerPollDeadline(c->next_ns);
     return 1;
 }
 
@@ -1093,10 +1141,17 @@ long GetRCnt(long spec) {
     KernelLock();
     RootCounter* c = &counters[i];
     long value = 0;
-    if (c->period_us) {
-        uint32_t phase = (KernelNowUs() - c->last_us) % c->period_us;
-        uint32_t ticks = phase * c->ticks_per_us_q15 >> 15;
-        value = (long)(ticks < c->target ? ticks : c->target - 1);
+    if (c->period_ns) {
+        // the counts since the last restart, which came last_frac /
+        // clock_hz ns after last_ns, modulo the target
+        uint64_t now = KernelNowNs();
+        uint64_t since = now > c->last_ns ? now - c->last_ns : 0;
+        uint64_t sub = since % 1000000000u * c->clock_hz;
+        int64_t ticks = (int64_t)(since / 1000000000u * c->clock_hz % c->target);
+        ticks += sub >= c->last_frac
+                     ? (int64_t)((sub - c->last_frac) / 1000000000u)
+                     : -1;
+        value = (long)((ticks % (int64_t)c->target + c->target) % c->target);
     }
     KernelUnlock();
     return value;
@@ -1108,10 +1163,9 @@ long ResetRCnt(long spec) {
         return 0;
     }
     KernelLock();
-    CounterRestart(&counters[i], KernelNowUs());
-    AtomicTimeStore(&poll_deadline_us, counters[i].last_us);
+    CounterRestart(&counters[i], KernelNowNs(), 0);
     KernelUnlock();
-    Psyz_OsBellRing(bell_irq);
+    LowerPollDeadline(counters[i].next_ns);
     return 1;
 }
 
@@ -1215,7 +1269,6 @@ int ResetCallback(void) {
     memset(vsync_callbacks, 0, sizeof(vsync_callbacks));
     // the fractions of time carried between spends start again (D10 list in
     // internal.h)
-    spend_carry_ns = 0;
     spend_deadline_ns = 0;
     spend_cycle_carry = 0;
     irq_callbacks[IRQ_VBLANK] = VSyncDispatch;

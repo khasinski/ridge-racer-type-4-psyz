@@ -598,7 +598,11 @@ static void drive_wait_until_mode(uint64_t until_us, int poll) {
                 until_us = now + owed_us;
             }
         }
-        Psyz_AudioWaitUs(until_us - now);
+        // to the deadline itself, from the CPU's position (ns)
+        uint64_t now_ns = Psyz_KernelNowNs();
+        if (until_us * 1000 > now_ns) {
+            Psyz_AudioWaitNs(until_us * 1000 - now_ns);
+        }
         if (poll) {
             Psyz_KernelTakeInterruptCycles();
         }

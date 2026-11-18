@@ -135,6 +135,14 @@ enum {
      * fields */
     BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
     BIOS_CHAIN_CARD_TEST_CLOCKS = 1197,
+    /* A device's exception (the CD drive's) reaches those tests this much
+     * sooner: the root counters' handlers, which deliver their event in a
+     * counter's exception, only test theirs. On DuckStation a blank 845 to
+     * 2899 clocks into a CD exception has neither libpad's exchange nor a
+     * card driver turn, one 365 to 414 clocks into it both (the card
+     * scenarios of tools/port/ds_compare.py, DSF_EXC, DSF_PADLOG,
+     * DSF_CARDPORT): the tests come between, here 637 and 496 [exc] */
+    BIOS_RCNT_CHAIN_CYCLES = 560,
     LIBETC_DISPATCH_EXIT_CLOCKS = 243,
 };
 
@@ -316,13 +324,23 @@ enum {
     CD_DATA_IRQ_CLOCKS = 3780,
     /* A read's ready callback that issues a command (CdRead's ending
      * Pause): CD_cw comes this long after the sector's exception, before
-     * the card driver's chain is installed (the boot's reads, 3336 [exc])
-     * and BIOS_CARD_CHAIN_CYCLES later after it. */
-    CD_DATA_CALLBACK_CW_CLOCKS = 3336,
+     * the card driver's chain is installed and BIOS_CARD_CHAIN_CYCLES later
+     * after it. On DuckStation the Pause's acknowledge comes 28848-28890
+     * clocks after the sector's interrupt in the boot's reads and 29221-
+     * 29269 in the opening and the menus, the acknowledge's 25000 included
+     * [exc] (DSF_EXC; the boot against the port's sector times, which
+     * match DuckStation's to 50 clocks in the menus). */
+    CD_DATA_CALLBACK_CW_CLOCKS = 3864,
     CD_ACK_IRQ_CLOCKS = 2400,
     CD_DONE_IRQ_CLOCKS = 2400,
     CD_CW_ACK_CYCLES = 2620,
     CD_DONE_IRQ_CYCLES = 2120,
+    /* CdRead's ending Pause: its completion's sync callback (restoring the
+     * caller's) and the wait loop's return, more than CD_DONE_IRQ_CYCLES;
+     * the Pause done to the next read's Setloc acknowledge of the boot's
+     * directory reads on DuckStation (31143 clocks; the commands and
+     * CD_SEARCH_* between them as charged) [exc] */
+    CD_READ_PAUSE_CALLBACK_CYCLES = 220,
     CD_INIT_CYCLES = 4680,
     /* CdReset(1)'s CD_initvol (the SPU volume writes and CdMix) after
      * CD_init's last acknowledge, to the caller's next call (SoundSystemInit:
@@ -339,6 +357,12 @@ enum {
      * included): the volume descriptor, the path table, the directory's
      * file records; then each name compared, and the found file's return
      * to the caller's next call [mark] */
+    /* CdSearchFile on a new disc before its first read: the caller's
+     * return from CdInit (CD_initvol after its Demute) to CD_newmedia's
+     * Setloc, DuckStation's 29072 clocks from that Demute's acknowledge to
+     * the Setloc's (CD_CW_ACK_CYCLES, CD_INITVOL_CYCLES and the command's
+     * own as charged) [exc] */
+    CD_SEARCH_NEWMEDIA_CYCLES = 345,
     CD_SEARCH_PVD_CYCLES = 3215,
     CD_SEARCH_PATH_TABLE_CYCLES = 2561,
     CD_SEARCH_DIR_CYCLES = 14047,
