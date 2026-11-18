@@ -298,8 +298,10 @@ enum {
      * ring before its first read, 290 fields with one pad, 292 with two.
      * [field] f0e3704; refit with the interrupt costs above to DuckStation's
      * 5,839,811 us from the opening's ring setup to its first read
-     * (tools/port/ds_frames.py marks). */
-    ST_POLL_MILLICYCLES = 47026,
+     * (tools/port/ds_frames.py marks); on the CPU-position clock the
+     * movie's first Setloc acknowledge comes 1.2k clocks before
+     * DuckStation's (47026 put it 34.8k after). */
+    ST_POLL_MILLICYCLES = 47017,
     /* Another drive query in a busy loop (CdSync, CdReady, CdReadSync),
      * interrupts included. [unrecorded] 8080ec2 */
     CD_POLL_NS = 2000,
