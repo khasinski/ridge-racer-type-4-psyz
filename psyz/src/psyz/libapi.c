@@ -214,6 +214,16 @@ static unsigned int WaitBlank(unsigned int now) {
         return ServiceWallBlanks();
     }
     wall_serviced_valid = 0;
+    if (Psyz_KernelOfflineClock()) {
+        /* The handlers that ran during the wait were the polling loop's
+         * time: only one still running at the blank delays what follows. */
+        Psyz_KernelTakeInterruptCycles();
+        uint64_t at_ns = Psyz_KernelNowUs() * 1000;
+        unsigned since = 0, cycles = 0;
+        if (Psyz_KernelLastDispatch(at_ns, &since, &cycles) && cycles > since) {
+            Psyz_KernelInterruptCycles(cycles - since);
+        }
+    }
     now = (unsigned int)Psyz_VideoVSync(-1);
     unsigned int advanced = now - before;
     while (advanced--) {
@@ -277,6 +287,9 @@ int VSync(int mode) {
     uint64_t handler_ns = (uint64_t)Psyz_KernelTakeInterruptCycles() *
                           1000000000u / 33868800u;
     uint64_t wait_ns = (uint64_t)wait_lines * LineNs();
+    if (PadTrace())
+        fprintf(stderr, "pad: vsync return handler %llu ns wait %u lines\n",
+                (unsigned long long)handler_ns, wait_lines);
     if (handler_ns > wait_ns) {
         wait_ns = handler_ns;
     }
