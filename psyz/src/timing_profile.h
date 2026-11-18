@@ -109,10 +109,12 @@ enum {
     CARD_RAW_END_CYCLES = 2109,
     /* libpad's controller exchange at each vblank once PadStartCom ran: its
      * SIO busy waits for a digital pad in port 1, port 2 empty [call]
-     * 686859c; 4.8k more with a pad in port 2 (26.2k against 21.4k for the
-     * whole handler) [call] f0e3704. */
+     * 686859c; 4333 more with a pad in port 2: the vblank's exception
+     * takes 24633 clocks against 20300 with one pad (DSF_EXC, the recompiler:
+     * the Versus scenario with two saved cards, fields 800-829, against the
+     * boot's 158-160; the breakpoint value was 4.8k [call] f0e3704). */
     LIBPAD_VBLANK_CYCLES = 16084,
-    LIBPAD_VBLANK_PORT2_CYCLES = 4790,
+    LIBPAD_VBLANK_PORT2_CYCLES = 4333,
     /* A digital pad in port 1 does not acknowledge a command other than
      * 0x42 (libpad's 0x43 while it probes for an analog controller after
      * PadStartCom): the exchange stops at the ID byte and the vblank's
