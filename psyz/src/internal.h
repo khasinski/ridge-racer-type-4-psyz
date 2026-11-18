@@ -172,6 +172,9 @@ int Psyz_CardChainInstalled(void);
 int Psyz_CardDriverRunning(void);
 void Psyz_LibpadVBlank(void);
 int Psyz_LibpadExchanged(int port, int* halfwords);
+// Whether that port's controller refused the command byte at the latest
+// vblank (the exchange stopped there).
+int Psyz_LibpadRefused(int port);
 // The controllers' side of the serial exchange (pad.c): the byte a
 // controller answers to @p in with the input of @p frame, and whether it
 // ACKs it; deselecting the port ends its command.
@@ -184,6 +187,8 @@ const char* Psyz_PadsFrame(int port);
 // The BIOS memory card driver's work at a vblank (libcard.c); turn 0: a
 // vblank its handler misses.
 void Psyz_CardVBlank(int turn);
+// Applies Psyz_CardSetSlotStateAtBlank's state at the start of a blank.
+void Psyz_CardBlankBegin(void);
 // The blank where a raw card access ends: libpad has no exchange there.
 int Psyz_CardRawEndsAt(int turn);
 // A BIOS file service that reads a card sector itself and waits for it

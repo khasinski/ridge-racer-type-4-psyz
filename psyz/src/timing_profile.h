@@ -113,6 +113,12 @@ enum {
      * whole handler) [call] f0e3704. */
     LIBPAD_VBLANK_CYCLES = 16084,
     LIBPAD_VBLANK_PORT2_CYCLES = 4790,
+    /* A digital pad in port 1 does not acknowledge a command other than
+     * 0x42 (libpad's 0x43 while it probes for an analog controller after
+     * PadStartCom): the exchange stops at the ID byte and the vblank's
+     * exception takes 18688 clocks against 20300 for a 0x42 exchange
+     * (DSF_EXC, DuckStation fields 146-157 against 158-160 of the boot). */
+    LIBPAD_REFUSED_COMMAND_SAVED_CYCLES = 1612,
     /* Each halfword of a controller's packet past the first: libpad's
      * handler takes 22.0k clocks with a JogCon in port 1 (three halfwords)
      * against 15.6k with a digital pad. [rec] ds_irqlog, menus */

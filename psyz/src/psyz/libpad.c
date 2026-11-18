@@ -98,6 +98,7 @@ static int bus_port;
 static struct {
     int answered; // the controller ACKed the address byte
     int halfwords; // of the packet received to its end, else 0
+    int refused;   // the controller did not ACK the command byte
 } exchanged[2];
 
 static void Send(u8 byte) {
@@ -683,8 +684,12 @@ static int Exchange(Channel* c, int port) {
     exchanged[port].answered = 1;
     // stage 2: the ID; the Multi Tap byte
     r = SioRW2(c, 0);
-    if (r < 0)
+    if (r < 0) {
+        // a command the controller does not know (a digital pad's 0x43
+        // while libpad probes for analog modes) is not acknowledged
+        exchanged[port].refused = r == -2;
         return r;
+    }
     bytes_left = (r & 0xF) * 2;
     if (bytes_left == 0)
         bytes_left = 0x20;
@@ -771,6 +776,10 @@ void Psyz_LibpadVBlank(void) {
 }
 
 int Psyz_PadDriverRunning(void) { return com_started; }
+
+int Psyz_LibpadRefused(int port) {
+    return port >= 0 && port <= 1 && exchanged[port].refused;
+}
 
 int Psyz_LibpadExchanged(int port, int* halfwords) {
     if (port < 0 || port > 1)

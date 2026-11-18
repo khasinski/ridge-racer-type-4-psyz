@@ -216,6 +216,15 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write);
 void Psyz_CardFileCreate(void);
 
 /**
+ * @brief A BIOS open of a card file on `chan`: whether a card answers
+ *
+ * With no card in the port the BIOS's access to it goes out on the port's
+ * next turn and times out at the vblank after; the open then fails
+ * (returns 0). Returns 1 at once when a card is there.
+ */
+int Psyz_CardFileOpen(long chan);
+
+/**
  * @brief Complete memory card requests and file I/O at once
  *
  * By default the BIOS card driver serves the two ports on alternate
@@ -230,9 +239,11 @@ void Psyz_CardSetInstantTiming(int instant);
 /**
  * @brief Start a raw command on memory card channel `chan`
  *
- * For a host-side library that talks to the card port itself (libmcx):
- * the card driver transfers it on that port's next vblank and it is
- * answered at the vblank after. Returns 0 while a command is in progress.
+ * For a host-side library that talks to the card port itself from its own
+ * vblank handler (libmcx): the command goes out at the next vblank,
+ * whichever port the BIOS card driver serves there, and is answered (timed
+ * out by a plain memory card) at the vblank after. Returns 0 while a
+ * command is in progress.
  */
 int Psyz_CardRawBegin(long chan);
 
@@ -259,6 +270,14 @@ int Psyz_CardSlotState(int port);
  * @brief Plug, unplug or unformat the card in port `port` (0 or 1)
  */
 void Psyz_CardSetSlotState(int port, int state);
+
+/**
+ * @brief The same at the next vblank, before the card driver's work there
+ *
+ * As a card taken out or put in between two fields of the console: the
+ * driver's transfer at that vblank already sees the new state.
+ */
+void Psyz_CardSetSlotStateAtBlank(int port, int state);
 
 #ifdef __cplusplus
 }

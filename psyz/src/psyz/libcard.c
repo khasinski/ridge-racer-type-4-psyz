@@ -78,6 +78,23 @@ void Psyz_CardSetSlotState(int port, int state) {
     }
 }
 
+static int card_slot_at_blank[2] = {-1, -1};
+
+void Psyz_CardSetSlotStateAtBlank(int port, int state) {
+    if (port >= 0 && port <= 1) {
+        card_slot_at_blank[port] = state;
+    }
+}
+
+void Psyz_CardBlankBegin(void) {
+    for (int port = 0; port < 2; port++) {
+        if (card_slot_at_blank[port] >= 0) {
+            Psyz_CardSetSlotState(port, card_slot_at_blank[port]);
+            card_slot_at_blank[port] = -1;
+        }
+    }
+}
+
 static int card_is_instant(void);
 static uint64_t card_fields_us(unsigned fields);
 
@@ -151,7 +168,7 @@ static struct {
     int port;         // the port served at the last vblank
     int timeout_port; // an unanswered transfer, timed out at the next vblank
     int parse_port;   // a directory read, finished at the next vblank
-    int raw_port;     // a raw command waiting for its port (-1: none)
+    int raw_port;     // the raw command's port (-1: none)
     int raw_state;    // 0 none, 1 waiting, 2 transferred, 3 answered
     int raw_late;     // a new card answers a vblank later
     uint64_t last_vblank_us;
@@ -233,15 +250,27 @@ void Psyz_CardVBlank(int turn) {
     if (!turn) {
         return;
     }
+    /* A raw command (Psyz_CardRawBegin: libmcx's PocketStation 0x5A) runs
+     * on libmcx's own vblank handler, not on the BIOS driver's port turns:
+     * it selects the card and sends the command at the first vblank after
+     * the call, whichever port the driver serves there, and a plain memory
+     * card does not answer it, so the handler times it out at the next
+     * vblank (DuckStation, DUCKSTATION_CARD_TRACE: the unformatted
+     * scenario's CARDOP 5a at port vsync 270 with the BIOS driver on port
+     * 1, libpad's exchange missing at 271; the Save and Load scenario's
+     * probe at 5900-5901, the driver's port 1 then 0). A card whose FLAG
+     * says new answers a vblank later (raw_late; see docs/TECH_DEBT.md). */
     if (card_drv.raw_state == 2) {
-        // a card whose FLAG says new answers the raw access a vblank later
-        // (DuckStation: an unformatted card's probe before _card_clear,
-        // fields 270-273, against 280-282 after it)
         if (card_drv.raw_late) {
             card_drv.raw_late = 0;
         } else {
             card_drv.raw_state = 3;
         }
+    } else if (card_drv.raw_state == 1) {
+        card_drv.raw_state = 2;
+        card_drv.raw_late = card_drv.raw_port >= 0 && card_drv.raw_port < 2 &&
+                            card_new[card_drv.raw_port] &&
+                            Psyz_CardSlotState(card_drv.raw_port) != PSYZ_CARD_NONE;
     }
     if (card_drv.parse_port >= 0) {
         // the parse's vblank is the other port's turn too (DuckStation
@@ -266,13 +295,6 @@ void Psyz_CardVBlank(int turn) {
     if (card_trace()) {
         fprintf(stderr, "card: vblank port %d transfers %d raw %d\n", port,
                 card_drv.req[port].transfers, card_drv.raw_state);
-    }
-    if (card_drv.raw_state == 1 && card_drv.raw_port == port) {
-        card_drv.raw_state = 2;
-        card_drv.raw_late = card_drv.raw_port >= 0 && card_drv.raw_port < 2 &&
-                            card_new[card_drv.raw_port] &&
-                            Psyz_CardSlotState(card_drv.raw_port) != PSYZ_CARD_NONE;
-        return;
     }
     CardRequest* r = &card_drv.req[port];
     if (!r->transfers || r->answering) {
@@ -671,3 +693,15 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
 }
 
 void Psyz_CardFileCreate(void) { card_spend_fields(CARD_CREATE_FIELDS); }
+
+/* DuckStation, the card pulled out during a save (DUCKSTATION_CARD_TRACE):
+ * each of the game's three retries of open(create) selects the empty slot
+ * once (port vsyncs 4475, 4478, 4483), times out at the next vblank and
+ * fails. */
+int Psyz_CardFileOpen(long chan) {
+    if (!validate_chan(chan) || card_chan_state(chan) != PSYZ_CARD_NONE) {
+        return 1;
+    }
+    Psyz_CardSyncTransfer(chan);
+    return 0;
+}

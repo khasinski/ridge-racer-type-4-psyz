@@ -116,6 +116,7 @@ void Psyz_VSyncBlank(void) {
     // on the offline clock the blank's exact time: it runs there
     uint64_t blank_ns = Psyz_KernelNowNs();
     last_blank_us = blank_ns / 1000;
+    Psyz_CardBlankBegin();
     Psyz_GpuCrtcBlank();
     int pad_exchange =
         Psyz_PadDriverRunning() &&
@@ -135,9 +136,11 @@ void Psyz_VSyncBlank(void) {
                  : Psyz_CardDriverRunning() && card_turn ? CARD_VBLANK_TURN_CYCLES
                                                          : 0) +
         (pad_exchange
-             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) +
+             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) -
+                   (Psyz_LibpadRefused(0) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0) +
                    (Psyz_LibpadExchanged(1, NULL)
-                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1)
+                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) -
+                              (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0)
                         : 0)
              : 0));
     if (PadTrace()) {
@@ -414,6 +417,11 @@ struct DIRENTRY* firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
                   dirPath[3] >= '0' && dirPath[3] <= '3';
     if (card_search) {
         Psyz_CardSyncTransfer(((dirPath[2] - '0') << 4) | (dirPath[3] - '0'));
+        // no card there (taken out: its host directory remains): no entry
+        if (dirPath[3] != '0' || Psyz_CardSlotState(dirPath[2] - '0') == PSYZ_CARD_NONE) {
+            card_search = 0;
+            return NULL;
+        }
     }
     struct DIRENTRY* entry = my_firstfile(dirPath, firstEntry);
     if (card_search) {
