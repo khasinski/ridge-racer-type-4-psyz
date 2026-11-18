@@ -1179,9 +1179,9 @@ ZTEST(events, card_info_takes_the_drivers_turn_of_the_port) {
     zexpect_s32_le(3, n);
 }
 
-// A memory card file's frames take the driver's turns of the port, after a
-// frame of the BIOS's own: a 1-block FASYNC read raises SwCARD (only) about
-// 2 x 65 vblanks later.
+// A memory card file's frames take the driver's turns of the port: a 1-block
+// FASYNC read raises SwCARD (only) about 2 x 64 vblanks later, a write one
+// turn later still.
 ZTEST(events, card_file_read_takes_a_turn_per_frame) {
     card_start();
     if (card_info(CARD_SLOT_1) != CARD_IOE) {
@@ -1191,14 +1191,14 @@ ZTEST(events, card_file_read_takes_a_turn_per_frame) {
     // count blanks, not loop turns: a stalled host can take several
     // blanks in one VSync(0)
     int start = VSync(-1);
-    Psyz_CardFileTransfer(CARD_SLOT_1, 0x2000, 1);
+    Psyz_CardFileTransfer(CARD_SLOT_1, 0x2000, 1, 0);
     int n = 0;
     while (!TestEvent(card_sw[CARD_IOE]) && n <= 140) {
         VSync(0);
         n = VSync(-1) - start;
     }
-    zexpect_s32_ge(128, n);
-    zexpect_s32_le(132, n);
+    zexpect_s32_ge(126, n);
+    zexpect_s32_le(130, n);
     zexpect_s32_eq(-1, card_poll(card_hw, 0));
 }
 

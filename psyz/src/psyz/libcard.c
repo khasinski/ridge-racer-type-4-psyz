@@ -531,10 +531,15 @@ long _card_read(long chan, long block, unsigned char* buf) {
 
 /* Memory card file timing ("bu" device). The BIOS moves a file's 128-byte
  * frames through the card driver, one transfer per turn of the port (every
- * other vblank), after a frame of its own: a 1-block FASYNC read raises
- * SwCARD/EvSpIOE a sector time after the vblank of its 65th transfer, 130.3
- * fields after the call (DuckStation, Ridge Racer Type 4, PAL); a
- * synchronous transfer returns then. Without a running driver (or with the
+ * other vblank), from the port's first turn after the call; a 1-block FASYNC
+ * read raises SwCARD/EvSpIOE a sector time after the vblank of its 64th
+ * transfer (DuckStation's card commands, DUCKSTATION_CARD_TRACE: Ridge Racer
+ * Type 4 loading its save at boot and in Save and Load, frames 0x40..0x7F).
+ * A write takes one transfer more: on DuckStation creating the file reads
+ * frame 0 and writes the directory frame between the probes of the BIOS file
+ * layer, and the data frames end on the turn the port's 65th transfer takes
+ * after the fixed creation time below. A synchronous transfer returns when
+ * the last one has ended. Without a running driver (or with the
  * port busy) the transfer takes the same number of turns on the clock.
  * Creating a file first writes its directory frames: 8 fields.
  * Psyz_CardSetInstantTiming(1) or PSYZ_CARD_TIMING=instant completes card
@@ -563,8 +568,8 @@ static uint64_t card_fields_us(unsigned fields) {
     return (fields * 3413ull * 263 * 1000000 + 26846587) / 53693175;
 }
 
-static int card_file_transfers(long bytes) {
-    return (int)((bytes + 127) / 128) + CARD_FILE_EXTRA_TRANSFERS;
+static int card_file_transfers(long bytes, int write) {
+    return (int)((bytes + 127) / 128) + (write ? CARD_FILE_EXTRA_TRANSFERS : 0);
 }
 
 static void card_spend_fields(unsigned fields) {
@@ -578,14 +583,14 @@ static void card_spend_fields(unsigned fields) {
 
 static void card_async_done(void) { Psyz_KernelRaise(SwCARD, EvSpIOE); }
 
-void Psyz_CardFileTransfer(long chan, long bytes, int async) {
+void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
     if (card_is_instant()) {
         if (async) {
             card_async_done();
         }
         return;
     }
-    int transfers = card_file_transfers(bytes);
+    int transfers = card_file_transfers(bytes, write);
     if (card_drv.running && validate_chan(chan) &&
         card_request_sectors(chan, transfers, async ? CARD_RAISE_SW : CARD_RAISE_NONE,
                              0, 0, 1)) {

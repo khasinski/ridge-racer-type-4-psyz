@@ -205,8 +205,10 @@ void Psyz_MdecSetInstantTiming(int instant);
  * turns of the port (chan: port << 4 | slot). An asynchronous (FASYNC)
  * transfer raises SwCARD/EvSpIOE once the PS1 would have finished it, on
  * the emulated clock; a synchronous one waits for that before returning.
+ * A read takes one transfer per 128-byte frame, a write (@p write non-zero)
+ * one more.
  */
-void Psyz_CardFileTransfer(long chan, long bytes, int async);
+void Psyz_CardFileTransfer(long chan, long bytes, int async, int write);
 
 /**
  * @brief Spend the time the BIOS takes to create a card file
