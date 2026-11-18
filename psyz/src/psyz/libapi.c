@@ -121,11 +121,19 @@ void Psyz_VSyncBlank(void) {
         !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
                                     LIBETC_DISPATCH_EXIT_CLOCKS);
     int card_turn =
-        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
-                                    LIBETC_DISPATCH_EXIT_CLOCKS);
+        !Psyz_KernelBlankInDispatchUpTo(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
+                                        LIBETC_DISPATCH_EXIT_CLOCKS,
+                                        BIOS_CHAIN_CARD_UNTIL_CLOCKS);
+    int raw_end = Psyz_CardRawEndsAt(card_turn);
+    if (raw_end) {
+        pad_exchange = 0;
+    }
     ReadPadsOnVsync(pad_exchange || !Psyz_PadDriverRunning());
     Psyz_KernelInterruptCycles(
         VBLANK_HANDLER_CYCLES +
+        (raw_end ? CARD_RAW_END_CYCLES
+                 : Psyz_CardDriverRunning() && card_turn ? CARD_VBLANK_TURN_CYCLES
+                                                         : 0) +
         (pad_exchange
              ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) +
                    (Psyz_LibpadExchanged(1, NULL)

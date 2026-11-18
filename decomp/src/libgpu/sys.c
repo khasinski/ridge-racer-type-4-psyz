@@ -162,6 +162,9 @@ enum {
 
 void GPU_cw(u_long*);
 int ResetGraph(int mode) {
+    GPU_TIME((mode & 7) == 0 || (mode & 7) == 3 || (mode & 7) == 5
+                 ? RESET_GRAPH_CYCLES
+                 : RESET_GRAPH_QUEUE_CYCLES);
     switch (mode & 7) {
     case 3:
     case 0:
@@ -199,6 +202,7 @@ int SetGraphReverse(int mode) {
 
 int SetGraphDebug(int level) {
     u_char prev = info.level;
+    GPU_TIME(SET_GRAPH_DEBUG_CYCLES);
     info.level = level;
     if (info.level) {
         GPU_printf("SetGraphDebug:level:%d,type:%d reverse:%d\n", info.level,
@@ -235,6 +239,7 @@ u_long DrawSyncCallback(void (*func)()) {
 }
 
 void SetDispMask(int mask) {
+    GPU_TIME(SET_DISP_MASK_CYCLES);
     if (info.level >= 2) {
         GPU_printf("SetDispMask(%d)...\n", mask);
     }

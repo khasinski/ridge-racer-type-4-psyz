@@ -1546,6 +1546,7 @@ void CD_datasync(int mode) { NOT_IMPLEMENTED; }
 
 int CD_initvol(void) {
     CdlATV vol = {128, 0, 128, 0};
+    drive_cpu(CD_INITVOL_CYCLES);
     if (SPUR(main_volx.left) == 0 && SPUR(main_volx.right) == 0) {
         SPUW(main_vol.left, 0x3FFF);
         SPUW(main_vol.right, 0x3FFF);
@@ -1696,13 +1697,22 @@ static void start_data_read(void) {
 }
 
 static uint64_t command_ack_us; // CD_cw
+/* While a read's ready callback runs from a sector's interrupt: where the
+ * CPU has got to in the handler, for a command it issues (CD_cw). */
+static uint64_t sector_callback_us;
 
 // The drive's interrupt for a sector, a command's acknowledge or its
 // completion: the exception's window for the vblanks it hides from the
 // BIOS chains, and the handler time not spent elsewhere (timing_profile.h).
+static int drive_trace(void);
 static void drive_irq(uint64_t at_us, unsigned cycles, unsigned charged) {
+    if (drive_trace()) {
+        fprintf(stderr, "cd irq %" PRIu64 " %u sector %d\n", at_us, cycles,
+                data_sector_number);
+    }
     if (!drive_is_instant()) {
-        Psyz_KernelDispatch(at_us * 1000, cycles, charged);
+        unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
+        Psyz_KernelDispatch(at_us * 1000, cycles + chain, charged ? charged + chain : 0);
     }
 }
 
@@ -1728,6 +1738,11 @@ static void deliver_data_sector(void) {
     if (!CD_cbready) {
         return;
     }
+    if (!drive_is_instant()) {
+        unsigned clocks = CD_DATA_CALLBACK_CW_CLOCKS +
+                          (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0);
+        sector_callback_us = irq_us + (clocks * 1000000ull + 33868799) / 33868800;
+    }
     u_char result[8] = {(u_char)CD_status};
     // CdGetSector inside the callback reads this sector.
     data_sector_number = sector;
@@ -1736,6 +1751,7 @@ static void deliver_data_sector(void) {
     drive_ready_sector = sector;
     unsigned generation = drive_generation;
     CD_cbready(CdlDataReady, result);
+    sector_callback_us = 0;
     drive_ready_sector = -1;
     if (generation == drive_generation) { // the callback issued no new read
         data_sector_valid = 0;
@@ -1980,7 +1996,12 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive_cpu(CD_CW_ISSUE_CYCLES);
     Psyz_KernelLockInterrupts();
     CD_com = com; // CdLastCom
+    // The command register write comes where the CPU's work has got to: in
+    // a handler (a read's ready callback) after the handler time before it.
     command_ack_us = drive_now();
+    if (sector_callback_us > command_ack_us) {
+        command_ack_us = sector_callback_us;
+    }
     if (!drive_is_instant()) {
         command_ack_us += drive_ack_us(com);
     }

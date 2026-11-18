@@ -329,35 +329,46 @@ void Psyz_AudioDisplayRangeChanged(
     StartOfflineClock();
     if (!is_audio_init || !video_clock || video_paused || mixing)
         return;
-    const unsigned total = video_pal ? 314 : 263;
-    const double field = video_pal
-                             ? (double)FIELD_SAMPLES_PAL / FIELD_DIVISOR_PAL
-                             : (double)FIELD_SAMPLES_NTSC / FIELD_DIVISOR_NTSC;
-    y1 = y1 < total ? y1 : total;
-    y2 = y2 < total ? y2 : total;
-    new_y1 = new_y1 < total ? new_y1 : total;
-    new_y2 = new_y2 < total ? new_y2 : total;
-    unsigned elapsed = field_frames_left ? field_frames_total - field_frames_left : 0;
-    double line = y2 + elapsed * total / field;
-    while (line >= total)
-        line -= total;
-    unsigned current = (unsigned)line;
+    /* Exact positions in units of 1 / (divisor * lines) samples, so that a
+     * line is FIELD_SAMPLES units: the beam's line now, from the console's
+     * blank (the latest blank's boundary plus its carried fraction). */
+    const uint64_t total = video_pal ? 314 : 263;
+    const uint64_t div = video_pal ? FIELD_DIVISOR_PAL : FIELD_DIVISOR_NTSC;
+    const uint64_t line_u = video_pal ? FIELD_SAMPLES_PAL : FIELD_SAMPLES_NTSC;
+    const uint64_t field_u = line_u * total;
+    y1 = y1 < total ? y1 : (unsigned)total;
+    y2 = y2 < total ? y2 : (unsigned)total;
+    new_y1 = new_y1 < total ? new_y1 : (unsigned)total;
+    new_y2 = new_y2 < total ? new_y2 : (unsigned)total;
+    uint64_t elapsed = field_frames_left ? field_frames_total - field_frames_left : 0;
+    uint64_t lag_u = blank_divisor > 1 ? (uint64_t)blank_fraction * div * total / blank_divisor : 0;
+    uint64_t since_u = elapsed * div * total;
+    since_u = since_u > lag_u ? since_u - lag_u : 0;
+    uint64_t pos_u = ((uint64_t)y2 * line_u + since_u) % field_u;
+    unsigned current = (unsigned)(pos_u / line_u);
     int was_blank = current < y1 || current >= y2;
     int is_blank = current < new_y1 || current >= new_y2;
     if (!was_blank && is_blank) {
         blank_fraction = 0; // the beam leaves the new range at once
         Psyz_VideoWaitBlank();
+        pos_u = (uint64_t)new_y2 * line_u;
     }
-    double lines = new_y2 - line;
-    if (lines <= 0)
-        lines += total;
-    unsigned frames = (unsigned)(lines * field / total + 0.5);
-    if (frames < 1)
+    uint64_t end_u = (uint64_t)new_y2 * line_u;
+    uint64_t left_u = end_u > pos_u ? end_u - pos_u : end_u + field_u - pos_u;
+    uint64_t frames = left_u / (div * total);
+    uint64_t fraction = left_u % (div * total);
+    if (frames < 1) {
         frames = 1;
+        fraction = 0;
+    }
     if (frames > FIELD_FRAMES_MAX)
         frames = FIELD_FRAMES_MAX;
-    field_frames_left = field_frames_total = frames;
-    field_end_fraction = 0;
+    field_frames_left = field_frames_total = (unsigned)frames;
+    // the console's blank comes the fraction after the boundary; the fields
+    // after it carry that phase
+    field_end_fraction = (unsigned)(fraction / total);
+    field_end_divisor = (unsigned)div;
+    video_remainder = field_end_fraction;
 }
 
 /* The display mode's PAL bit changed (GP1(08h), a GPU reset): fields from

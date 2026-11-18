@@ -50,7 +50,10 @@ void SsSetTableSize(char* table, short s_max, short t_max) {
 
 #ifdef __psyz
 #undef SsSetTableSize
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
 void SsSetTableSize(char* table, short s_max, short t_max) {
+    Psyz_SpendCycles(SS_SET_TABLE_SIZE_CYCLES);
     Psyz_KernelLockInterrupts();
     SsSetTableSize_Unlocked(table, s_max, t_max);
     Psyz_KernelUnlockInterrupts();

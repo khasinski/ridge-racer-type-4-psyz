@@ -132,6 +132,9 @@ unsigned Psyz_KernelTakeInterruptCycles(void);
 // takes that vblank and the chain handlers miss it. Offline clock only.
 int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
                                unsigned exit_clocks);
+// The same, for a blank at most `until` clocks after the exception began.
+int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
+                                   unsigned exit_clocks, unsigned until);
 // An interrupt the kernel does not dispatch itself (a device model's: CD,
 // DMA) began at at_ns and its exception takes `cycles` (the window of
 // Psyz_KernelBlankInDispatch); `charged` of them become interrupt handler
@@ -147,6 +150,10 @@ int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
 // a port's controller answered at it and the halfwords of the packet it
 // received to the end (0 when the exchange failed).
 int Psyz_PadDriverRunning(void);
+// The BIOS card driver: its handlers are in the interrupt chains
+// (InitCARD), and it runs at each vblank (StartCARD .. StopCARD).
+int Psyz_CardChainInstalled(void);
+int Psyz_CardDriverRunning(void);
 void Psyz_LibpadVBlank(void);
 int Psyz_LibpadExchanged(int port, int* halfwords);
 // The controllers' side of the serial exchange (pad.c): the byte a
@@ -161,6 +168,8 @@ const char* Psyz_PadsFrame(int port);
 // The BIOS memory card driver's work at a vblank (libcard.c); turn 0: a
 // vblank its handler misses.
 void Psyz_CardVBlank(int turn);
+// The blank where a raw card access ends: libpad has no exchange there.
+int Psyz_CardRawEndsAt(int turn);
 // A BIOS file service that reads a card sector itself and waits for it
 // without raising events (firstfile reads sector 0).
 void Psyz_CardSyncTransfer(long chan);

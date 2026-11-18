@@ -79,12 +79,34 @@ enum {
 
 /* ---- Interrupts (kernel.c, libapi.c) ---- */
 enum {
-    /* The BIOS exception handler and libetc's dispatcher around a callback:
-     * 2.9k for an RCnt interrupt with an empty callback. [call] 686859c */
-    KERNEL_IRQ_CYCLES = 2850,
+    /* The BIOS exception handler and libetc's dispatcher around a callback,
+     * before the BIOS card driver is installed: an RCnt interrupt with no
+     * tick 2374 clocks from the exception to its return, a vblank 2442,
+     * at boot (SoundSystemInit's bzero, DuckStation fields 426-435) [exc]
+     * less the stubs' 24 clocks a dispatch (the bzero's span with and
+     * without them). */
+    KERNEL_IRQ_CYCLES = 2350,
+    /* The card driver's chain (InitCARD) on every exception from then on:
+     * a non-ticking RCnt interrupt takes 2748 in the menus [exc] */
+    BIOS_CARD_CHAIN_CYCLES = 374,
+    /* SetRCnt up to its last mode write, which starts the count (kernel.c
+     * counts from where the CPU's work has got to, the handlers' time owed
+     * included): the sequencer's timer then interrupts at DuckStation's
+     * phase against the vblanks to within 40 clocks over the Grand Prix
+     * menus (the timer's period from its RCNT2 mode write in
+     * DUCKSTATION_CD_TRACE against the blank times) [field] */
+    SET_RCNT_CYCLES = 84,
     /* The vblank handler besides the kernel's: libetc's VSync handler and
-     * callbacks dispatch, the BIOS card driver's turn. [call] 686859c */
-    VBLANK_HANDLER_CYCLES = 2387,
+     * callbacks dispatch (68), and the BIOS card driver's turn once
+     * StartCARD ran (1409): a vblank with libpad's exchange of a digital
+     * pad takes 20309 [exc] in the menus. */
+    VBLANK_HANDLER_CYCLES = 68,
+    CARD_VBLANK_TURN_CYCLES = 1409,
+    /* The vblank where a raw card access ends (Psyz_CardRawEndsAt): the
+     * driver's handler there instead, and no libpad exchange: 4901 for the
+     * whole exception [exc] the boot's card polling (DuckStation fields
+     * 699-798) */
+    CARD_RAW_END_CYCLES = 2109,
     /* libpad's controller exchange at each vblank once PadStartCom ran: its
      * SIO busy waits for a digital pad in port 1, port 2 empty [call]
      * 686859c; 4.8k more with a pad in port 2 (26.2k against 21.4k for the
@@ -110,6 +132,12 @@ enum {
      * attract fields */
     BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
     BIOS_CHAIN_CARD_TEST_CLOCKS = 1197,
+    /* ... but a blank later than this into a ticking sequencer interrupt
+     * (the tick runs inside it) still gets its card turn: the driver's
+     * alternation on DuckStation goes on through a blank 3.1k clocks into
+     * one (the boot's card polling, field 397) and shifts at one 7.4k into
+     * it (431); 2600 is where a non-ticking one's window ends. [field] */
+    BIOS_CHAIN_CARD_UNTIL_CLOCKS = 2600,
     LIBETC_DISPATCH_EXIT_CLOCKS = 243,
 };
 
@@ -133,6 +161,15 @@ enum {
      * Time Attack run (DS fields 283-3700: 19816 and 4941 with the memcpy,
      * the display start changing at every call, and 468 for a table that
      * starts with a packet). The recompiler confirms DrawSync (249). */
+    /* SystemInit's graphics setup [ret] (tools/port/ds_frames.py return
+     * marks, the boot): ResetGraph(0) (the GPU reset and its waits) 28164,
+     * ResetGraph(1) 2488, SetGraphDebug 41, SetDispMask 175, InitGeom (the
+     * GTE registers) 48903 */
+    RESET_GRAPH_CYCLES = 28164,
+    RESET_GRAPH_QUEUE_CYCLES = 2488,
+    SET_GRAPH_DEBUG_CYCLES = 41,
+    SET_DISP_MASK_CYCLES = 175,
+    INIT_GEOM_CYCLES = 48903,
     PUT_DRAW_ENV_CYCLES = 790,
     PUT_DISP_ENV_CYCLES = 603,
     GET_ENV_CYCLES = 40,
@@ -167,8 +204,9 @@ enum {
     /* SpuClearReverbWorkArea: the setup of each 1 KiB chunk (_spu_t's
      * waits, the DMA event) besides its DMA: its 97 chunks take 1.219M
      * clocks in SsInit on the recompiler [mark] (the entry of the next
-     * function, as CD_CW_ISSUE_CYCLES). */
-    SPU_CLEAR_CHUNK_CYCLES = 4376,
+     * function, as CD_CW_ISSUE_CYCLES); refit to SpuInit's 1,248,339 to
+     * _SsInit, the two vblanks within it included (ds_frames.py). */
+    SPU_CLEAR_CHUNK_CYCLES = 4410,
     /* SpuInit (cold): _spu_init's resets and waits and SpuStart, 29.2k up
      * to SsInit's SpuClearReverbWorkArea [mark] */
     SPU_INIT_CYCLES = 29230,
@@ -185,6 +223,18 @@ enum {
      * scaled by the recompiler / interpreter clocks of the attract cycle's
      * ticks (5923 / 6340) [rec ratio]. */
     SS_TICK_CYCLES = 5895,
+    /* SoundSystemInit's sequencer setup after CdReset, entry to entry of
+     * the next call [mark] (tools/port/ds_frames.py, the boot):
+     * SsSetSerialAttr 142, SsSetSerialVol 146, SsSetTableSize 911,
+     * SsSetTickMode 81, and _SsStart's 1000-pass wait loop up to SetRCnt
+     * 2633, the rest to the caller's next call 799: SetRCnt then lands on
+     * DuckStation's clock. */
+    SS_SET_SERIAL_ATTR_CYCLES = 142,
+    SS_SET_SERIAL_VOL_CYCLES = 146,
+    SS_SET_TABLE_SIZE_CYCLES = 911,
+    SS_SET_TICK_MODE_CYCLES = 81,
+    SS_START_CYCLES = 2633,
+    SS_START_RETURN_CYCLES = 799,
     /* _SsInit: the voice and state registers and _SsVmInit, 35.2k up to
      * the caller's next call (SoundSystemInit) [mark] */
     SS_INIT_CYCLES = 35204,
@@ -212,6 +262,11 @@ enum {
     /* The handler's bookkeeping when a request ends (its events undelivered
      * and raised), added to that interrupt. [call] 8a79d5e */
     CARD_FINISH_ISR_CLOCKS = 5400,
+    /* InitCARD (the BIOS card driver's setup and its handlers in the
+     * chains) 155157 [ret] the boot, with a vblank and a sequencer tick in
+     * it; StartCARD 2893 */
+    INIT_CARD_CYCLES = 146643,
+    START_CARD_CYCLES = 2893,
     /* A PS1 program spinning on the card driver: a scanline a spin.
      * [unrecorded] dd07ccc */
     CARD_SPIN_NS = 64000,
@@ -223,8 +278,10 @@ enum {
      * CPU time only (the interrupts that come meanwhile lengthen the
      * wait), in millicycles: the game spins 4,000,000 polls on an empty
      * ring before its first read, 290 fields with one pad, 292 with two.
-     * [field] f0e3704 (no breakpoints) */
-    ST_POLL_MILLICYCLES = 46800,
+     * [field] f0e3704; refit with the interrupt costs above to DuckStation's
+     * 5,839,811 us from the opening's ring setup to its first read
+     * (tools/port/ds_frames.py marks). */
+    ST_POLL_MILLICYCLES = 47026,
     /* Another drive query in a busy loop (CdSync, CdReady, CdReadSync),
      * interrupts included. [unrecorded] 8080ec2 */
     CD_POLL_NS = 2000,
@@ -239,18 +296,29 @@ enum {
     CD_CW_ISSUE_CYCLES = 480,
     /* The drive's interrupts as exceptions, from the exception to its
      * return: a data sector's INT1 (LIBCD's handler, CdRead's callback and
-     * its CdGetSector), a command's acknowledge and a second response.
-     * They hide a vblank that comes meanwhile from the BIOS chains (libapi.c
-     * Psyz_VSyncBlank). A sector's is handler time; an acknowledge's and a
-     * completion's are spent by CD_cw and the waits (CD_CW_ACK_CYCLES,
-     * CD_DONE_IRQ_CYCLES). [exc] the Grand Prix menus' loads (stubs at the
-     * exception vector and its returns, less their own clocks) */
-    CD_DATA_IRQ_CLOCKS = 4100,
-    CD_ACK_IRQ_CLOCKS = 2750,
-    CD_DONE_IRQ_CLOCKS = 2750,
+     * its CdGetSector), a command's acknowledge and a second response,
+     * before the card driver's chain is installed (BIOS_CARD_CHAIN_CYCLES
+     * more after it). They hide a vblank that comes meanwhile from the BIOS
+     * chains (libapi.c Psyz_VSyncBlank). A sector's is handler time; an
+     * acknowledge's and a completion's are spent by CD_cw and the waits
+     * (CD_CW_ACK_CYCLES, CD_DONE_IRQ_CYCLES). [exc] the boot's reads
+     * (3800, 2420) and the Grand Prix menus' loads (4130, 2790) */
+    CD_DATA_IRQ_CLOCKS = 3780,
+    /* A read's ready callback that issues a command (CdRead's ending
+     * Pause): CD_cw comes this long after the sector's exception, before
+     * the card driver's chain is installed (the boot's reads, 3336 [exc])
+     * and BIOS_CARD_CHAIN_CYCLES later after it. */
+    CD_DATA_CALLBACK_CW_CLOCKS = 3336,
+    CD_ACK_IRQ_CLOCKS = 2400,
+    CD_DONE_IRQ_CLOCKS = 2400,
     CD_CW_ACK_CYCLES = 2620,
     CD_DONE_IRQ_CYCLES = 2120,
     CD_INIT_CYCLES = 4680,
+    /* CdReset(1)'s CD_initvol (the SPU volume writes and CdMix) after
+     * CD_init's last acknowledge, to the caller's next call (SoundSystemInit:
+     * DuckStation's Demute acknowledge to SsSetSerialAttr 3167 clocks, less
+     * CD_CW_ACK_CYCLES) [mark] */
+    CD_INITVOL_CYCLES = 547,
     /* CdControl, CdControlF, CdControlB around CD_cw: before it, and from
      * its return after an acknowledge to the caller [mark] */
     CD_CONTROL_CYCLES = 80,

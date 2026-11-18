@@ -380,7 +380,8 @@ static void RecordDispatch(uint64_t at_ns, unsigned cycles) {
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
     irq_latched &= ~(1u << line);
-    Psyz_KernelInterruptCycles(KERNEL_IRQ_CYCLES);
+    Psyz_KernelInterruptCycles(KERNEL_IRQ_CYCLES +
+                               (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0));
     switch (line) {
     case IRQ_VBLANK:
         DeliverLocked(RCntCNT3, EvSpINT);
@@ -435,6 +436,12 @@ int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
 
 int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
                                unsigned exit_clocks) {
+    return Psyz_KernelBlankInDispatchUpTo(blank_ns, test_clocks, exit_clocks,
+                                          UINT32_MAX);
+}
+
+int Psyz_KernelBlankInDispatchUpTo(uint64_t blank_ns, unsigned test_clocks,
+                                   unsigned exit_clocks, unsigned until) {
     if (!dispatch_seen || !UsesAudioClock()) {
         return 0;
     }
@@ -446,7 +453,7 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
         uint64_t clocks =
             (blank_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
         if (clocks > test_clocks &&
-            clocks <= dispatches[i].cycles - exit_clocks) {
+            clocks <= dispatches[i].cycles - exit_clocks && clocks <= until) {
             return 1;
         }
     }
@@ -954,6 +961,7 @@ long SetRCnt(long spec, unsigned short target, long mode) {
     if (i >= 3) {
         return 0;
     }
+    Psyz_SpendCycles(SET_RCNT_CYCLES);
     StartIrqThread();
     KernelLock();
     RootCounter* c = &counters[i];
@@ -971,7 +979,23 @@ long SetRCnt(long spec, unsigned short target, long mode) {
     }
     c->ticks_per_us_q15 = clock / 15625 * 512 + clock % 15625 * 512 / 15625;
     c->irq = (mode & RCntMdINTR) != 0;
-    CounterRestart(c, KernelNowUs());
+    /* The count starts at the mode write, within the microsecond: the first
+     * target comes a period after it, to the clock (SetRCnt's own code up to
+     * that write is SET_RCNT_CYCLES, spent before). */
+    uint64_t start_ns = KernelNowUs() * 1000;
+    if (UsesAudioClock()) {
+        // the main thread's position: the time spent but not yet mixed and
+        // the handlers' time owed (inside a critical section it is owed)
+        start_ns += spend_carry_ns +
+                    (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u /
+                        SYSTEM_CLOCK_HZ;
+    }
+    CounterRestart(c, start_ns / 1000);
+    c->frac_acc += (uint32_t)(start_ns % 1000 * clock / 1000);
+    if (c->frac_acc >= c->clock_hz) {
+        c->frac_acc -= c->clock_hz;
+        c->next_us++;
+    }
     AtomicTimeStore(&poll_deadline_us, c->last_us);
     KernelUnlock();
     Psyz_OsBellRing(bell_irq);

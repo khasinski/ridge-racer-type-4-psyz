@@ -195,6 +195,13 @@ static void card_sector_done1(void) { card_sector_done(1); }
 
 // The BIOS card handler's work at one vblank; a vblank it misses (turn 0)
 // leaves its state, and its port, as they are.
+/* The vblank where a raw access (Psyz_CardRawBegin) ends: the driver's
+ * handler takes the SIO there and libpad makes no exchange (DuckStation:
+ * that vblank's exception is 4.9k clocks, libpad's flag stays clear). */
+int Psyz_CardRawEndsAt(int turn) {
+    return card_drv.running && turn && card_drv.raw_state == 2;
+}
+
 void Psyz_CardVBlank(int turn) {
     if (!card_drv.running) {
         return;
@@ -430,9 +437,16 @@ static void card_driver_reset(int running) {
     card_drv.last_vblank_us = Psyz_KernelNowUs();
 }
 
+/* InitCARD installs the BIOS card driver's handlers in the interrupt
+ * chains: every exception runs its test from then on (kernel.c). */
+static int card_chain;
+int Psyz_CardChainInstalled(void) { return card_chain; }
+int Psyz_CardDriverRunning(void) { return card_drv.running; }
+
 void InitCARD2(long val) {
     (void)val;
     card_driver_reset(0);
+    card_chain = 1;
 }
 
 long StartCARD2(void) {
