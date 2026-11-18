@@ -1,4 +1,11 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#define SS_CPU(c) Psyz_SpendCycles(c)
+#else
+#define SS_CPU(c)
+#endif
 
 SPU_RXX* _svm_sreg = (SPU_RXX*)0x1F801C00;
 SPU_VOICE_REG _svm_sreg_buf[NUM_VOICES];
@@ -14,6 +21,7 @@ unsigned short _svm_onos2;
 struct SpuVoice _svm_voice[NUM_VOICES];
 unsigned int _svm_envx_ptr;
 static int _dummy;
+int _ss_flush_uncharged; // _SsVmInit's flush: SS_INIT_CYCLES has it
 int _svm_envx_hist[16];
 #ifdef __psyz
 void (*_autovol)(short voice);
@@ -206,7 +214,13 @@ void _SsVmFlush(void) {
             _autopan(i);
         }
     }
+    if (!_ss_flush_uncharged) {
+        SS_CPU(SS_VM_FLUSH_CYCLES);
+    }
     for (i = 0; i < NUM_VOICES; i++) {
+        if (_svm_sreg_dirty[i] && !_ss_flush_uncharged) {
+            SS_CPU(SS_VM_FLUSH_VOICE_CYCLES);
+        }
         if (_svm_sreg_dirty[i] & 1) {
             SPUWV(i, volume.left, _svm_sreg_buf[i].volume.left);
             SPUWV(i, volume.right, _svm_sreg_buf[i].volume.right);

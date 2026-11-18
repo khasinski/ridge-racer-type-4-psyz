@@ -57,8 +57,8 @@ void SsSeqCalledTbyT(void) {
 
 #ifdef __psyz
 #undef SsSeqCalledTbyT
-/* A tick's PS1 time, mostly _SsVmFlush's pass over the 24 voices
- * (SS_TICK_CYCLES). */
+/* A tick's PS1 time: its own (SS_TICK_CYCLES), _SsVmFlush's and the
+ * sequences' events' (timing_profile.h). */
 #include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 void SsSeqCalledTbyT(void) {

@@ -477,7 +477,17 @@ static void ServiceLine(int line, uint64_t at_ns) {
         irq_callbacks[line]();
     }
     if (line != IRQ_VBLANK) {
-        RecordDispatch(at_ns, (unsigned)(AtomicLoad(&interrupt_debt) - debt));
+        unsigned window = (unsigned)(AtomicLoad(&interrupt_debt) - debt);
+        // DMA stalls that come while the handler runs lengthen it
+        while (stall_len &&
+               stalls[stall_head].at_ns <=
+                   at_ns + (uint64_t)window * 1000000000u / SYSTEM_CLOCK_HZ) {
+            AtomicAdd(&interrupt_debt, (long)stalls[stall_head].clocks);
+            window += stalls[stall_head].clocks;
+            stall_head = (stall_head + 1) % STALLS_MAX;
+            stall_len--;
+        }
+        RecordDispatch(at_ns, window);
     }
 }
 

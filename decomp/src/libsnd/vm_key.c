@@ -1,4 +1,11 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#define SS_CPU(c) Psyz_SpendCycles(c)
+#else
+#define SS_CPU(c)
+#endif
 
 #ifndef __psyz
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_key", _SsVmKeyOn);
@@ -23,6 +30,7 @@ int _SsVmKeyOn(short seq_sep_no, short vabId, short prog, short note,
     unsigned short vel = voll;
     unsigned short pn = pan;
     struct SeqStruct* score = NULL;
+    SS_CPU(SS_VM_KEY_ON_CYCLES);
     unsigned char n, i;
     unsigned short tone;
     short voice;
@@ -96,6 +104,7 @@ int _SsVmKeyOn(short seq_sep_no, short vabId, short prog, short note,
 int _SsVmKeyOff(short seq_sep_no, short vabId, short prog, short note) {
     u8 i;
     int count = 0;
+    SS_CPU(SS_VM_KEY_OFF_CYCLES);
 
     for (i = 0; i < _SsVmMaxVoice; i++) {
         if (_svm_voice[i].note == note && _svm_voice[i].prog == prog &&

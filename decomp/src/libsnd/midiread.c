@@ -1,4 +1,11 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#define SS_CPU(c) Psyz_SpendCycles(c)
+#else
+#define SS_CPU(c)
+#endif
 
 #ifndef __psyz
 INCLUDE_ASM("asm/nonmatchings/libsnd/midiread", _SsSeqPlay);
@@ -86,6 +93,7 @@ int _SsGetSeqData(short seq_access_num, short seq_num) {
     u8 c, note, vel, value;
     int ret = 0;
 
+    SS_CPU(SS_GET_SEQ_DATA_CYCLES);
     c = *score->seq_ptr++;
     if ((score->flags & (SEQ_FLAG_400 | SEQ_FLAG_1)) ==
             (SEQ_FLAG_400 | SEQ_FLAG_1) &&

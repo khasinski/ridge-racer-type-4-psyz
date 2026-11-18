@@ -213,11 +213,26 @@ enum {
 
 /* ---- libsnd (decomp libsnd) ---- */
 enum {
-    /* A sequencer tick (SsSeqCalledTbyT), mostly _SsVmFlush's pass over the
-     * 24 voices, with no sequence playing: the breakpoint value of 686859c
-     * scaled by the recompiler / interpreter clocks of the attract cycle's
-     * ticks (5923 / 6340) [rec ratio]. */
-    SS_TICK_CYCLES = 5895,
+    /* A sequencer tick (SsSeqCalledTbyT) by its parts, on DuckStation
+     * (ds_frames.py name:ret marks, each call's time less its marked
+     * callees', the Save and Load scenario's menu sound effects, port
+     * vsyncs 2905-3000) [mark]: the tick's own 396; _SsVmFlush 5544 with
+     * no voice to update (24 envelope reads, the reverb and noise masks)
+     * plus its two SpuSetKey calls (52 each), and about 920 a voice whose
+     * registers it rewrites (DuckStation's flush calls SpuSetVoiceAttr,
+     * 779, for it); _SsSndPlay 132 a playing track; _SsGetSeqData 332 an
+     * event; _SsVmKeyOn 3313 (median of 22, 2692-3556) and _SsVmKeyOff
+     * 1234. A tick with sound effects starting takes 10k-20k. The marks'
+     * stubs add about 15 clocks each to the calls around them: the tick's
+     * own is the rest of a tick with no sequence playing, 5895 in all
+     * (the attract boot's ticks, SsSeqCalledTbyT:ret alone) [rec ratio]. */
+    SS_TICK_CYCLES = 5895 - (5544 + 2 * 52),
+    SS_VM_FLUSH_CYCLES = 5544 + 2 * 52,
+    SS_VM_FLUSH_VOICE_CYCLES = 920,
+    SS_SND_PLAY_CYCLES = 132,
+    SS_GET_SEQ_DATA_CYCLES = 332,
+    SS_VM_KEY_ON_CYCLES = 3313,
+    SS_VM_KEY_OFF_CYCLES = 1234,
     /* SoundSystemInit's sequencer setup after CdReset, entry to entry of
      * the next call [mark] (tools/port/ds_frames.py, the boot):
      * SsSetSerialAttr 142, SsSetSerialVol 146, SsSetTableSize 911,
