@@ -286,6 +286,17 @@ ZTEST_TEARDOWN(libcd) {
 }
 
 // Mirrors the real-hardware capture: 1 MODE2/2352 track, 271,796 sectors.
+/* The XA resampler's (DuckStation's zigzag) output for a constant 0x1000
+ * input, by output frame (its seven tables' gains, each tap shifted down on
+ * its own), and that after the CD and main volumes of the playback tests. */
+static short xa_dc_level(size_t frame) {
+    static const short level[7] = {3701, 3705, 3697, 3705, 3701, 3704, 3704};
+    return level[frame % 7];
+}
+static short xa_dc_out(size_t frame) {
+    return (short)((((int)xa_dc_level(frame) * 0x3FFF) >> 15) * 0x3FFF >> 14);
+}
+
 ZTEST(libcd, single_data_track_matches_real_hardware) {
     const long kSectors = 271796; // 639,264,192 bytes / 2352
     u_char r[8];
@@ -1042,7 +1053,7 @@ ZTEST(libcd_playback, xa_callback_matches_cue_and_stops_at_extent) {
     CdControlB(CdlReadN, NULL, NULL);
     size_t count = Psyz_CdPullSamples(expected, frames);
     zexpect_s32_eq(1, count > 64 && count < frames);
-    zexpect_s32_eq(0x1000, expected[128]);
+    zexpect_s32_eq(xa_dc_level(64), expected[128]);
     CdControlB(CdlStop, NULL, NULL);
     Psyz_CdSetDiskPath(NULL);
     xa_callback_data = (unsigned char*)raw;
@@ -1090,7 +1101,7 @@ ZTEST(libcd_playback, xa_callback_silent_tail_reaches_extent) {
     size_t count = Psyz_CdPullSamples(out, frames);
     zexpect_s32_eq(sectors, xa_callback_reads);
     zexpect_s32_eq(1, count > 8 * 2352 && count < frames);
-    zexpect_s32_eq(0x1000, out[128]);
+    zexpect_s32_eq(xa_dc_level(64), out[128]);
     for (size_t i = 8 * 2352 + 64; i < count; ++i) {
         zassert_s16_eq(0, out[i * 2]);
         zassert_s16_eq(0, out[i * 2 + 1]);
@@ -1171,17 +1182,17 @@ ZTEST(libcd_playback, xa_playback) {
     // Reverse Psyz_AudioLock
     Psyz_AudioUnlock();
 
-    // Each XA sample decodes to 0x1000 -> after cd_vol (0x3FFF >> 15) and
-    // main_vol (0x3FFF >> 14) the steady-state output is 0x07FE per channel.
+    // Each XA sample decodes to 0x1000 -> the zigzag's gain by output frame,
+    // then cd_vol (0x3FFF >> 15) and main_vol (0x3FFF >> 14) per channel.
     for (i = kSettle; i < frame_count; ++i) {
-        if (out[i * 2 + 0] != 0x07FE) {
+        if (out[i * 2 + 0] != xa_dc_out(i)) {
             zprintf("frame %d left channel unexpected value\n", i);
         }
-        zassert_s16_eq(0x07FE, out[i * 2 + 0]);
-        if (out[i * 2 + 1] != 0x07FE) {
+        zassert_s16_eq(xa_dc_out(i), out[i * 2 + 0]);
+        if (out[i * 2 + 1] != xa_dc_out(i)) {
             zprintf("frame %d right channel unexpected value\n", i);
         }
-        zassert_s16_eq(0x07FE, out[i * 2 + 1]);
+        zassert_s16_eq(xa_dc_out(i), out[i * 2 + 1]);
     }
     /* A short pull leaves decoded CD frames prefetched inside the SPU.
      * Stopping the decoder must silence that buffer immediately as well. */
@@ -1313,11 +1324,11 @@ ZTEST(libcd_playback, xa_filtered_stream_ends_in_silence) {
     Psyz_AudioUnlock();
 
     for (i = kSettle; i < kClipFrames - kSettle; ++i) {
-        if (out[i * 2 + 0] != 0x07FE || out[i * 2 + 1] != 0x07FE) {
+        if (out[i * 2 + 0] != xa_dc_out(i) || out[i * 2 + 1] != xa_dc_out(i)) {
             zprintf("clip frame %d unexpected value\n", i);
         }
-        zassert_s16_eq(0x07FE, out[i * 2 + 0]);
-        zassert_s16_eq(0x07FE, out[i * 2 + 1]);
+        zassert_s16_eq(xa_dc_out(i), out[i * 2 + 0]);
+        zassert_s16_eq(xa_dc_out(i), out[i * 2 + 1]);
     }
     for (i = kClipFrames + kSettle; i < frame_count; ++i) {
         if (out[i * 2 + 0] != 0 || out[i * 2 + 1] != 0) {
@@ -1364,7 +1375,8 @@ ZTEST(libcd_playback, xa_resampler_rounding) {
     zprintf("XA varying-wave PCM frames %zu hash %08x%08x\n", count,
             (unsigned)(hash >> 32), (unsigned)hash);
     zexpect_s32_eq(frames, count);
-    zexpect_u32_eq(0xc1a616c2u, (unsigned)(hash >> 32));
-    zexpect_u32_eq(0xd17dd80au, (unsigned)hash);
+    /* DuckStation's decoder and zigzag resampler (cdrom.cpp) */
+    zexpect_u32_eq(0x805732b0u, (unsigned)(hash >> 32));
+    zexpect_u32_eq(0xfd1ea4d8u, (unsigned)hash);
     CdControlB(CdlStop, NULL, NULL);
 }

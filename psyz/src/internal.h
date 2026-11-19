@@ -213,6 +213,9 @@ void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks);
 // The same with the handler time owed changed by `debt` instead (time a
 // callback in the handler has already charged lengthens the window only).
 void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt);
+/* The device dispatch at at_ns ends with a DMA of this many clocks before
+ * its last 23 (a blank in it is not hidden). */
+void Psyz_KernelDispatchOpenTail(uint64_t at_ns, unsigned open_tail);
 // The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
 // thread from then on, like a handler's time. Offline clock only.
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);

@@ -284,8 +284,16 @@ enum {
      * before it do not, but 210 here makes Save and Load and two cards
      * differ from DuckStation's fields 2603 and 2621 on (none with 330;
      * again with the card menus' CPU time charged: 13 scenarios match
-     * against 17, decision differences 2997 against 968): kept. */
+     * against 17, decision differences 2997 against 968): kept for a
+     * device's exception (a root counter's has its own, below). */
     LIBETC_DISPATCH_EXIT_CLOCKS = 330,
+    /* ... in a root counter's exception: DuckStation's exact timing has
+     * libpad's exchange (the blank's own exception) at every blank up to
+     * 193 clocks before the end of one (the port's window: 2742 clocks
+     * not ticking, 8663 ticking) and at none from 223 (ta-full, vs-full,
+     * the 27 ds_compare scenarios; the timer's blank every 131 fields
+     * moves 33 clocks through it) [field] */
+    LIBETC_RCNT_DISPATCH_EXIT_CLOCKS = 210,
 };
 
 /* ---- libpad (libetc.c) ---- */
@@ -620,6 +628,15 @@ enum {
      * 192 comes 243 clocks late, at the DMA's end, and neither libpad nor
      * the card driver misses it). */
     CD_DATA_DMA_TAIL_CLOCKS = 544 + 23,
+    /* ... 17/16 clocks a word (16 x): a ready callback of the program's own
+     * fetches less (the XA player's 32 words), so its exception's DMA tail
+     * is that much shorter: on DuckStation's exact timing a blank 352 to
+     * 496 clocks before the end of such a sector's exception (3029 clocks,
+     * the race's XA stream) is taken in it (vs-full vsync 17367, ta-full,
+     * the course scenarios), not in its own exception as within CdRead's
+     * tail; so are ones 186 to 318 before it, which the port's exit
+     * (LIBETC_DISPATCH_EXIT_CLOCKS) still leaves out [field] */
+    CD_GETSECTOR_DMA_WORD_X16 = 17,
     /* A read's ready callback that issues a command (CdRead's ending
      * Pause): CD_cw comes this long after the sector's exception, before
      * the card driver's chain is installed and BIOS_CARD_CHAIN_CYCLES later

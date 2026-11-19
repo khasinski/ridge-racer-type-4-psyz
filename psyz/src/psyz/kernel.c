@@ -864,7 +864,7 @@ static void ServiceLine(int line, uint64_t at_ns) {
             stall_head = (stall_head + 1) % STALLS_MAX;
             stall_len--;
         }
-        RecordDispatch(at_ns, window, 0);
+        RecordDispatchExit(at_ns, window, 0, LIBETC_RCNT_DISPATCH_EXIT_CLOCKS);
     }
 }
 
@@ -921,6 +921,20 @@ uint64_t Psyz_KernelCpuClocks(void) {
         }
     }
     return clocks;
+}
+
+void Psyz_KernelDispatchOpenTail(uint64_t at_ns, unsigned open_tail) {
+    if (!UsesAudioClock() || !dispatch_seen) {
+        return;
+    }
+    at_ns = Psyz_KernelUnmaskedNs(at_ns);
+    for (unsigned k = 1; k <= DISPATCH_RING; k++) {
+        unsigned i = (dispatch_next + DISPATCH_RING - k) % DISPATCH_RING;
+        if (dispatches[i].ns == at_ns && dispatches[i].device) {
+            dispatches[i].open_tail = open_tail;
+            return;
+        }
+    }
 }
 
 void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt) {

@@ -808,7 +808,6 @@ end:
 }
 
 #define XA_DECODED_MAX_FRAMES 4032            // 18 blocks * 4 sub * 28 samples
-#define XA_STEP_Q16 ((37800u << 16) / 44100u) // 56173
 // Real hardware keeps reading sectors and discards the ones rejected by the
 // filter, so once the selected file/channel ends playback goes silent. Give up
 // after this many consecutive rejected sectors instead of scanning the disc
@@ -824,9 +823,13 @@ static struct {
     int decoded_pos;
     int hist_l_old, hist_l_older;
     int hist_r_old, hist_r_older;
-    // Hermite ring: index [0]=oldest .. [3]=newest per channel
-    short rh_l[4], rh_r[4];
-    unsigned int phase; // 16.16 fractional position into the input stream
+    // the resampler (xa_zigzag): its input ring, the frames to its next
+    // output burst, and that burst's frames not yet played
+    short ring_l[32], ring_r[32];
+    unsigned ring_p;
+    int sixstep;
+    short out_l[7], out_r[7];
+    int out_pos, out_count;
     int cur_abs_sector; // absolute last sector used, for CdlGetlocL
     int stream_ended;   // filtered file/channel ran out, emit silence
     int silent_sectors_pending;
@@ -837,9 +840,11 @@ static void xa_reset_stream(void) {
     xa.decoded_pos = 0;
     xa.hist_l_old = xa.hist_l_older = 0;
     xa.hist_r_old = xa.hist_r_older = 0;
-    memset(xa.rh_l, 0, sizeof(xa.rh_l));
-    memset(xa.rh_r, 0, sizeof(xa.rh_r));
-    xa.phase = 0;
+    memset(xa.ring_l, 0, sizeof(xa.ring_l));
+    memset(xa.ring_r, 0, sizeof(xa.ring_r));
+    xa.ring_p = 0;
+    xa.sixstep = 6;
+    xa.out_pos = xa.out_count = 0;
     xa.stream_ended = 0;
     xa.silent_sectors_pending = 0;
 }
@@ -851,8 +856,6 @@ static int xa_sector_matches(unsigned char file, unsigned char channel) {
     return file == xa.filter_file && channel == xa.filter_channel;
 }
 
-static int s4(int n) { return (n & 0x8) ? (n - 0x10) : n; }
-
 static const int xa_pos[4] = {0, 60, 115, 98};
 static const int xa_neg[4] = {0, 0, -52, -55};
 // Decode 28 samples for one (block, nibble) pair into `dst` (stride=2 stereo
@@ -860,17 +863,20 @@ static const int xa_neg[4] = {0, 0, -52, -55};
 static void xa_decode_28(const unsigned char* blk, int sub, int nibble,
                          short* dst, int stride, int* prev, int* prev2) {
     const unsigned char hdr = blk[4 + sub * 2 + nibble];
+    /* As DuckStation's DecodeXAADPCMChunks: the nibble in the top of a
+     * 16-bit sample shifted right by the header's shift (9 for 13..15), each
+     * filter term shifted down on its own, the clamped sample kept as the
+     * history; filters 4..15 are none. */
     const int shift_in = hdr & 0x0F;
-    const int shift = (shift_in > 12) ? 9 : (12 - shift_in);
-    const int filter = (hdr & 0x30) >> 4; // 0..3
-    const int f0 = xa_pos[filter];
-    const int f1 = xa_neg[filter];
+    const int shift = (shift_in > 12) ? 9 : shift_in;
+    const int filter = (hdr >> 4) & 0x0F;
+    const int f0 = filter < 4 ? xa_pos[filter] : 0;
+    const int f1 = filter < 4 ? xa_neg[filter] : 0;
     for (int j = 0; j < 28; j++) {
         const unsigned char byte = blk[16 + sub + j * 4];
-        const int t = s4((byte >> (nibble * 4)) & 0x0F);
-        const int s =
-            t * (1 << shift) + (((*prev) * f0 + (*prev2) * f1 + 32) / 64);
-        dst[j * stride] = clamp16(s);
+        const int t = (short)(unsigned short)(((byte >> (nibble * 4)) & 0x0F) << 12) >> shift;
+        const int s = clamp16(t + (((*prev) * f0) >> 6) + (((*prev2) * f1) >> 6));
+        dst[j * stride] = (short)s;
         *prev2 = *prev;
         *prev = s;
     }
@@ -985,46 +991,89 @@ silence:
     return 1;
 }
 
-// Pull next 37800 Hz stereo input frame into the Hermite ring buffers.
-// Returns 1 on success, 0 if stream ended.
+/* The XA resampler, the console's and DuckStation's (cdrom.cpp
+ * ResampleXAADPCM, psx-spx "zigzag" interpolation): every 6 input frames
+ * (37800 Hz) give 7 output frames (44100 Hz), each from the ring of the last
+ * 32 inputs through one of seven 29-tap tables (about 15 output frames of
+ * delay). With the decoder above it gives DuckStation's frames to the
+ * sample: the Time Attack scenario's race XA (1.5M frames, PSYZ_XA_DUMP
+ * against the regtest's DUCKSTATION_XA_OUT_DUMP) is identical but for the
+ * frames where a stream starts or stops; the 4-point Hermite interpolation
+ * it replaces, with the same decoder, matched 1% of them. */
+static const short xa_zigzag_tables[7][29] = {
+    {0, 0x0, 0x0, 0x0, 0x0, -0x0002, 0x000A, -0x0022, 0x0041, -0x0054,
+     0x0034, 0x0009, -0x010A, 0x0400, -0x0A78, 0x234C, 0x6794, -0x1780,
+     0x0BCD, -0x0623, 0x0350, -0x016D, 0x006B, 0x000A, -0x0010, 0x0011,
+     -0x0008, 0x0003, -0x0001},
+    {0, 0x0, 0x0, -0x0002, 0x0, 0x0003, -0x0013, 0x003C, -0x004B, 0x00A2,
+     -0x00E3, 0x0132, -0x0043, -0x0267, 0x0C9D, 0x74BB, -0x11B4, 0x09B8,
+     -0x05BF, 0x0372, -0x01A8, 0x00A6, -0x001B, 0x0005, 0x0006, -0x0008,
+     0x0003, -0x0001, 0x0},
+    {0, 0x0, -0x0001, 0x0003, -0x0002, -0x0005, 0x001F, -0x004A, 0x00B3,
+     -0x0192, 0x02B1, -0x039E, 0x04F8, -0x05A6, 0x7939, -0x05A6, 0x04F8,
+     -0x039E, 0x02B1, -0x0192, 0x00B3, -0x004A, 0x001F, -0x0005, -0x0002,
+     0x0003, -0x0001, 0x0, 0x0},
+    {0, -0x0001, 0x0003, -0x0008, 0x0006, 0x0005, -0x001B, 0x00A6, -0x01A8,
+     0x0372, -0x05BF, 0x09B8, -0x11B4, 0x74BB, 0x0C9D, -0x0267, -0x0043,
+     0x0132, -0x00E3, 0x00A2, -0x004B, 0x003C, -0x0013, 0x0003, 0x0,
+     -0x0002, 0x0, 0x0, 0x0},
+    {-0x0001, 0x0003, -0x0008, 0x0011, -0x0010, 0x000A, 0x006B, -0x016D,
+     0x0350, -0x0623, 0x0BCD, -0x1780, 0x6794, 0x234C, -0x0A78, 0x0400,
+     -0x010A, 0x0009, 0x0034, -0x0054, 0x0041, -0x0022, 0x000A, -0x0001,
+     0x0, 0x0001, 0x0, 0x0, 0x0},
+    {0x0002, -0x0008, 0x0010, -0x0023, 0x002B, 0x001A, -0x00EB, 0x027B,
+     -0x0548, 0x0AFA, -0x16FA, 0x53E0, 0x3C07, -0x1249, 0x080E, -0x0347,
+     0x015B, -0x0044, -0x0017, 0x0046, -0x0023, 0x0011, -0x0005, 0x0, 0x0,
+     0x0, 0x0, 0x0, 0x0},
+    {-0x0005, 0x0011, -0x0023, 0x0046, -0x0017, -0x0044, 0x015B, -0x0347,
+     0x080E, -0x1249, 0x3C07, 0x53E0, -0x16FA, 0x0AFA, -0x0548, 0x027B,
+     -0x00EB, 0x001A, 0x002B, -0x0023, 0x0010, -0x0008, 0x0002, 0x0, 0x0,
+     0x0, 0x0, 0x0, 0x0},
+};
+
+static short xa_zigzag(const short* ring, int table, unsigned p) {
+    const short* t = xa_zigzag_tables[table];
+    int sum = 0;
+    for (unsigned i = 0; i < 29; i++) {
+        sum += ((int)ring[(p - i) & 31] * (int)t[i]) >> 15;
+    }
+    return clamp16(sum);
+}
+
+// Feeds the next 37800 Hz stereo input frame to the resampler, which makes
+// a burst of 7 output frames every 6th. Returns 0 if the stream ended.
 static int xa_advance_input(void) {
     if (xa.decoded_pos >= xa.decoded_count) {
         if (!xa_read_and_decode_sector()) {
             return 0;
         }
     }
-    short l = xa.decoded[xa.decoded_pos * 2 + 0];
-    short r = xa.decoded[xa.decoded_pos * 2 + 1];
+    xa.ring_l[xa.ring_p] = xa.decoded[xa.decoded_pos * 2 + 0];
+    xa.ring_r[xa.ring_p] = xa.decoded[xa.decoded_pos * 2 + 1];
     xa.decoded_pos++;
-    xa.rh_l[0] = xa.rh_l[1];
-    xa.rh_l[1] = xa.rh_l[2];
-    xa.rh_l[2] = xa.rh_l[3];
-    xa.rh_l[3] = l;
-    xa.rh_r[0] = xa.rh_r[1];
-    xa.rh_r[1] = xa.rh_r[2];
-    xa.rh_r[2] = xa.rh_r[3];
-    xa.rh_r[3] = r;
+    xa.ring_p = (xa.ring_p + 1) & 31;
+    if (--xa.sixstep == 0) {
+        xa.sixstep = 6;
+        for (int j = 0; j < 7; j++) {
+            xa.out_l[j] = xa_zigzag(xa.ring_l, j, xa.ring_p);
+            xa.out_r[j] = xa_zigzag(xa.ring_r, j, xa.ring_p);
+        }
+        xa.out_pos = 0;
+        xa.out_count = 7;
+    }
     return 1;
 }
 
-// 4-point Hermite (Catmull-Rom-like) at fractional position frac in [0,1).
-// frac is given as Q1.16 (only low 16 bits used).
-// TODO !!! slown down considerably on hardware without float processing unit
-static short hermite4(
-    short ym1, short y0, short y1, short y2, unsigned int frac_q16) {
-    // Use floating math here for correctness; this is run-once per output
-    // sample and is still very cheap. Embedded targets get clean output.
-    float x = (float)(frac_q16 & 0xFFFF) / 65536.0f;
-    float c0 = (float)y0;
-    float c1 = 0.5f * (float)(y1 - ym1);
-    float c2 =
-        (float)ym1 - 2.5f * (float)y0 + 2.0f * (float)y1 - 0.5f * (float)y2;
-    float c3 = 0.5f * (float)(y2 - ym1) + 1.5f * (float)(y0 - y1);
-    /* Contract each Horner stage explicitly: GCC and Clang otherwise choose
-     * different multiply/add contractions near half-sample boundaries. */
-    float v = fmaf(fmaf(fmaf(c3, x, c2), x, c1), x, c0);
-    int iv = (int)(v + (v >= 0 ? 0.5f : -0.5f));
-    return clamp16(iv);
+/* PSYZ_XA_DUMP=<file>: every resampled XA frame played (s16 L, R, before
+ * the CD volume), to compare with DuckStation's DUCKSTATION_XA_OUT_DUMP. */
+static void xa_dump(const short* lr) {
+    static FILE* f;
+    static int init;
+    if (!init) {
+        init = 1;
+        if (getenv("PSYZ_XA_DUMP")) f = fopen(getenv("PSYZ_XA_DUMP"), "wb");
+    }
+    if (f) fwrite(lr, 4, 1, f);
 }
 
 static size_t xa_pull_samples(short* buf, size_t max_frames) {
@@ -1038,35 +1087,22 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     if (written == max_frames) {
         goto end;
     }
-    // Prime Hermite ring on first call so we have y0..y2 valid.
-    while (xa.rh_l[3] == 0 && xa.rh_l[2] == 0 && xa.rh_l[1] == 0 &&
-           xa.decoded_pos == 0 && xa.decoded_count == 0) {
-        if (!xa_advance_input()) {
-            hit_eof = 1;
-            goto end;
-        }
-        if (xa.decoded_count > 0)
-            break;
-    }
     while (written < max_frames) {
-        // Advance input as many times as needed to get phase < 1.0.
-        while (xa.phase >= 0x10000) {
+        while (xa.out_pos >= xa.out_count) {
             if (!xa_advance_input()) {
                 hit_eof = 1;
                 goto end;
             }
-            xa.phase -= 0x10000;
         }
         if (is_muted) {
             buf[written * 2 + 0] = 0;
             buf[written * 2 + 1] = 0;
         } else {
-            buf[written * 2 + 0] = hermite4(
-                xa.rh_l[0], xa.rh_l[1], xa.rh_l[2], xa.rh_l[3], xa.phase);
-            buf[written * 2 + 1] = hermite4(
-                xa.rh_r[0], xa.rh_r[1], xa.rh_r[2], xa.rh_r[3], xa.phase);
+            buf[written * 2 + 0] = xa.out_l[xa.out_pos];
+            buf[written * 2 + 1] = xa.out_r[xa.out_pos];
         }
-        xa.phase += XA_STEP_Q16;
+        if (!is_muted) xa_dump(&buf[written * 2]);
+        xa.out_pos++;
         written++;
     }
 end:
@@ -1529,8 +1565,10 @@ int CD_vol(CdlATV* vol) {
     return 0;
 }
 
+static int getsector_last_words; // the latest CdGetSector's, for its DMA's tail
 int CD_getsector(void* madr, int size) {
     size_t bytes = (size_t)size * 4;
+    getsector_last_words = size;
     if (!data_sector_valid || !madr)
         return -1;
     size_t offset = data_getsector_count++ == 0 ? 12u : 24u;
@@ -1750,6 +1788,7 @@ static void deliver_data_sector(void) {
         }
         return;
     }
+    getsector_last_words = 0;
     data_sector_number = sector + 1;
     if (is_played_audio_sector()) {
         return;
@@ -1789,6 +1828,11 @@ static void deliver_data_sector(void) {
         Psyz_KernelResizeDispatch(irq_us * 1000,
                                   (int)spent - (int)CD_READ_CALLBACK_CLOCKS,
                                   -(int)CD_READ_CALLBACK_CLOCKS);
+        /* its last DMA is its own CdGetSector's (the XA player's 32
+         * words), which ends the exception sooner than CdRead's 512 */
+        Psyz_KernelDispatchOpenTail(irq_us * 1000,
+                                    (unsigned)getsector_last_words * CD_GETSECTOR_DMA_WORD_X16 / 16 +
+                                        CD_DATA_DMA_TAIL_CLOCKS - 544);
     }
     st_irq_called = 0;
     sector_callback_us = 0;
