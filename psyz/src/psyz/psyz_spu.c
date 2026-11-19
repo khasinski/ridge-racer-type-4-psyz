@@ -190,7 +190,7 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
      * the tick on DuckStation), not at the exception's start, where the
      * clock stops for the handler: the samples before it are mixed first
      * (to the next blank at most, which the handler cannot pass). */
-    uint64_t at_ns = getenv("PSYZ_SPU_AT_START") ? 0 : Psyz_KernelHandlerPositionNs();
+    uint64_t at_ns = Psyz_KernelHandlerPositionNs();
     if (at_ns) {
         uint64_t blank = Psyz_AudioNextBlankNs();
         Psyz_AudioMixTo(at_ns < blank ? at_ns : blank);
