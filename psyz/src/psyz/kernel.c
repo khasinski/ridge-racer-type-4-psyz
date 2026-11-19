@@ -587,6 +587,15 @@ uint64_t Psyz_KernelExceptionStartNs(int* root_counter) {
 static uint64_t vblank_exception_ns, vblank_exception_end_ns;
 
 void Psyz_KernelNoteException(uint64_t at_ns, unsigned cycles) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char* v = getenv("PSYZ_IRQ_TRACE");
+        trace = v && *v == '1';
+    }
+    if (trace && UsesAudioClock()) {
+        fprintf(stderr, "irq vblank at %llu clocks for %u\n",
+                (unsigned long long)(at_ns * SYSTEM_CLOCK_HZ / 1000000000u), cycles);
+    }
     if (UsesAudioClock()) {
         NoteException(at_ns, cycles, 0);
         if (exception_start_ns == at_ns) {
@@ -738,6 +747,15 @@ static void ServiceLine(int line, uint64_t at_ns) {
      * at 5824) [exc] */
     if (line == IRQ_VBLANK && InOpenException(at_ns)) {
         entry -= SHARED_EXCEPTION_SAVED_CYCLES;
+    } else if (line != IRQ_VBLANK && vblank_exception_end_ns > vblank_exception_ns &&
+               at_ns >= vblank_exception_ns &&
+               at_ns + (uint64_t)LIBETC_DISPATCH_EXIT_CLOCKS * 1000000000u / SYSTEM_CLOCK_HZ <
+                   vblank_exception_end_ns) {
+        /* a root counter's interrupt during the vblank's exception: served
+         * in it (DuckStation, the unformatted card's opening movie poll: a
+         * vblank exception with the timer's tick in it 26.8k clocks, with
+         * a non-ticking one 20.9k, alone 20.3k; the tick's own 8.6k) [exc] */
+        entry -= RCNT_IN_VBLANK_SAVED_CYCLES;
     }
     Psyz_KernelInterruptCycles(entry);
     switch (line) {

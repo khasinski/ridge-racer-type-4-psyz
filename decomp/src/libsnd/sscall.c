@@ -63,8 +63,14 @@ void SsSeqCalledTbyT(void) {
 void Psyz_SpendCycles(unsigned cycles);
 void SsSeqCalledTbyT(void) {
     Psyz_KernelLockInterrupts();
+    unsigned own = SS_TICK_CYCLES;
+    for (int i = 0; i < _snd_seq_s_max; i++) {
+        if (_snd_openflag & (1u << i)) {
+            own += SS_TICK_OPEN_SEQUENCE_CYCLES;
+        }
+    }
     SsSeqCalledTbyT_Unlocked();
-    Psyz_SpendCycles(SS_TICK_CYCLES);
+    Psyz_SpendCycles(own);
     Psyz_KernelUnlockInterrupts();
 }
 #endif

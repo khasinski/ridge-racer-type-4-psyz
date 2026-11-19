@@ -83,9 +83,13 @@ enum {
      * before the BIOS card driver is installed: an RCnt interrupt with no
      * tick 2374 clocks from the exception to its return, a vblank 2442,
      * at boot (SoundSystemInit's bzero, DuckStation fields 426-435) [exc]
-     * less the stubs' 24 clocks a dispatch (the bzero's span with and
-     * without them). */
-    KERNEL_IRQ_CYCLES = 2350,
+     * less the 6 of the exception stubs' clocks that fall between those
+     * marks (the vector's stub logs after 15 of its 19 instructions, the
+     * return's after 1 of 4: 25.6 clocks a dispatch in all, the bzero's
+     * span with and without them). With 2350 (all 25.6 taken out) the
+     * bzero's span came 680 clocks short of DuckStation's unmarked one
+     * (6018935 clocks from SsSetMVol to InitSceneOverlayState). */
+    KERNEL_IRQ_CYCLES = 2368,
     /* libetc's DMA dispatcher (DICR) on top of it: a DMA interrupt's
      * exception takes 2804 besides its callback's work on DuckStation
      * (the movie's MDEC output callbacks: 1883 to the callback, 945 from
@@ -99,6 +103,11 @@ enum {
      * sector's 9708 alone; VSync(0) 1615 sooner after a blank inside a
      * root counter's exception, two-cards vsync 904) [exc] */
     SHARED_EXCEPTION_SAVED_CYCLES = 2724 - 1123,
+    /* ... and a root counter's raised during the vblank's exception adds
+     * 618 (a non-ticking one) or 6546 (a tick) to it, against 2741 and
+     * 8660 alone (DSF_EXC, the unformatted card's opening movie poll,
+     * vsyncs 455-743: 20 in 290 fields) [exc] */
+    RCNT_IN_VBLANK_SAVED_CYCLES = 2115,
     /* ... of which this much comes before the callback starts (the
      * MDEC output callback 1883 after the exception, its DecDCTout 2086
      * after it) [exc] */
@@ -206,9 +215,11 @@ enum {
      * makes its exchange at every blank up to 1044 clocks in (1034: 10 of
      * 19 scenarios) and at none from 1067 (1100-1165: 6 of 54), the card
      * driver takes its turn up to 1143 (1165: 2 of 18, 1170: 2 of 5) and
-     * none from 1175. [field] */
-    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
-    BIOS_CHAIN_CARD_TEST_CLOCKS = 1155,
+     * none from 1175 [field]; 34 later since the exceptions take
+     * KERNEL_IRQ_CYCLES' 18 more (the blanks' positions in the timer's
+     * exceptions moved by 34). */
+    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056 + 34,
+    BIOS_CHAIN_CARD_TEST_CLOCKS = 1155 + 34,
     /* A device's exception (the CD drive's) reaches those tests this much
      * sooner: the root counters' handlers, which deliver their event in a
      * counter's exception, only test theirs. On DuckStation a blank 845 to
@@ -339,9 +350,20 @@ enum {
      * event; _SsVmKeyOn 3313 (median of 22, 2692-3556) and _SsVmKeyOff
      * 1234. A tick with sound effects starting takes 10k-20k. The marks'
      * stubs add about 15 clocks each to the calls around them: the tick's
-     * own is the rest of a tick with no sequence playing, 5895 in all
-     * (the attract boot's ticks, SsSeqCalledTbyT:ret alone) [rec ratio]. */
-    SS_TICK_CYCLES = 5895 - (5544 + 2 * 52),
+     * own is the rest of a tick with no sequence playing: 5921 with the
+     * flush's 5759 (all voices silent: SsSeqCalledTbyT:ret and
+     * _SsVmFlush:ret, one stub each, the unformatted card scenario's
+     * opening movie poll, vsyncs 494-520) [mark]. It was the attract
+     * boot's 5895 less the menus' flush (5648), 85 clocks a tick long,
+     * which made the movie's 290-field poll 30k clocks long. */
+    SS_TICK_CYCLES = 5921 - 5759,
+    /* ... and this much more for each open sequence (its tracks' flags
+     * looked at). DuckStation's Save and Load ticks, a sequence open and
+     * playing, take 359 of their own by the marks' accounting (6169 with
+     * the flush's 5641 and _SsSndPlay's 132, 12.5 a stub); the menus'
+     * parts (the flush, the key-ons) were fit with 247 in all, which this
+     * keeps. [mark] */
+    SS_TICK_OPEN_SEQUENCE_CYCLES = 247 - (5921 - 5759),
     /* _SsVmFlush with its two SpuSetKey calls, and 11 more for each voice
      * silent for the last 15 ticks (its envelope history), which it
      * releases: DuckStation's boot ticks take 5495 before that history
@@ -382,6 +404,7 @@ enum {
      * 2633, the rest to the caller's next call 799: SetRCnt then lands on
      * DuckStation's clock. */
     SS_SET_SERIAL_ATTR_CYCLES = 142,
+    SS_SET_MVOL_CYCLES = 120, // SsSetMVol:ret 132 with its stub [mark] the boot
     SS_SET_SERIAL_VOL_CYCLES = 146,
     SS_SET_TABLE_SIZE_CYCLES = 911,
     SS_SET_TICK_MODE_CYCLES = 81,
@@ -430,12 +453,13 @@ enum {
      * CPU time only (the interrupts that come meanwhile lengthen the
      * wait), in millicycles: the game spins 4,000,000 polls on an empty
      * ring before its first read, 290 fields with one pad, 292 with two.
-     * [field] f0e3704; refit with the interrupt costs above to DuckStation's
-     * 5,839,811 us from the opening's ring setup to its first read
-     * (tools/port/ds_frames.py marks); on the CPU-position clock the
-     * movie's first Setloc acknowledge comes 1.2k clocks before
-     * DuckStation's (47026 put it 34.8k after). */
-    ST_POLL_MILLICYCLES = 47017,
+     * On DuckStation (the unformatted card's opening movie, two marks
+     * only: 197,847,069 clocks from ovl668_start_stream_playback to
+     * ovl668_seek_and_read_stream; DSF_EXC: its 965 exceptions 9.76M) the
+     * polls take 188.08M [mark] [exc]. (47017 had been refit against the
+     * idle ticks' and the timer's interrupts in the vblank's exceptions'
+     * excess, SS_TICK_CYCLES, RCNT_IN_VBLANK_SAVED_CYCLES.) */
+    ST_POLL_MILLICYCLES = 47021,
     /* Another drive query in a busy loop (CdReady, the wait for a read's
      * Pause), interrupts included. [unrecorded] 8080ec2 */
     CD_POLL_NS = 2000,
