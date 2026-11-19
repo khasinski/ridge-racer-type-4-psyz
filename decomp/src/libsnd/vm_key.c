@@ -69,6 +69,7 @@ int _SsVmKeyOn(short seq_sep_no, short vabId, short prog, short note,
         _svm_cur.tone_center = _svm_tn[tone].center;
         _svm_cur.tone_shift = _svm_tn[tone].shift;
         _svm_cur.tone_mode = _svm_tn[tone].mode;
+        SS_CPU(SS_VM_KEY_ON_TONE_CYCLES);
         voice = (unsigned char)_SsVmAlloc(0);
         _svm_cur.voice = voice;
         if (voice < _SsVmMaxVoice) {

@@ -182,11 +182,16 @@ enum {
      * alternation skips that turn). [field] VS menus, 20000 attract
      * fields; 58 clocks less since the sequencer's interrupts come at
      * DuckStation's exception marks (SET_RCNT_CYCLES), where they came 58
-     * before: DuckStation's libpad misses a blank 1043 clocks after such
-     * a mark, the card driver one 1170 after it but not 1087 (Save and
-     * Load, DSF_EXC, DSF_PADLOG, DSF_CARDPORT) */
-    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056 - 58,
-    BIOS_CHAIN_CARD_TEST_CLOCKS = 1197 - 58,
+     * before. Refit to the unmarked references (exception marks delay the
+     * chains' tests by their stubs: tools/port/DUCKSTATION.md), the 19
+     * ds_compare scenarios' pad flag and card driver port against the
+     * port's position of each blank in a root counter's exception: libpad
+     * makes its exchange at every blank up to 1044 clocks in (1034: 10 of
+     * 19 scenarios) and at none from 1067 (1100-1165: 6 of 54), the card
+     * driver takes its turn up to 1143 (1165: 2 of 18, 1170: 2 of 5) and
+     * none from 1175. [field] */
+    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056,
+    BIOS_CHAIN_CARD_TEST_CLOCKS = 1155,
     /* A device's exception (the CD drive's) reaches those tests this much
      * sooner: the root counters' handlers, which deliver their event in a
      * counter's exception, only test theirs. On DuckStation a blank 845 to
@@ -313,7 +318,27 @@ enum {
     SS_VM_FLUSH_VOICE_CYCLES = 920,
     SS_SND_PLAY_CYCLES = 132,
     SS_GET_SEQ_DATA_CYCLES = 332,
-    SS_VM_KEY_ON_CYCLES = 3313,
+    /* _SsVmKeyOn by its paths, fit to 1739 calls on DuckStation (Save
+     * and Load, name:ret marks on it and each callee, less the marks'
+     * stubs, 12.5 clocks each; the port's KeyOn state per call): its own
+     * code with _SsVmVSetUp and the tone search's setup 829, each of the
+     * program's tones the search looks at 51 and 8 more when the note is
+     * not below the tone's range; for each tone keyed, _SsVmAlloc (a free
+     * first voice), _SsVmDoAllocate, note2pitch and _SsVmKeyOnNow 1825, 74
+     * for each voice the allocation scans past (13 more when it is
+     * allocated but not keyed, 41 or 30 more when it ties the quietest
+     * envelope and is older or not). Calls of 2.84k-3.86k (the 3313 flat
+     * cost before) are then within 40 clocks in 80% of the calls, the
+     * rest within 85 (the instruction cache, which this does not model),
+     * besides the 3% an interrupt lengthens. [mark] */
+    SS_VM_KEY_ON_CYCLES = 829,
+    SS_VM_SELECT_TONE_CYCLES = 51,
+    SS_VM_SELECT_TONE_IN_RANGE_CYCLES = 8,
+    SS_VM_KEY_ON_TONE_CYCLES = 1825,
+    SS_VM_ALLOC_SCAN_CYCLES = 74,
+    SS_VM_ALLOC_SCAN_RESERVED_CYCLES = 13,
+    SS_VM_ALLOC_SCAN_OLDER_CYCLES = 41,
+    SS_VM_ALLOC_SCAN_NOT_OLDER_CYCLES = 30,
     SS_VM_KEY_OFF_CYCLES = 1234,
     /* SoundSystemInit's sequencer setup after CdReset, entry to entry of
      * the next call [mark] (tools/port/ds_frames.py, the boot):

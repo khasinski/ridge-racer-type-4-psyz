@@ -1,4 +1,11 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#define SS_CPU(c) Psyz_SpendCycles(c)
+#else
+#define SS_CPU(c)
+#endif
 
 #ifndef __psyz
 INCLUDE_ASM("asm/nonmatchings/libsnd/vm_stav", _SsVmSelectToneAndVag);
@@ -12,6 +19,10 @@ unsigned char _SsVmSelectToneAndVag(unsigned char* tones, unsigned char* vags) {
 
     for (i = 0; i < _svm_cur.prog_tones; i++) {
         tn = &_svm_tn[_svm_cur.fake_program * 16 + i];
+        SS_CPU(SS_VM_SELECT_TONE_CYCLES);
+        if (!(tn->min > _svm_cur.note)) {
+            SS_CPU(SS_VM_SELECT_TONE_IN_RANGE_CYCLES);
+        }
         if (!(tn->min > _svm_cur.note) && !(tn->max < _svm_cur.note)) {
             vags[n] = tn->vag;
             tones[n++] = i;

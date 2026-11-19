@@ -814,6 +814,42 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
     return 0;
 }
 
+/* How far, in clocks, the blank is from flipping Psyz_KernelBlankInDispatch's
+ * answer: its distance to the nearest test point or exit point of a dispatch
+ * it falls in or near (diagnostics: PSYZ_PAD_TRACE), -1 when none is near. */
+int Psyz_KernelBlankMargin(uint64_t blank_ns, unsigned test_clocks,
+                           unsigned exit_clocks) {
+    int best = -1;
+    if (!dispatch_seen || !UsesAudioClock()) {
+        return -1;
+    }
+    for (int i = 0; i < DISPATCH_RING; i++) {
+        unsigned exit = dispatches[i].exit ? dispatches[i].exit : exit_clocks;
+        if (dispatches[i].ns > blank_ns || dispatches[i].cycles <= exit) {
+            continue;
+        }
+        uint64_t clocks =
+            (blank_ns - dispatches[i].ns) * SYSTEM_CLOCK_HZ / 1000000000u;
+        if (clocks > (uint64_t)dispatches[i].cycles + 1000) {
+            continue;
+        }
+        unsigned test = dispatches[i].device && test_clocks > BIOS_RCNT_CHAIN_CYCLES
+                            ? test_clocks - BIOS_RCNT_CHAIN_CYCLES
+                            : test_clocks;
+        if (dispatches[i].open_tail > exit) {
+            exit = dispatches[i].open_tail;
+        }
+        long c = (long)clocks;
+        long d1 = labs(c - (long)test);
+        long d2 = labs(c - (long)(dispatches[i].cycles - exit));
+        long d = d1 < d2 ? d1 : d2;
+        if (best < 0 || d < best) {
+            best = (int)d;
+        }
+    }
+    return best;
+}
+
 static void DrainPosted(void) {
     for (;;) {
         void (*fn)(void) = NULL;

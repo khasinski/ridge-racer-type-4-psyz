@@ -1,4 +1,11 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#define SS_CPU(c) Psyz_SpendCycles(c)
+#else
+#define SS_CPU(c)
+#endif
 
 #ifndef __psyz
 char _SsVmAlloc(short voice) {
@@ -79,6 +86,10 @@ char _SsVmAlloc(short voice) {
             alloc = i;
             break;
         }
+        SS_CPU(SS_VM_ALLOC_SCAN_CYCLES);
+        if (_svm_voice[i].unk1b == 0) {
+            SS_CPU(SS_VM_ALLOC_SCAN_RESERVED_CYCLES);
+        }
         if (_svm_voice[i].priority < lowestPrior) {
             lowestPrior = _svm_voice[i].priority;
             lowest = i;
@@ -93,8 +104,11 @@ char _SsVmAlloc(short voice) {
                 lowest = i;
             } else if (_svm_voice[i].key_stat == lowestKeyStat) {
                 if ((s32)lowestAge < (s16)_svm_voice[i].unk2) {
+                    SS_CPU(SS_VM_ALLOC_SCAN_OLDER_CYCLES);
                     lowestAge = _svm_voice[i].unk2;
                     lowest = i;
+                } else {
+                    SS_CPU(SS_VM_ALLOC_SCAN_NOT_OLDER_CYCLES);
                 }
             }
         }

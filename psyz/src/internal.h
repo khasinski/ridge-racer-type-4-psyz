@@ -201,6 +201,10 @@ uint64_t Psyz_KernelNowNs(void);
 void Psyz_KernelWaitUntilNs(uint64_t at_ns);
 // PSYZ_PAD_TRACE: clocks from the latest such exception to at_ns, and
 // its handlers' clocks; 0 when there was none before.
+// Distance in clocks of a blank to the nearest boundary of
+// Psyz_KernelBlankInDispatch's answer, -1 when no dispatch is near.
+int Psyz_KernelBlankMargin(uint64_t blank_ns, unsigned test_clocks,
+                           unsigned exit_clocks);
 int Psyz_KernelLastDispatch(uint64_t at_ns, unsigned* since_clocks,
                             unsigned* cycles);
 // libpad (libpad.c): its handler runs at each vblank once PadStartCom ran;

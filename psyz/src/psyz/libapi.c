@@ -1,3 +1,5 @@
+#include <string.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <psyz.h>
 #include <psyz/log.h>
@@ -108,6 +110,65 @@ static int PadTrace(void) {
     return trace;
 }
 
+/* PSYZ_BLANK_FORCE=<vsync>:pad=<0|1>[:card=<0|1>],... (diagnostics): at
+ * those blanks libpad's exchange and the card driver's turn are what is
+ * named instead of what the dispatch windows decide, to see where a
+ * scenario goes when a blank near a window's boundary goes the other way
+ * (tools/port/ds_compare.py --force-blanks). */
+enum { BLANK_FORCE_MAX = 64 };
+static struct {
+    unsigned vsync;
+    signed char pad, card;
+} blank_force[BLANK_FORCE_MAX];
+static int blank_force_len = -1;
+
+static void BlankForce(unsigned vsync, int* pad, int* card) {
+    if (blank_force_len < 0) {
+        blank_force_len = 0;
+        const char* v = getenv("PSYZ_BLANK_FORCE");
+        while (v && *v && blank_force_len < BLANK_FORCE_MAX) {
+            char* end;
+            unsigned n = (unsigned)strtoul(v, &end, 10);
+            if (end == v) {
+                break;
+            }
+            blank_force[blank_force_len].vsync = n;
+            blank_force[blank_force_len].pad = -1;
+            blank_force[blank_force_len].card = -1;
+            v = end;
+            while (*v == ':') {
+                v++;
+                if (!strncmp(v, "pad=", 4)) {
+                    blank_force[blank_force_len].pad = (signed char)(v[4] == '1');
+                    v += 5;
+                } else if (!strncmp(v, "card=", 5)) {
+                    blank_force[blank_force_len].card = (signed char)(v[5] == '1');
+                    v += 6;
+                } else {
+                    break;
+                }
+            }
+            blank_force_len++;
+            while (*v && *v != ',') {
+                v++;
+            }
+            if (*v == ',') {
+                v++;
+            }
+        }
+    }
+    for (int i = 0; i < blank_force_len; i++) {
+        if (blank_force[i].vsync == vsync) {
+            if (blank_force[i].pad >= 0) {
+                *pad = blank_force[i].pad;
+            }
+            if (blank_force[i].card >= 0) {
+                *card = blank_force[i].card;
+            }
+        }
+    }
+}
+
 /* A blank that comes while another interrupt is dispatched, after the BIOS
  * chains tested for it, reaches only libetc's dispatcher: libpad has no
  * exchange and the BIOS card driver no turn at that vblank
@@ -126,6 +187,9 @@ void Psyz_VSyncBlank(void) {
     int card_turn =
         !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
                                     LIBETC_DISPATCH_EXIT_CLOCKS);
+    if (Psyz_PadDriverRunning()) {
+        BlankForce((unsigned)Psyz_VideoVSync(-1), &pad_exchange, &card_turn);
+    }
     int raw_end = Psyz_CardRawEndsAt(card_turn);
     if (raw_end) {
         pad_exchange = 0;
@@ -149,9 +213,13 @@ void Psyz_VSyncBlank(void) {
         int seen = Psyz_KernelLastDispatch(blank_ns, &since, &cycles);
         fprintf(stderr,
                 "pad: blank %u exchange %d card %d dispatch %d +%u/%u at %" PRIu64
-                "\n",
+                " margin %d %d\n",
                 (unsigned)Psyz_VideoVSync(-1), pad_exchange, card_turn, seen,
-                since, cycles, blank_ns);
+                since, cycles, blank_ns,
+                Psyz_KernelBlankMargin(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
+                                       LIBETC_DISPATCH_EXIT_CLOCKS),
+                Psyz_KernelBlankMargin(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
+                                       LIBETC_DISPATCH_EXIT_CLOCKS));
     }
     Psyz_CardVBlank(card_turn);
     if (g_PsyzVsyncCb)
