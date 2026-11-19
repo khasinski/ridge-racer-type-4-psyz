@@ -6,6 +6,17 @@
 
 #include <stdint.h>
 
+/* An absolute time on the offline clock between nanoseconds and system
+ * clocks (33.8688 MHz) without the 64-bit overflow of ns * 33868800 or
+ * clocks * 10^9, which wraps after 544.6 s of emulated time (a full race
+ * and its replay: field 27097). */
+static inline uint64_t Psyz_NsToClocks(uint64_t ns) {
+    return ns / 1000000000u * 33868800u + ns % 1000000000u * 33868800u / 1000000000u;
+}
+static inline uint64_t Psyz_ClocksToNs(uint64_t clocks) {
+    return clocks / 33868800u * 1000000000u + clocks % 33868800u * 1000000000u / 33868800u;
+}
+
 #define INCLUDE_ASM(path, func)
 #define WEAK_INCLUDE_ASM(path, func)
 #define NOP
@@ -192,6 +203,9 @@ void Psyz_KernelDispatchTail(uint64_t at_ns, unsigned cycles, unsigned charged,
 // The device exception recorded at at_ns takes `clocks` more (or fewer),
 // handler time too (a stream sector's, once its callback has run).
 void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks);
+// The same with the handler time owed changed by `debt` instead (time a
+// callback in the handler has already charged lengthens the window only).
+void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt);
 // The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
 // thread from then on, like a handler's time. Offline clock only.
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);

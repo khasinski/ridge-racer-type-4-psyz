@@ -187,6 +187,15 @@ enum {
      * exception takes 18688 clocks against 20300 for a 0x42 exchange
      * (DSF_EXC, DuckStation fields 146-157 against 158-160 of the boot). */
     LIBPAD_REFUSED_COMMAND_SAVED_CYCLES = 1612,
+    /* ... a pad in port 2 refusing it saves this much (both pads refusing:
+     * 20823 against 24654, DSF_EXC, REGTEST_PAD2=1, boot fields 220-229) */
+    LIBPAD_REFUSED_COMMAND_PORT2_SAVED_CYCLES = 2194,
+    /* An empty port 1 (no controller acknowledges the address byte): the
+     * vblank's exception takes 16548 clocks against 20330 with a digital
+     * pad there (DSF_EXC, REGTEST_PAD1_TYPE=None, the boot's fields
+     * 250-800; with no pad the libpad probe for analog modes sends nothing
+     * either) */
+    LIBPAD_EMPTY_PORT1_SAVED_CYCLES = 3782,
     /* Each halfword of a controller's packet past the first: libpad's
      * handler takes 22.0k clocks with a JogCon in port 1 (three halfwords)
      * against 15.6k with a digital pad. [rec] ds_irqlog, menus */
@@ -371,8 +380,32 @@ enum {
      * 143), _SsVmFlush:ret marks [mark]; the menus' 5544 + 2 * 52 above
      * had about 14 of them silent. */
     SS_VM_FLUSH_SILENT_VOICE_CYCLES = 11,
-    SS_VM_FLUSH_CYCLES = 5494,
-    SS_VM_FLUSH_VOICE_CYCLES = 920,
+    /* ... the flush's own part and its envelope read for each voice the
+     * sequencer may use (_SsVmMaxVoice, SsSetReservedVoice): 3579 clocks
+     * with the race's 4 and 5759 with 24, all silent (Time Attack, port
+     * vsyncs 2210-3990, _SsVmFlush:ret marks against the port's dirty
+     * masks there); each voice whose registers it rewrites takes 601 and
+     * 37 for each register (the volume's two, the pitch, the address, the
+     * ADSR's two): 675 a voice with its volume changed, 712 with its
+     * pitch too, about 858 with all of them (the menus' 920 a voice was
+     * an average; with it the race's ticks were 2k clocks long, which hid
+     * blanks DuckStation's take) [mark] */
+    SS_VM_FLUSH_CYCLES = 3143,
+    SS_VM_FLUSH_ENVELOPE_CYCLES = 98,
+    SS_VM_FLUSH_VOICE_CYCLES = 601,
+    SS_VM_FLUSH_WRITE_CYCLES = 37,
+    /* The utility calls the game's sound slots and player voices make for
+     * each voice: SsUtChangePitch 365 when the voice plays the tone named
+     * (the pitch worked out and stored) and 85 when it does not (a voice
+     * the race has not keyed on: the menus', the attract demo's),
+     * SsUtSetVVol 33, a voice's SsUtKeyOnV about 1620 (a slot's two key-ons
+     * when its program changes: 7637 against 4398). DuckStation, a stub at
+     * entry and return (12.5 clocks taken off each): Time Attack race fields
+     * 3700-3800 and its menus 2620-2700 [mark] */
+    SS_UT_CHANGE_PITCH_CYCLES = 365,
+    SS_UT_CHANGE_PITCH_MISS_CYCLES = 85,
+    SS_UT_SET_VVOL_CYCLES = 33,
+    SS_UT_KEY_ON_V_CYCLES = 1620,
     SS_SND_PLAY_CYCLES = 132,
     SS_GET_SEQ_DATA_CYCLES = 332,
     /* _SsVmKeyOn by its paths, fit to 1739 calls on DuckStation (Save
@@ -502,6 +535,14 @@ enum {
      * (CD_CW_ACK_CYCLES, CD_DONE_IRQ_CYCLES). [exc] the boot's reads
      * (3800, 2420) and the Grand Prix menus' loads (4130, 2790) */
     CD_DATA_IRQ_CLOCKS = 3780,
+    /* ... of which CdRead's ready callback (cb_read, its two CdGetSector
+     * calls: the sector's header and 512 words) takes this much: a sector
+     * whose ready callback is the program's own takes the exception without
+     * it and the callback's time (the XA player's in a race, which fetches
+     * 32 words: 230 clocks on the marks, CdAudioReadyCallback in the game;
+     * the exception 3029 clocks against 4177 for a CdRead sector on
+     * DuckStation, Time Attack race fields 3300-8100) [exc] [mark] */
+    CD_READ_CALLBACK_CLOCKS = 1355,
     /* The sector's DMA to RAM (CdGetSector, 512 words: 544 clocks on
      * DuckStation) ends 23 clocks before that exception does; a blank
      * during it reaches the CPU only after it and is not hidden
@@ -530,6 +571,11 @@ enum {
     ST_COPY_CYCLES = 1930,
     ST_FRAME_DONE_CYCLES = 396,
     CD_ACK_IRQ_CLOCKS = 2400,
+    /* ... and for each byte of the first response past the status that
+     * LIBCD's handler reads: a GetlocP's acknowledge (8 bytes) takes 3087
+     * clocks on DuckStation against a ReadS's 2868 and the port's 2814
+     * (Time Attack race, its GetlocP every frame) [exc] */
+    CD_RESULT_BYTE_CLOCKS = 39,
     CD_DONE_IRQ_CLOCKS = 2400,
     CD_CW_ACK_CYCLES = 2620,
     /* A Setloc's acknowledge before the card driver's chain is installed:

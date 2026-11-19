@@ -281,7 +281,7 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
 }
 
 static uint64_t now_ns(void) {
-    return Psyz_EmulatedClocks() * 1000000000u / 33868800u;
+    return Psyz_ClocksToNs(Psyz_EmulatedClocks());
 }
 
 /* The first slice of a list _addque2 started after its wait ends before

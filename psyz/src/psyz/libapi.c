@@ -202,10 +202,12 @@ void Psyz_VSyncBlank(void) {
                                                          : 0) +
         (pad_exchange
              ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) -
+                   (!Psyz_LibpadExchanged(0, NULL) ? LIBPAD_EMPTY_PORT1_SAVED_CYCLES : 0) -
                    (Psyz_LibpadRefused(0) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0) +
                    (Psyz_LibpadExchanged(1, NULL)
                         ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) -
-                              (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0)
+                              (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_PORT2_SAVED_CYCLES
+                                                     : 0)
                         : 0)
              : 0));
     if (PadTrace()) {

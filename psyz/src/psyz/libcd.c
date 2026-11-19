@@ -341,6 +341,7 @@ static int parse_cue_file(const char* cue_path) {
 static u_char last_result[8];
 static size_t last_result_len = 0;
 static int last_intr = CdlComplete;
+static unsigned last_result_count; // cache_last_result calls
 
 // `result` points at a caller-owned buffer sized for its own command, which is
 // usually shorter than last_result, so only `len` bytes may be touched.
@@ -352,6 +353,7 @@ static void cache_last_result(const u_char* result, size_t len, int intr) {
     memcpy(last_result, result, len);
     last_result_len = len;
     last_intr = intr;
+    last_result_count++;
 }
 
 static int is_disk_loaded = 0;
@@ -1701,6 +1703,13 @@ static void start_data_read(void) {
 }
 
 static uint64_t command_ack_us; // CD_cw
+/* A command the drive refuses answers with an error interrupt (INT5), which
+ * LIBCD's getintr hands to the ready callback too (CdlDiskError): a read's
+ * callback (cb_read) then retries the read, as on DuckStation when the XA
+ * player's Pause comes during a load's seek (the Grand Prix's third
+ * course, field 16637). */
+static int error_ready_due;
+static uint64_t error_ready_us;
 /* StCdInterrupt from a stream sector's ready callback: its clocks there. */
 static int st_irq_called;
 static unsigned st_irq_extra;
@@ -1723,6 +1732,8 @@ static void drive_irq(uint64_t at_us, unsigned cycles, unsigned charged) {
                                 cycles == CD_DATA_IRQ_CLOCKS ? CD_DATA_DMA_TAIL_CLOCKS : 0);
     }
 }
+
+void cb_read(u_char intr, u_char* result); // CdRead's ready callback
 
 static void deliver_data_sector(void) {
     int sector = data_sector_number;
@@ -1761,13 +1772,23 @@ static void deliver_data_sector(void) {
     unsigned generation = drive_generation;
     st_irq_called = 0;
     st_irq_extra = 0;
-    CD_cbready(CdlDataReady, result);
+    CdlCB ready = CD_cbready;
+    long debt = Psyz_KernelDebtClocks();
+    ready(CdlDataReady, result);
     if (st_irq_called && !drive_is_instant()) {
         // a stream sector's exception: StCdInterrupt's own path
         Psyz_KernelExtendDispatch(irq_us * 1000,
                                   (int)ST_SECTOR_IRQ_CLOCKS -
                                       (int)CD_DATA_IRQ_CLOCKS +
                                       (int)st_irq_extra);
+    } else if (ready != (CdlCB)cb_read && !drive_is_instant()) {
+        // a ready callback of the program's own (the XA player's): the
+        // exception without CdRead's callback, with the time the program's
+        // callback charged meanwhile
+        long spent = Psyz_KernelDebtClocks() - debt;
+        Psyz_KernelResizeDispatch(irq_us * 1000,
+                                  (int)spent - (int)CD_READ_CALLBACK_CLOCKS,
+                                  -(int)CD_READ_CALLBACK_CLOCKS);
     }
     st_irq_called = 0;
     sector_callback_us = 0;
@@ -1808,6 +1829,20 @@ void Psyz_CdServiceDrive(void) {
     drive_servicing = 1;
     drive_update_status(drive_now());
     service_sync_callback();
+    if (error_ready_due && drive_now() >= error_ready_us) {
+        error_ready_due = 0;
+        if (CD_cbready) {
+            u_char result[8];
+            memcpy(result, last_result, sizeof(result));
+            if (!drive_is_instant()) {
+                unsigned clocks = CD_DATA_CALLBACK_CW_CLOCKS +
+                                  (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0);
+                sector_callback_us = error_ready_us + (clocks * 1000000ull + 33868799) / 33868800;
+            }
+            CD_cbready(CdlDiskError, result);
+            sector_callback_us = 0;
+        }
+    }
     if (data_read_active && CD_cbready) {
         uint64_t due = drive_sectors_due(drive_now());
         if (drive_is_instant() && !(CD_mode & CdlModeRT)) {
@@ -1844,6 +1879,9 @@ static void drive_schedule(void) {
     if (drive.sync_cb_due && CD_cbsync &&
         (!next || drive.done_us < next)) {
         next = drive.done_us;
+    }
+    if (error_ready_due && (!next || error_ready_us < next)) {
+        next = error_ready_us;
     }
     if (next) {
         Psyz_KernelPostAt(next, drive_timer);
@@ -2060,6 +2098,24 @@ static unsigned cd_param_bytes(u_char com) {
     }
 }
 
+/* The bytes of a command's first response, which LIBCD's handler reads
+ * one by one (CD_RESULT_BYTE_CLOCKS each past the status byte). */
+static unsigned cd_result_bytes(u_char com) {
+    switch (com) {
+    case CdlGetlocL:
+    case CdlGetlocP:
+        return 8;
+    case CdlGetTN:
+    case CdlGetTD:
+        return 3;
+    default:
+        return 1;
+    }
+}
+
+static unsigned cw_count; // commands issued (CD_cw)
+static int cw_error;       // ... and whether the latest one was refused
+
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     // LIBCD's CD_cw first waits (CD_sync(0)) for the previous command to
     // complete, a second response included.
@@ -2068,6 +2124,11 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelUnlockInterrupts();
     drive_wait_done(previous_done);
     Psyz_CdServiceDrive();
+    // in a ready callback (the CPU's position there is sector_callback_us):
+    // the wait ends at the previous command's completion
+    if (sector_callback_us && previous_done > sector_callback_us) {
+        sector_callback_us = previous_done + (CD_DONE_IRQ_CYCLES * 1000000ull + 33868799) / 33868800;
+    }
     drive_cpu(CD_CW_ISSUE_CYCLES + (param ? cd_param_bytes(com) : 0) *
                                        CD_CW_PARAM_CYCLES);
     Psyz_KernelLockInterrupts();
@@ -2084,7 +2145,20 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive.done_us = command_ack_us;
     drive.sync_cb_due = 1;
     drive_update_status(drive_now());
+    unsigned cached = last_result_count;
     int ret = CD_command(com, param, result, arg3);
+    if (ret >= 0 && last_result_count == cached) {
+        // LIBCD's CD_cw clears the interrupt status and the acknowledge
+        // sets it: a command accepted leaves no earlier error for CdSync
+        u_char status = (u_char)CD_status;
+        cache_last_result(&status, 1, CdlComplete);
+    }
+    unsigned issued = ++cw_count;
+    cw_error = ret < 0;
+    if (ret < 0 && CD_cbready) {
+        error_ready_due = 1;
+        error_ready_us = command_ack_us;
+    }
     if (drive_trace()) {
         // emulated time, command, Setloc position, completion, read timing
         fprintf(stderr,
@@ -2097,7 +2171,8 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     drive_schedule();
     uint64_t ack = command_ack_us;
-    drive_irq(ack, CD_ACK_IRQ_CLOCKS, 0); // CD_CW_ACK_CYCLES has its time
+    unsigned result_clocks = (cd_result_bytes(com) - 1) * CD_RESULT_BYTE_CLOCKS;
+    drive_irq(ack, CD_ACK_IRQ_CLOCKS + result_clocks, 0); // CD_CW_ACK_CYCLES has its time
     Psyz_KernelUnlockInterrupts();
     if (!arg3) {
         // the interrupts during the spin run within it, as on DuckStation
@@ -2109,10 +2184,23 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
             Psyz_KernelSettleWait(debt, start_ns, ack * 1000, ack * 1000);
         }
         // the acknowledge's exception runs the card driver's chain too
-        drive_cpu(CD_CW_ACK_CYCLES +
-                  (Psyz_CardChainInstalled() ? CD_CW_ACK_CHAIN_CYCLES
-                   : com == CdlSetloc        ? CD_CW_SETLOC_ACK_CYCLES
-                                             : 0));
+        unsigned ack_clocks = CD_CW_ACK_CYCLES + result_clocks +
+                              (Psyz_CardChainInstalled() ? CD_CW_ACK_CHAIN_CYCLES
+                               : com == CdlSetloc        ? CD_CW_SETLOC_ACK_CYCLES
+                                                         : 0);
+        drive_cpu(ack_clocks);
+        // LIBCD's CD_cw returns the status the latest interrupt left: a
+        // callback that issued commands meanwhile (cb_read's retry on this
+        // command's error) leaves theirs
+        if (cw_count != issued) {
+            ret = cw_error ? -1 : 0;
+        }
+        // in a ready callback the next command comes after this one's
+        // acknowledge (DuckStation: CdRead's retry from cb_read, its
+        // commands 26.6k-26.8k clocks apart)
+        if (sector_callback_us) {
+            sector_callback_us = ack + (ack_clocks * 1000000ull + 33868799) / 33868800;
+        }
     }
     return ret;
 }

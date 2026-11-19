@@ -220,11 +220,14 @@ void _SsVmFlush(void) {
         }
     }
     if (!_ss_flush_uncharged) {
-        SS_CPU(SS_VM_FLUSH_CYCLES);
+        SS_CPU(SS_VM_FLUSH_CYCLES + _SsVmMaxVoice * SS_VM_FLUSH_ENVELOPE_CYCLES);
     }
     for (i = 0; i < NUM_VOICES; i++) {
         if (_svm_sreg_dirty[i] && !_ss_flush_uncharged) {
-            SS_CPU(SS_VM_FLUSH_VOICE_CYCLES);
+            unsigned d = _svm_sreg_dirty[i];
+            SS_CPU(SS_VM_FLUSH_VOICE_CYCLES +
+                   SS_VM_FLUSH_WRITE_CYCLES * ((d & 1 ? 2 : 0) + (d & 4 ? 1 : 0) +
+                                               (d & 8 ? 1 : 0) + (d & 0x10 ? 2 : 0)));
         }
         if (_svm_sreg_dirty[i] & 1) {
             SPUWV(i, volume.left, _svm_sreg_buf[i].volume.left);

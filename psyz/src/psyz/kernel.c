@@ -284,8 +284,7 @@ unsigned long long Psyz_EmulatedClocks(void) {
         return Psyz_KernelCpuClocks();
     }
     uint64_t ns = AtomicTimeLoad(&cpu_ns);
-    return ns * SYSTEM_CLOCK_HZ / 1000000000u +
-           (uint64_t)AtomicLoad(&interrupt_debt);
+    return Psyz_NsToClocks(ns) + (uint64_t)AtomicLoad(&interrupt_debt);
 }
 
 uint64_t Psyz_KernelNowNs(void) { return KernelNowNs(); }
@@ -422,7 +421,7 @@ void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks) {
         }
         if (trace) {
             fprintf(stderr, "stall at %llu clocks %u\n",
-                    (unsigned long long)(at_ns * SYSTEM_CLOCK_HZ / 1000000000u), clocks);
+                    (unsigned long long)Psyz_NsToClocks(at_ns), clocks);
         }
     }
     // where the CPU has got to: in a handler, after the handler time so far;
@@ -594,7 +593,7 @@ void Psyz_KernelNoteException(uint64_t at_ns, unsigned cycles) {
     }
     if (trace && UsesAudioClock()) {
         fprintf(stderr, "irq vblank at %llu clocks for %u\n",
-                (unsigned long long)(at_ns * SYSTEM_CLOCK_HZ / 1000000000u), cycles);
+                (unsigned long long)Psyz_NsToClocks(at_ns), cycles);
     }
     if (UsesAudioClock()) {
         NoteException(at_ns, cycles, 0);
@@ -719,7 +718,7 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
     if (trace) {
         fprintf(stderr, "irq %s at %llu clocks for %u\n",
                 device ? "device" : "rcnt",
-                (unsigned long long)(at_ns * SYSTEM_CLOCK_HZ / 1000000000u),
+                (unsigned long long)Psyz_NsToClocks(at_ns),
                 cycles);
     }
     dispatches[dispatch_next].ns = at_ns;
@@ -815,7 +814,7 @@ uint64_t Psyz_KernelCpuClocks(void) {
         return 0;
     }
     uint64_t ns = AtomicTimeLoad(&cpu_ns);
-    uint64_t clocks = ns * SYSTEM_CLOCK_HZ / 1000000000u;
+    uint64_t clocks = Psyz_NsToClocks(ns);
     if (OwnsKernel() && handler_debt_base >= 0) {
         long in = AtomicLoad(&interrupt_debt) - handler_debt_base;
         if (in > 0) {
@@ -825,7 +824,7 @@ uint64_t Psyz_KernelCpuClocks(void) {
     return clocks;
 }
 
-void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks) {
+void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt) {
     if (!UsesAudioClock() || !dispatch_seen) {
         return;
     }
@@ -844,13 +843,17 @@ void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks) {
             // ring): the DMA no longer ends the exception
             dispatches[i].open_tail = 0;
         }
-        AtomicAdd(&interrupt_debt, (long)clocks);
+        AtomicAdd(&interrupt_debt, (long)debt);
         if (exception_end_ns == old_end) { // the latest: it ends sooner too
             exception_end_ns = 0;
         }
         NoteException(at_ns, dispatches[i].cycles, 1);
         return;
     }
+}
+
+void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks) {
+    Psyz_KernelResizeDispatch(at_ns, clocks, clocks);
 }
 
 void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged) {

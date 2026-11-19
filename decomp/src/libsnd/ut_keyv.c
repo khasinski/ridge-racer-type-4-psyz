@@ -1,4 +1,8 @@
 #include "libsnd_private.h"
+#ifdef __psyz
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
+#endif
 
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
@@ -99,6 +103,9 @@ short SsUtKeyOnV(short voice, short vabId, short prog, short tone, short note,
 
     Psyz_KernelLockInterrupts();
     ret = SsUtKeyOnV_Unlocked(voice, vabId, prog, tone, note, fine, voll, volr);
+    if (ret >= 0) {
+        Psyz_SpendCycles(SS_UT_KEY_ON_V_CYCLES);
+    }
     Psyz_KernelUnlockInterrupts();
     return ret;
 }

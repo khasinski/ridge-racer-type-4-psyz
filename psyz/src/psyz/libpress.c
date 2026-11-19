@@ -374,7 +374,7 @@ static void MDEC_out_locked(void* buf, int size) {
         issue += MDEC_FIRST_OUT_CLOCKS;
         mdec.out_started = 1;
     }
-    issue = issue * 1000000000 / 33868800;
+    issue = Psyz_ClocksToNs(issue);
     if (issue > ready)
         ready = issue;
     if (Psyz_MdecTrace()) {
