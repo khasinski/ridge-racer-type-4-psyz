@@ -241,6 +241,16 @@ int Psyz_CardRawEndsAt(int turn) {
     return card_drv.running && turn && card_drv.raw_state == 2;
 }
 
+/* The vblank where the driver times out a transfer to a port without a
+ * card: its handler resets the SIO there too, and libpad makes no exchange
+ * (DuckStation: every select of an empty slot in the card scenarios, 82 in
+ * Slot 2 Only and 4 after the card is pulled out, is followed by a vblank
+ * without libpad's exchange). */
+int Psyz_CardTimeoutAt(int turn) {
+    return card_drv.running && turn && card_drv.timeout_port >= 0 &&
+           card_drv.parse_port < 0;
+}
+
 void Psyz_CardVBlank(int turn) {
     if (!card_drv.running) {
         return;

@@ -237,6 +237,9 @@ void Psyz_CardVBlank(int turn);
 void Psyz_CardBlankBegin(void);
 // The blank where a raw card access ends: libpad has no exchange there.
 int Psyz_CardRawEndsAt(int turn);
+// The blank where the driver times out a transfer to an empty port: no
+// libpad exchange there either.
+int Psyz_CardTimeoutAt(int turn);
 // A BIOS file service that reads a card sector itself and waits for it
 // without raising events (firstfile reads sector 0).
 void Psyz_CardSyncTransfer(long chan);

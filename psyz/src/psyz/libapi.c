@@ -190,7 +190,7 @@ void Psyz_VSyncBlank(void) {
     if (Psyz_PadDriverRunning()) {
         BlankForce((unsigned)Psyz_VideoVSync(-1), &pad_exchange, &card_turn);
     }
-    int raw_end = Psyz_CardRawEndsAt(card_turn);
+    int raw_end = Psyz_CardRawEndsAt(card_turn) || Psyz_CardTimeoutAt(card_turn);
     if (raw_end) {
         pad_exchange = 0;
     }
