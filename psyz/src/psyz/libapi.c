@@ -337,7 +337,9 @@ int VSync(int mode) {
     }
     if (mode == 1) {
         Psyz_KernelTakeInterruptCycles(); // a polling loop absorbs handlers
-        return (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);
+        unsigned short lines = (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);
+        Psyz_SpendCycles(LIBETC_VSYNC_QUERY_CYCLES);
+        return lines;
     }
 
     int raw = Psyz_VideoVSync(1);

@@ -34,6 +34,9 @@
  *            recompiler: stubs at the exception vector and at the BIOS's
  *            returns (rfe) log the tick (the game's tools/port/ds_frames.py
  *            DSF_EXC=1), less the stubs' own clocks; the median.
+ *   [marks]  entry-to-return clocks on DuckStation's exact timing
+ *            (REGTEST_EXACT, the default reference), from ds_frames.py
+ *            DSF_MARKS stubs at the call and its return (~15 clocks each).
  *   [unrecorded] no measurement is recorded for it (a poll or spin step
  *            whose exact length has not decided a field so far).
  *
@@ -175,6 +178,14 @@ enum {
      * the blank when it waits 58 lines) [mark] (DSF_EXC, DSF_MARKS
      * PutDispEnv) */
     VSYNC_RETURN_CYCLES = 110,
+    /* A VSync(1) query in the game's frame loop (do {} while (VSync(1) <
+     * threshold)): 99 clocks from one call to the next, and from the last
+     * to its VSync(0) (DuckStation's exact timing, DSF_MARKS VSync: the
+     * Garage's and Save and Load's frames). Each query spent a scanline
+     * (2167 clocks) before, which put the VSync(0) of a frame that ends
+     * 0.7k clocks before a blank (the Garage's history screen leaving for
+     * the team car select, port vsync 3393) past it. [mark] */
+    LIBETC_VSYNC_QUERY_CYCLES = 99,
     /* The vblank where a raw card access ends (Psyz_CardRawEndsAt): the
      * driver's handler there instead, and no libpad exchange: 4901 for the
      * whole exception [exc] the boot's card polling (DuckStation fields
@@ -262,8 +273,9 @@ enum {
      * the blanks of the 19 ds_compare scenarios 200 clocks or less before
      * a root counter exception's end raise their own and those 220 or more
      * before it do not, but 210 here makes Save and Load and two cards
-     * differ from DuckStation's fields 2603 and 2621 on (4414 and none
-     * with 330): kept. */
+     * differ from DuckStation's fields 2603 and 2621 on (none with 330;
+     * again with the card menus' CPU time charged: 13 scenarios match
+     * against 17, decision differences 2997 against 968): kept. */
     LIBETC_DISPATCH_EXIT_CLOCKS = 330,
 };
 
@@ -507,6 +519,26 @@ enum {
     /* A PS1 program spinning on the card driver: a scanline a spin.
      * [unrecorded] dd07ccc */
     CARD_SPIN_NS = 64000,
+    /* The BIOS file layer on a card file (B(32h) open, B(34h) read, B(35h)
+     * write, B(36h) close: the kernel's 0x2958, 0x2b28, 0x2c94, 0x2e00),
+     * CPU time besides the driver's turns. Opening an existing file for
+     * reading 26163, for writing 21233; an FASYNC read's start 16957 and
+     * write's 16575, each returning 0 to the game's retry loop, which calls
+     * again (42 clocks) for another 1712 / 1611; a close after a create
+     * 4102, after a read 1245, after a write 773. Creating a file returns
+     * 12.5k clocks after the SIO interrupt of the BIOS's last probe of the
+     * card, 18.1k after the vblank exception that starts it (Save and Load
+     * 39.8k after its blank, the Garage 46.9k: its exception is 7.2k
+     * longer). [marks] the save's CardWriteFile and Save and Load's
+     * CardReadFile at port vsyncs 4412 and 5904, the Garage's at 5341 */
+    BIOS_CARD_OPEN_READ_CYCLES = 26163,
+    BIOS_CARD_OPEN_WRITE_CYCLES = 21233,
+    BIOS_CARD_READ_START_CYCLES = 16957 + 42 + 1712,
+    BIOS_CARD_WRITE_START_CYCLES = 16575 + 42 + 1611,
+    BIOS_CARD_CLOSE_CREATED_CYCLES = 4102,
+    BIOS_CARD_CLOSE_READ_CYCLES = 1245,
+    BIOS_CARD_CLOSE_WRITE_CYCLES = 773,
+    BIOS_CARD_CREATE_END_CYCLES = 18100,
 };
 
 /* ---- CD drive and MDEC (libcd.c, libpress.c) ---- */

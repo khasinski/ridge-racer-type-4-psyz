@@ -387,9 +387,22 @@ static long card_request(long chan, int transfers, int raise, int load, int pars
     return card_request_sectors(chan, transfers, raise, load, parse, 0);
 }
 
+/* The PS1 program sees the request end once the exception that ended it
+ * has returned (the vblank's, a sector's): its spin resumes there, not
+ * within the exception (DuckStation: the BIOS's file creation returns
+ * 18.1k clocks after the vblank exception of its last turn ends, whatever
+ * that exception's length). */
 static void card_wait(int port) {
+    int spun = 0;
     while (card_drv.running && card_drv.req[port].transfers) {
         card_spin();
+        spun = 1;
+    }
+    if (spun) {
+        uint64_t end = Psyz_KernelExceptionEndNs(NULL);
+        if (end > Psyz_KernelNowNs()) {
+            Psyz_KernelWaitUntilNs(end);
+        }
     }
 }
 
@@ -625,13 +638,12 @@ long _card_read(long chan, long block, unsigned char* buf) {
  * read raises SwCARD/EvSpIOE a sector time after the vblank of its 64th
  * transfer (DuckStation's card commands, DUCKSTATION_CARD_TRACE: Ridge Racer
  * Type 4 loading its save at boot and in Save and Load, frames 0x40..0x7F).
- * A write takes one transfer more: on DuckStation creating the file reads
- * frame 0 and writes the directory frame between the probes of the BIOS file
- * layer, and the data frames end on the turn the port's 65th transfer takes
- * after the fixed creation time below. A synchronous transfer returns when
- * the last one has ended. Without a running driver (or with the
- * port busy) the transfer takes the same number of turns on the clock.
- * Creating a file first writes its directory frames: 8 fields.
+ * A write takes one transfer more. A synchronous transfer returns when
+ * the last one has ended. Without a running driver (or with the port busy)
+ * the transfer takes the same number of turns on the clock, and creating a
+ * file 8 fields (with the driver: its turns, Psyz_CardFileCreate). The
+ * BIOS file layer's own CPU time (open, an FASYNC transfer's start, close)
+ * is spent too (BIOS_CARD_*).
  * Psyz_CardSetInstantTiming(1) or PSYZ_CARD_TIMING=instant completes card
  * I/O at once. */
 enum { CARD_FIELDS_PER_FRAME = 2, CARD_FILE_EXTRA_TRANSFERS = 1, CARD_CREATE_FIELDS = 8 };
@@ -681,6 +693,9 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
         return;
     }
     int transfers = card_file_transfers(bytes, write);
+    if (async) {
+        Psyz_SpendCycles(write ? BIOS_CARD_WRITE_START_CYCLES : BIOS_CARD_READ_START_CYCLES);
+    }
     if (card_drv.running && validate_chan(chan) &&
         (card_next_kind = write ? CARD_KIND_WRITE : 0,
          card_request_sectors(chan, transfers, async ? CARD_RAISE_SW : CARD_RAISE_NONE,
@@ -700,16 +715,60 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
     }
 }
 
-void Psyz_CardFileCreate(void) { card_spend_fields(CARD_CREATE_FIELDS); }
+/* Creating a file on a card with the driver running: on DuckStation
+ * (DUCKSTATION_CARD_TRACE: Save and Load's save, port vsyncs 4406-4414;
+ * the Garage's, 5335-5343) the BIOS reads directory frame 0 at the port's
+ * next turn, probes the card at the one after, writes the file's directory
+ * frame at the third, probes at the fourth and returns 12.5k clocks after
+ * that probe's last SIO interrupt (BIOS_CARD_CREATE_END_CYCLES after the
+ * turn's exception); the data's first frame goes out at the turn after.
+ * The fixed 8 fields from the call put the game's next frame a field late
+ * when the call came just before the port's turn (Save and Load); the four
+ * turns without the BIOS's and the menu frame's CPU time put the Garage's
+ * VSync(0) in the blank of an interlaced field, a field late too. */
+enum { CARD_CREATE_TURNS = 4 };
+
+void Psyz_CardFileCreate(long chan) {
+    if (card_is_instant()) {
+        return;
+    }
+    if (!card_drv.running || !validate_chan(chan)) {
+        card_spend_fields(CARD_CREATE_FIELDS);
+        return;
+    }
+    int port = (int)(chan >> 4);
+    for (int i = 0; i < CARD_CREATE_TURNS; i++) {
+        int frame = i % 2 == 0; // frame 0's read, the directory frame's write
+        card_next_kind = i == 2 ? CARD_KIND_WRITE : 0;
+        if (!card_request_sectors(chan, 1, CARD_RAISE_NONE, 0, 0, frame)) {
+            break;
+        }
+        card_wait(port);
+    }
+    Psyz_SpendCycles(BIOS_CARD_CREATE_END_CYCLES);
+}
 
 /* DuckStation, the card pulled out during a save (DUCKSTATION_CARD_TRACE):
  * each of the game's three retries of open(create) selects the empty slot
  * once (port vsyncs 4475, 4478, 4483), times out at the next vblank and
  * fails. */
-int Psyz_CardFileOpen(long chan) {
+int Psyz_CardFileOpen(long chan, int mode) {
     if (!validate_chan(chan) || card_chan_state(chan) != PSYZ_CARD_NONE) {
+        if (!card_is_instant() && validate_chan(chan) && !(mode & PSYZ_CARD_FILE_CREATE)) {
+            Psyz_SpendCycles(mode & PSYZ_CARD_FILE_WRITE ? BIOS_CARD_OPEN_WRITE_CYCLES
+                                                         : BIOS_CARD_OPEN_READ_CYCLES);
+        }
         return 1;
     }
     Psyz_CardSyncTransfer(chan);
     return 0;
+}
+
+void Psyz_CardFileClose(long chan, int mode) {
+    if (card_is_instant() || !validate_chan(chan)) {
+        return;
+    }
+    Psyz_SpendCycles(mode & PSYZ_CARD_FILE_CREATE  ? BIOS_CARD_CLOSE_CREATED_CYCLES
+                     : mode & PSYZ_CARD_FILE_WRITE ? BIOS_CARD_CLOSE_WRITE_CYCLES
+                                                   : BIOS_CARD_CLOSE_READ_CYCLES);
 }

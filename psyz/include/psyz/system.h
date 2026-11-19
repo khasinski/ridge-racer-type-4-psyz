@@ -214,18 +214,30 @@ void Psyz_MdecSetInstantTiming(int instant);
 void Psyz_CardFileTransfer(long chan, long bytes, int async, int write);
 
 /**
- * @brief Spend the time the BIOS takes to create a card file
+ * @brief The BIOS creating a card file on `chan`: its driver turns (the
+ * directory's frames) or, without the driver, their time
  */
-void Psyz_CardFileCreate(void);
+void Psyz_CardFileCreate(long chan);
+
+/** Psyz_CardFileOpen / Psyz_CardFileClose modes (the BIOS open's FREAD,
+ * FWRITE and FCREAT bits) */
+enum { PSYZ_CARD_FILE_READ = 1, PSYZ_CARD_FILE_WRITE = 2, PSYZ_CARD_FILE_CREATE = 0x200 };
 
 /**
- * @brief A BIOS open of a card file on `chan`: whether a card answers
+ * @brief A BIOS open of a card file on `chan` in `mode`: whether a card
+ * answers
  *
  * With no card in the port the BIOS's access to it goes out on the port's
  * next turn and times out at the vblank after; the open then fails
- * (returns 0). Returns 1 at once when a card is there.
+ * (returns 0). With a card it returns 1 after the BIOS's time to open an
+ * existing file (a create's time is Psyz_CardFileCreate's).
  */
-int Psyz_CardFileOpen(long chan);
+int Psyz_CardFileOpen(long chan, int mode);
+
+/**
+ * @brief The BIOS's time to close a card file opened on `chan` in `mode`
+ */
+void Psyz_CardFileClose(long chan, int mode);
 
 /**
  * @brief Complete memory card requests and file I/O at once

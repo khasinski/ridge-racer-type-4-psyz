@@ -823,10 +823,11 @@ int Psyz_VideoVSync(int mode) {
         return (int)(WallVblankCount() + vblank_clock_offset);
     }
     if (vsync_mode == PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth) {
-        /* On the offline clock each query spends a line of emulated time, as
-         * a polling loop would: blanks it crosses happen in that wait
-         * (Psyz_VideoWaitBlank). The count runs from the last VSync(0). */
-        int offline = Psyz_AudioWaitUs(mode == 1 ? 64 : 0);
+        /* On the offline clock a query spends no time here: libetc's
+         * VSync(1) spends its PS1 time (LIBETC_VSYNC_QUERY_CYCLES), and the
+         * blanks it crosses happen in that wait (Psyz_VideoWaitBlank). The
+         * count runs from the last VSync(0). */
+        int offline = Psyz_AudioWaitUs(0);
         if (offline) {
             /* The line counter is 16 bits: wrap the whole count (a double
              * past 65535 converts to unsigned short undefined). */
