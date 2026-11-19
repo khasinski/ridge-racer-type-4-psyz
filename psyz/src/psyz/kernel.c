@@ -447,6 +447,7 @@ static struct {
     uint64_t ns;
     unsigned cycles;
     int device; // a device model's interrupt (Psyz_KernelDispatch)
+    unsigned open_tail; // its last clocks, where a blank is not hidden
 } dispatches[DISPATCH_RING];
 static unsigned dispatch_next;
 static int dispatch_seen;
@@ -458,6 +459,7 @@ static void RecordDispatch(uint64_t at_ns, unsigned cycles, int device) {
     dispatches[dispatch_next].ns = at_ns;
     dispatches[dispatch_next].cycles = cycles;
     dispatches[dispatch_next].device = device;
+    dispatches[dispatch_next].open_tail = 0;
     dispatch_next = (dispatch_next + 1) % DISPATCH_RING;
     dispatch_seen = 1;
 }
@@ -497,11 +499,17 @@ static void ServiceLine(int line, uint64_t at_ns) {
 }
 
 void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged) {
+    Psyz_KernelDispatchTail(at_ns, cycles, charged, 0);
+}
+
+void Psyz_KernelDispatchTail(uint64_t at_ns, unsigned cycles, unsigned charged,
+                             unsigned open_tail) {
     if (!UsesAudioClock()) {
         return;
     }
     Psyz_KernelInterruptCycles(charged);
     RecordDispatch(at_ns, cycles, 1);
+    dispatches[(dispatch_next + DISPATCH_RING - 1) % DISPATCH_RING].open_tail = open_tail;
 }
 
 // The latest recorded dispatch that began by at_ns.
@@ -546,7 +554,10 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
         unsigned test = dispatches[i].device && test_clocks > BIOS_RCNT_CHAIN_CYCLES
                             ? test_clocks - BIOS_RCNT_CHAIN_CYCLES
                             : test_clocks;
-        if (clocks > test && clocks <= dispatches[i].cycles - exit_clocks) {
+        unsigned exit = exit_clocks > dispatches[i].open_tail ? exit_clocks
+                                                              : dispatches[i].open_tail;
+        if (clocks > test && exit < dispatches[i].cycles &&
+            clocks <= dispatches[i].cycles - exit) {
             return 1;
         }
     }

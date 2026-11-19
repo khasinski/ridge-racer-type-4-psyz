@@ -170,10 +170,9 @@ static struct {
     int parse_port;   // a directory read, finished at the next vblank
     int raw_port;     // the raw command's port (-1: none)
     int raw_state;    // 0 none, 1 waiting, 2 transferred, 3 answered
-    int raw_late;     // a new card answers a vblank later
     uint64_t last_vblank_us;
     CardRequest req[2];
-} card_drv = {0, 0, -1, -1, -1, 0, 0, 0, {{0}}};
+} card_drv = {0, 0, -1, -1, -1, 0, 0, {{0}}};
 
 // PSYZ_CARD_TRACE=1 logs the driver's work at each vblank.
 static int card_trace(void) {
@@ -239,7 +238,7 @@ static void card_sector_done1(void) { card_sector_done(1); }
  * handler takes the SIO there and libpad makes no exchange (DuckStation:
  * that vblank's exception is 4.9k clocks, libpad's flag stays clear). */
 int Psyz_CardRawEndsAt(int turn) {
-    return card_drv.running && turn && card_drv.raw_state == 2 && !card_drv.raw_late;
+    return card_drv.running && turn && card_drv.raw_state == 2;
 }
 
 void Psyz_CardVBlank(int turn) {
@@ -258,19 +257,11 @@ void Psyz_CardVBlank(int turn) {
      * vblank (DuckStation, DUCKSTATION_CARD_TRACE: the unformatted
      * scenario's CARDOP 5a at port vsync 270 with the BIOS driver on port
      * 1, libpad's exchange missing at 271; the Save and Load scenario's
-     * probe at 5900-5901, the driver's port 1 then 0). A card whose FLAG
-     * says new answers a vblank later (raw_late; see docs/TECH_DEBT.md). */
+     * probe at 5900-5901, the driver's port 1 then 0), a new card's too. */
     if (card_drv.raw_state == 2) {
-        if (card_drv.raw_late) {
-            card_drv.raw_late = 0;
-        } else {
-            card_drv.raw_state = 3;
-        }
+        card_drv.raw_state = 3;
     } else if (card_drv.raw_state == 1) {
         card_drv.raw_state = 2;
-        card_drv.raw_late = card_drv.raw_port >= 0 && card_drv.raw_port < 2 &&
-                            card_new[card_drv.raw_port] &&
-                            Psyz_CardSlotState(card_drv.raw_port) != PSYZ_CARD_NONE;
     }
     if (card_drv.parse_port >= 0) {
         // the parse's vblank is the other port's turn too (DuckStation
@@ -517,7 +508,6 @@ static void card_driver_reset(int running) {
     card_drv.parse_port = -1;
     card_drv.raw_port = -1;
     card_drv.raw_state = 0;
-    card_drv.raw_late = 0;
     card_drv.last_vblank_us = Psyz_KernelNowUs();
 }
 
@@ -601,14 +591,17 @@ long _card_write(long chan, long block, unsigned char* buf) {
     (void)block;
     (void)buf;
     card_next_kind = CARD_KIND_WRITE;
-    return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
+    // its event comes when the card has taken the frame (DuckStation: the
+    // unformatted card's _card_clear of frame 0x3F ends 241.9k clocks after
+    // its vblank; frames written by the file layer 251k-269k)
+    return card_request_sectors(chan, 1, CARD_RAISE_BOTH, 0, 0, 1);
 }
 
 long _card_read(long chan, long block, unsigned char* buf) {
     LOG_ONCE("raw sectors are not emulated, only the completion event");
     (void)block;
     (void)buf;
-    return card_request(chan, 1, CARD_RAISE_BOTH, 0, 0);
+    return card_request_sectors(chan, 1, CARD_RAISE_BOTH, 0, 0, 1);
 }
 
 /* Memory card file timing ("bu" device). The BIOS moves a file's 128-byte

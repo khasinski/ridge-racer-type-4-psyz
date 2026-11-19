@@ -190,6 +190,11 @@ void _SsVmFlush(void) {
         }
         for (i = 0; i < _SsVmMaxVoice; i++) {
             if (mask & (1 << i)) {
+#ifdef __psyz
+                if (!_ss_flush_uncharged) {
+                    SS_CPU(SS_VM_FLUSH_SILENT_VOICE_CYCLES);
+                }
+#endif
                 if (_svm_voice[i].unk1b == 2) {
                     /* As the PS1: the low half of the mask is sign
                      * extended, so voice 15 also releases voices 16-23. */

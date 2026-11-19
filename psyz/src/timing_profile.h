@@ -243,7 +243,14 @@ enum {
      * own is the rest of a tick with no sequence playing, 5895 in all
      * (the attract boot's ticks, SsSeqCalledTbyT:ret alone) [rec ratio]. */
     SS_TICK_CYCLES = 5895 - (5544 + 2 * 52),
-    SS_VM_FLUSH_CYCLES = 5544 + 2 * 52,
+    /* _SsVmFlush with its two SpuSetKey calls, and 11 more for each voice
+     * silent for the last 15 ticks (its envelope history), which it
+     * releases: DuckStation's boot ticks take 5495 before that history
+     * fills (port vsyncs 131-142) and 5759 with all 24 voices silent (from
+     * 143), _SsVmFlush:ret marks [mark]; the menus' 5544 + 2 * 52 above
+     * had about 14 of them silent. */
+    SS_VM_FLUSH_SILENT_VOICE_CYCLES = 11,
+    SS_VM_FLUSH_CYCLES = 5494,
     SS_VM_FLUSH_VOICE_CYCLES = 920,
     SS_SND_PLAY_CYCLES = 132,
     SS_GET_SEQ_DATA_CYCLES = 332,
@@ -332,6 +339,13 @@ enum {
      * (CD_CW_ACK_CYCLES, CD_DONE_IRQ_CYCLES). [exc] the boot's reads
      * (3800, 2420) and the Grand Prix menus' loads (4130, 2790) */
     CD_DATA_IRQ_CLOCKS = 3780,
+    /* The sector's DMA to RAM (CdGetSector, 512 words: 544 clocks on
+     * DuckStation) ends 23 clocks before that exception does; a blank
+     * during it reaches the CPU only after it and is not hidden
+     * (DuckStation's vblank event at the unformatted scenario's port vsync
+     * 192 comes 243 clocks late, at the DMA's end, and neither libpad nor
+     * the card driver misses it). */
+    CD_DATA_DMA_TAIL_CLOCKS = 544 + 23,
     /* A read's ready callback that issues a command (CdRead's ending
      * Pause): CD_cw comes this long after the sector's exception, before
      * the card driver's chain is installed and BIOS_CARD_CHAIN_CYCLES later

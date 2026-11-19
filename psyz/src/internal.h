@@ -147,6 +147,10 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
 // time (the rest is spent elsewhere, e.g. inside a wait that counts it).
 // Offline clock only.
 void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged);
+// The same for a handler whose last `open_tail` clocks do not hide a blank
+// (a DMA it waits for there: the blank reaches the CPU after it).
+void Psyz_KernelDispatchTail(uint64_t at_ns, unsigned cycles, unsigned charged,
+                             unsigned open_tail);
 // The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
 // thread from then on, like a handler's time. Offline clock only.
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);

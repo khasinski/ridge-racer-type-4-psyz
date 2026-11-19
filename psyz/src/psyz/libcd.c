@@ -1716,7 +1716,8 @@ static void drive_irq(uint64_t at_us, unsigned cycles, unsigned charged) {
     }
     if (!drive_is_instant()) {
         unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
-        Psyz_KernelDispatch(at_us * 1000, cycles + chain, charged ? charged + chain : 0);
+        Psyz_KernelDispatchTail(at_us * 1000, cycles + chain, charged ? charged + chain : 0,
+                                cycles == CD_DATA_IRQ_CLOCKS ? CD_DATA_DMA_TAIL_CLOCKS : 0);
     }
 }
 
