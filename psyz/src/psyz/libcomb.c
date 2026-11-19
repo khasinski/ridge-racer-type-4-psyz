@@ -90,7 +90,7 @@ typedef struct {
     LinkLines lines;
     uint8_t data[255];
     int len;
-    uint64_t at_us;
+    uint64_t at_ns;
 } WireEvent;
 
 static struct {
@@ -147,7 +147,7 @@ static void SioInterrupt(void);
 static void Lock(void) { Psyz_KernelLockInterrupts(); }
 static void Unlock(void) { Psyz_KernelUnlockInterrupts(); }
 
-static uint64_t NowNs(void) { return Psyz_KernelNowUs() * 1000; }
+static uint64_t NowNs(void) { return Psyz_KernelNowNs(); }
 
 /* One character on the wire: start bit, 5..8 data bits, parity, 1/1.5/2
  * stop bits, at the clock over reload value and factor (MUL1/1/16/64). */
@@ -261,7 +261,7 @@ static void DrainWire(void) {
         case 3: {
             uint64_t byte_ns = ByteNs();
             for (int i = 0; sio.up && i < ev.len; i++) {
-                uint64_t due = ev.at_us * 1000;
+                uint64_t due = ev.at_ns;
                 if (due < sio.rx_last_ns + byte_ns)
                     due = sio.rx_last_ns + byte_ns;
                 sio.rx_last_ns = due;
@@ -436,7 +436,7 @@ static void Report(void) {
 
 /* The next time the port changes by itself (a received byte entering the
  * FIFO, a character shifted out): an interrupt then. */
-static uint64_t scheduled_us; // the pending timed interrupt, 0 for none
+static uint64_t scheduled_ns; // the pending timed interrupt, 0 for none
 
 static void Schedule(void) {
     uint64_t next = UINT64_MAX, at;
@@ -444,14 +444,14 @@ static void Schedule(void) {
         next = sio.rxq[sio.rxq_head].due_ns;
     if (sio.tx_shifting && sio.tx_done_ns < next)
         next = sio.tx_done_ns;
-    at = next == UINT64_MAX ? 0 : (next + 999) / 1000;
-    if (at == scheduled_us)
+    at = next == UINT64_MAX ? 0 : next; // on the CPU's clock (it was rounded up to a us)
+    if (at == scheduled_ns)
         return;
-    if (scheduled_us)
+    if (scheduled_ns)
         Psyz_KernelCancel(SioInterrupt);
-    scheduled_us = at;
+    scheduled_ns = at;
     if (at)
-        Psyz_KernelPostAt(at, SioInterrupt);
+        Psyz_KernelPostAtNs(at, SioInterrupt);
 }
 
 /* ---- libsio interrupt handler (_sio_irq_handler) ---- */
@@ -512,8 +512,8 @@ static void IrqHandler(void) {
 /* The port's interrupt, and the network's: runs in interrupt context. */
 static void SioInterrupt(void) {
     Lock();
-    if (scheduled_us && Psyz_KernelNowUs() >= scheduled_us)
-        scheduled_us = 0; // this is it (or it comes with this one)
+    if (scheduled_ns && NowNs() >= scheduled_ns)
+        scheduled_ns = 0; // this is it (or it comes with this one)
     Advance();
     for (int i = 0; i < 64 && IrqPending(); i++)
         IrqHandler();
@@ -540,7 +540,7 @@ static void Queue(const WireEvent* ev) {
     Psyz_OsLock(wire_lock);
     if (wire_len < WIRE_QUEUE) {
         wire_queue[(wire_head + wire_len) % WIRE_QUEUE] = *ev;
-        wire_queue[(wire_head + wire_len) % WIRE_QUEUE].at_us = Psyz_KernelNowUs();
+        wire_queue[(wire_head + wire_len) % WIRE_QUEUE].at_ns = NowNs();
         wire_len++;
     } else {
         WARNF("link: dropped a network event");

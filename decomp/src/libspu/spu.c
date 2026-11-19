@@ -194,7 +194,9 @@ INCLUDE_ASM("asm/nonmatchings/libspu/spu", _spu_Fr_);
 #include <string.h>
 void Psyz_KernelRaise(unsigned int desc, unsigned int spec);
 uint64_t Psyz_KernelNowUs(void);
-void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
+uint64_t Psyz_KernelNowNs(void);
+void Psyz_KernelPostAtNs(uint64_t at_ns, void (*fn)(void));
+void Psyz_KernelWaitUntilNs(uint64_t at_ns);
 void Psyz_KernelCancel(void (*fn)(void));
 int Psyz_KernelOfflineClock(void);
 void Psyz_SpendTime(unsigned ns);
@@ -216,6 +218,7 @@ void _spu_DmaDone(void) {
  * emulated clock. PSYZ_SPU_TIMING=instant ends transfers at once. */
 #include "../../../psyz/src/timing_profile.h"
 static volatile int spu_dma_busy;
+static uint64_t spu_dma_end_ns; // the running transfer's end
 
 static int spu_dma_instant(void) {
     static int instant = -1;
@@ -248,21 +251,29 @@ static void spu_dma_start(unsigned size) {
         return;
     }
     spu_dma_busy = 1;
-    uint64_t us = ((uint64_t)size * SPU_DMA_CLOCKS_PER_BYTE * 1000000 + 33868800 / 2) / 33868800;
-    Psyz_KernelPostAt(Psyz_KernelNowUs() + us, spu_dma_end);
+    // on the CPU's clock, rounded up: done by then
+    uint64_t clocks = (uint64_t)size * SPU_DMA_CLOCKS_PER_BYTE;
+    spu_dma_end_ns = Psyz_KernelNowNs() + (clocks * 1000000000 + 33868799) / 33868800;
+    Psyz_KernelPostAtNs(spu_dma_end_ns, spu_dma_end);
 }
 
 int Psyz_SpuDmaBusy(void) { return spu_dma_busy; }
 
 /* SpuIsTransferCompleted(SPU_TRANSFER_WAIT): spins on the emulated clock
- * until the transfer ends. Where no time can pass (the offline clock with
- * audio paused, or inside an interrupt handler) the transfer ends at once,
- * as MDEC_out_sync does, instead of spinning forever. */
+ * until the transfer ends; on the CPU's clock to its end, as the PS1's
+ * loop on the DMA's status does (it overran it by up to a 64 us step).
+ * Where no time can pass (the offline clock with audio paused, or inside
+ * an interrupt handler) the transfer ends at once, as MDEC_out_sync does,
+ * instead of spinning forever. */
 void Psyz_SpuDmaWait(void) {
     while (spu_dma_busy) {
-        uint64_t before = Psyz_KernelNowUs();
-        Psyz_SpendTime(SPU_DMA_WAIT_STEP_NS);
-        if (spu_dma_busy && Psyz_KernelNowUs() == before &&
+        uint64_t before = Psyz_KernelNowNs();
+        if (Psyz_KernelOfflineClock()) {
+            Psyz_KernelWaitUntilNs(spu_dma_end_ns);
+        } else {
+            Psyz_SpendTime(SPU_DMA_WAIT_STEP_NS);
+        }
+        if (spu_dma_busy && Psyz_KernelNowNs() == before &&
             Psyz_KernelOfflineClock()) {
             spu_dma_reset();
         }

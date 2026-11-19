@@ -279,6 +279,9 @@ void Psyz_CardVBlank(int turn) {
         int port = card_drv.parse_port;
         card_drv.parse_port = -1;
         card_drv.port ^= 1;
+        if (card_trace()) {
+            fprintf(stderr, "card: vblank port %d parses port %d's read\n", card_drv.port, port);
+        }
         card_finish(port, card_result(&card_drv.req[port]));
         return;
     }
