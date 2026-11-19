@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <psyz.h>
 #include <libetc.h>
 
@@ -92,7 +93,33 @@ void* DMACallback(int dma, void (*func)()) {
 }
 
 /* Transfers finish synchronously on PC. A callback may start another one;
- * dispatch its completion after the current callback returns, as DMA would. */
+ * dispatch its completion after the current callback returns, as DMA would.
+ * The MDEC output's channel is the one whose interrupt the game enables
+ * (DICR on DuckStation: it and the SPU's): its callback runs in that
+ * interrupt's exception (Psyz_DmaIrqComplete); the others' at once. */
+static int dma_irq_host = -1; // Psyz_DmaIrqComplete: its exception's host
+
+static void DispatchDma(unsigned channel, void (*callback)(void)) {
+    if (channel != 1 || dma_irq_host < 0) {
+        callback();
+        return;
+    }
+    unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
+    unsigned total = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain;
+    unsigned before = DEVICE_IRQ_TO_HANDLER_CYCLES;
+    unsigned after = total - before;
+    if (dma_irq_host) { // raised during another exception: libetc's reread
+        before = dma_irq_host == 2 ? DMA_AFTER_DEVICE_TO_HANDLER_CYCLES
+                                   : DMA_AFTER_LINE_TO_HANDLER_CYCLES;
+        after = DMA_NESTED_RETURN_CYCLES;
+    }
+    if (Psyz_MdecTrace()) {
+        fprintf(stderr, "mdec irq host %d at %llu clocks\n", dma_irq_host,
+                (unsigned long long)Psyz_KernelCpuClocks());
+    }
+    Psyz_KernelDeviceIrq(callback, before, after, DMA_DISPATCH_EXIT_CLOCKS);
+}
+
 void Psyz_DmaComplete(unsigned channel) {
     if (channel >= 7)
         return;
@@ -110,9 +137,18 @@ void Psyz_DmaComplete(unsigned channel) {
         dma_pending &= ~(1u << next);
         void (*callback)(void) = dma_callbacks[next];
         if (callback)
-            callback();
+            DispatchDma(next, callback);
     }
     dma_dispatching = 0;
+    Psyz_KernelUnlockInterrupts();
+}
+
+void Psyz_DmaIrqComplete(unsigned channel, int host) {
+    Psyz_KernelLockInterrupts();
+    int outer = dma_irq_host;
+    dma_irq_host = host;
+    Psyz_DmaComplete(channel);
+    dma_irq_host = outer;
     Psyz_KernelUnlockInterrupts();
 }
 

@@ -115,6 +115,7 @@ static int PadTrace(void) {
 void Psyz_VSyncBlank(void) {
     // on the offline clock the blank's exact time: it runs there
     uint64_t blank_ns = Psyz_KernelNowNs();
+    long debt = Psyz_KernelDebtClocks();
     last_blank_us = blank_ns / 1000;
     Psyz_CardBlankBegin();
     Psyz_GpuCrtcBlank();
@@ -156,6 +157,9 @@ void Psyz_VSyncBlank(void) {
     if (g_PsyzVsyncCb)
         g_PsyzVsyncCb();
     Psyz_KernelVBlank();
+    // its exception, for the DMA interrupts that come meanwhile
+    long cycles = Psyz_KernelDebtClocks() - debt;
+    Psyz_KernelNoteException(blank_ns, cycles > 0 ? (unsigned)cycles : 0);
 }
 
 /* SDK VSync(n) waits for the interval since the previous blocking call,
@@ -301,6 +305,9 @@ int VSync(int mode) {
         Psyz_SpendTime((unsigned)wait_ns);
     }
     vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
+    if (Psyz_KernelOfflineClock()) {
+        Psyz_SpendCycles(VSYNC_RETURN_CYCLES);
+    }
     Psyz_CdServiceDrive();
     /* Keep periodic waits on their scheduled blank. Native presentation can
      * return just after it; using that late return as the next origin adds a

@@ -507,6 +507,7 @@ DISPENV* PutDispEnv(DISPENV* env) {
             mode |= 0x24;
         }
         D_800B8920->ctl(mode);
+        GPU_TIME(PUT_DISP_ENV_MODE_CYCLES);
     }
     memcpy((u8*)&info.disp, (u8*)env, sizeof(DISPENV));
     GPU_TIME(PUT_DISP_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DISPENV_SIZE));

@@ -1573,7 +1573,7 @@ int CD_sync(int mode, u_char* result) {
         drive_wait_done(done);
         Psyz_CdServiceDrive();
     } else {
-        Psyz_CdPollQuery();
+        Psyz_CdPollCycles(CD_SYNC_POLL_CYCLES);
     }
     Psyz_KernelLockInterrupts();
     int intr = last_intr;
@@ -1701,6 +1701,9 @@ static void start_data_read(void) {
 }
 
 static uint64_t command_ack_us; // CD_cw
+/* StCdInterrupt from a stream sector's ready callback: its clocks there. */
+static int st_irq_called;
+static unsigned st_irq_extra;
 /* While a read's ready callback runs from a sector's interrupt: where the
  * CPU has got to in the handler, for a command it issues (CD_cw). */
 static uint64_t sector_callback_us;
@@ -1755,7 +1758,17 @@ static void deliver_data_sector(void) {
     data_getsector_count = 0;
     drive_ready_sector = sector;
     unsigned generation = drive_generation;
+    st_irq_called = 0;
+    st_irq_extra = 0;
     CD_cbready(CdlDataReady, result);
+    if (st_irq_called && !drive_is_instant()) {
+        // a stream sector's exception: StCdInterrupt's own path
+        Psyz_KernelExtendDispatch(irq_us * 1000,
+                                  (int)ST_SECTOR_IRQ_CLOCKS -
+                                      (int)CD_DATA_IRQ_CLOCKS +
+                                      (int)st_irq_extra);
+    }
+    st_irq_called = 0;
     sector_callback_us = 0;
     drive_ready_sector = -1;
     if (generation == drive_generation) { // the callback issued no new read
@@ -1874,6 +1887,13 @@ void Psyz_CdPollDrive(void) {
 
 void Psyz_CdPollQuery(void) { drive_poll(CD_POLL_NS); }
 
+/* A LIBCD poll whose own code is measured (CdSync(1), CdReadSync(1)): CPU
+ * work, which the interrupts that come meanwhile lengthen. */
+void Psyz_CdPollCycles(unsigned cycles) {
+    drive_cpu(cycles);
+    Psyz_CdServiceDrive();
+}
+
 /* StCdInterrupt: the ready-callback half of LIBCD streaming. It moves the
  * current sector into the ring StSetRing installed: StRingSize 32-byte
  * StHEADERs followed by as many 2016-byte (504 word) payload slots. A sector
@@ -1937,16 +1957,48 @@ static int st_begin_frame(const StHEADER* h) {
     return 1;
 }
 
+/* With StSetStream's 24-bit mode (StRgb24) LIBCD's StCdInterrupt leaves a
+ * sector it gets while the MDEC's output DMA is under way (DMA1's CHCR
+ * busy) in the drive's buffer and sets StCdIntrFlag: the movie player's
+ * MDEC callback calls it then, before its next DecDCTout. Its PS1 time,
+ * in the sector's exception or the callback's: ST_SECTOR_IRQ_CLOCKS,
+ * ST_COPY_CYCLES, ST_FRAME_DONE_CYCLES (timing_profile.h). */
+static u_char st_deferred_data[SECTOR_SIZE];
+static int st_deferred_sector = -1;
+
+static void st_charge(unsigned cycles) {
+    if (drive_ready_sector >= 0) {
+        st_irq_extra += cycles; // the sector's exception (deliver_data_sector)
+    } else {
+        Psyz_KernelInterruptCycles(cycles); // the MDEC callback's
+    }
+}
+
 void StCdInterrupt(void) {
     StHEADER h;
-    if (drive_ready_sector < 0 || !StRingAddr || StRingSize < 2) {
+    const u_char* sector_data = data_sector;
+    int sector = drive_ready_sector;
+    if (sector >= 0) {
+        st_irq_called = 1;
+    } else if (st_deferred_sector >= 0) {
+        sector = st_deferred_sector; // the sector it left for the callback
+        sector_data = st_deferred_data;
+    }
+    st_deferred_sector = -1;
+    if (sector < 0 || !StRingAddr || StRingSize < 2) {
         return; // DataEnd/DiskError or no ring: nothing to store
     }
+    if (StRgb24 && drive_ready_sector >= 0 && Psyz_MdecOutBusy()) {
+        memcpy(st_deferred_data, data_sector, SECTOR_SIZE);
+        st_deferred_sector = sector;
+        StCdIntrFlag = 1;
+        return;
+    }
     StCdIntrFlag = 0;
-    if (data_sector[0x12] & 0x04) {
+    if (sector_data[0x12] & 0x04) {
         return; // XA audio interleaved with the frames
     }
-    memcpy(&h, data_sector + 24, sizeof(h));
+    memcpy(&h, sector_data + 24, sizeof(h));
     if (h.secCount == 0) {
         st_drop_frame(); // previous frame lost a sector
         if (!st_begin_frame(&h)) {
@@ -1961,10 +2013,11 @@ void StCdInterrupt(void) {
     StHEADER* dst = &StRingAddr[slot];
     u_char* payload =
         (u_char*)&StRingAddr[StRingSize] + (size_t)slot * ST_SLOT_BYTES;
-    memcpy(payload, data_sector + 24 + sizeof(StHEADER), ST_SLOT_BYTES);
+    memcpy(payload, sector_data + 24 + sizeof(StHEADER), ST_SLOT_BYTES);
+    st_charge(ST_COPY_CYCLES);
     *dst = h;
     dst->id = ST_SLOT_FILLING;
-    CdIntToPos(drive_ready_sector, &dst->loc);
+    CdIntToPos(sector, &dst->loc);
     Stsector_offset = (s16)h.secCount;
     if (++st_frame.next < st_frame.count) {
         return;
@@ -1973,6 +2026,7 @@ void StCdInterrupt(void) {
     Stframe_no = (s32)h.frameCount;
     StRingIdx1 = st_frame.slot + st_frame.count;
     StFinalSector = 1;
+    st_charge(ST_FRAME_DONE_CYCLES);
     Psyz_DmaComplete(3); // data_ready_callback publishes the frame
     if (StFunc2 && StEndFrame && h.frameCount >= (u32)StEndFrame) {
         StFunc2();
@@ -1990,6 +2044,21 @@ static int CD_command(u_char com, u_char* param, u_char* result, s32 arg3);
  * it CdlDiskError and the command fail. */
 static uint64_t command_ack_us;
 
+/* The parameter bytes of a command (LIBCD's table of them). */
+static unsigned cd_param_bytes(u_char com) {
+    switch (com) {
+    case CdlSetloc:
+        return 3;
+    case CdlSetfilter:
+        return 2;
+    case CdlSetmode:
+    case CdlGetTD:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     // LIBCD's CD_cw first waits (CD_sync(0)) for the previous command to
     // complete, a second response included.
@@ -1998,7 +2067,8 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelUnlockInterrupts();
     drive_wait_done(previous_done);
     Psyz_CdServiceDrive();
-    drive_cpu(CD_CW_ISSUE_CYCLES);
+    drive_cpu(CD_CW_ISSUE_CYCLES + (param ? cd_param_bytes(com) : 0) *
+                                       CD_CW_PARAM_CYCLES);
     Psyz_KernelLockInterrupts();
     CD_com = com; // CdLastCom
     // The command register write comes where the CPU's work has got to: in
@@ -2029,8 +2099,19 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive_irq(ack, CD_ACK_IRQ_CLOCKS, 0); // CD_CW_ACK_CYCLES has its time
     Psyz_KernelUnlockInterrupts();
     if (!arg3) {
+        // the interrupts during the spin run within it, as on DuckStation
+        // (a root counter's between CdRead2's Setmode and its acknowledge)
+        long debt = Psyz_KernelDebtClocks();
+        uint64_t start_ns = Psyz_KernelNowNs();
         drive_wait_until(ack);
-        drive_cpu(CD_CW_ACK_CYCLES);
+        if (Psyz_KernelOfflineClock() && !drive_is_instant()) {
+            Psyz_KernelSettleWait(debt, start_ns, ack * 1000, ack * 1000);
+        }
+        // the acknowledge's exception runs the card driver's chain too
+        drive_cpu(CD_CW_ACK_CYCLES +
+                  (Psyz_CardChainInstalled() ? CD_CW_ACK_CHAIN_CYCLES
+                   : com == CdlSetloc        ? CD_CW_SETLOC_ACK_CYCLES
+                                             : 0));
     }
     return ret;
 }

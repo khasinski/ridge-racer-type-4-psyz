@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <psyz.h>
 #include <libpress.h>
 #include <psyz/log.h>
@@ -17,15 +18,25 @@ static struct {
     int error;
     uint64_t start_us; // the decode of the current input began
     int out_pending;   // an output transfer waits for its macroblocks
+    int out_started;   // an output transfer came since the input began
     uint64_t out_us;   // and completes at this time
 } mdec;
 
 /* The decoder takes its PS1 time: a macroblock (a block in the mono
- * depths) leaves it every MDEC_UNIT_NS (timing_profile.h), so an output
+ * depths) leaves it every unit_clocks() (timing_profile.h), so an output
  * transfer completes, and raises its DMA callback, once the decoder has
  * produced its words. Psyz_MdecSetInstantTiming(1) completes transfers at
  * once. */
 static int mdec_instant;
+
+int Psyz_MdecTrace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char* v = getenv("PSYZ_MDEC_TRACE");
+        trace = v && *v == '1';
+    }
+    return trace;
+}
 
 void Psyz_MdecSetInstantTiming(int instant) {
     Psyz_KernelLockInterrupts();
@@ -46,16 +57,45 @@ static unsigned unit_bytes(void) {
     }
 }
 
+/* The output DMA's interrupt. While another exception runs (the vblank's,
+ * a root counter's, the CD drive's) it waits for that exception's handlers:
+ * libetc's dispatcher then takes it within the same exception. */
+static int out_host;
 static void out_done(void) {
+    int device = 0;
+    uint64_t end = Psyz_KernelExceptionEndNs(&device);
+    if (!mdec_instant && end > Psyz_KernelNowNs()) {
+        out_host = device ? 2 : 1;
+        Psyz_KernelPostAtNs(end, out_done);
+        return;
+    }
     mdec.out_pending = 0;
-    Psyz_DmaComplete(1);
+    int host = out_host;
+    out_host = 0;
+    Psyz_DmaIrqComplete(1, host);
+}
+
+int Psyz_MdecOutBusy(void) {
+    Psyz_KernelLockInterrupts();
+    int busy = mdec.out_pending;
+    Psyz_KernelUnlockInterrupts();
+    return busy;
 }
 
 static void cancel_out(void) {
     if (mdec.out_pending) {
         Psyz_KernelCancel(out_done);
         mdec.out_pending = 0;
+        out_host = 0;
     }
+}
+
+/* Clocks per output unit: its blocks' decode, then its words' DMA. */
+static uint64_t unit_clocks(void) {
+    unsigned blocks = unit_bytes() >= 512 ? 6 : 1;
+    unsigned words = unit_bytes() / 4;
+    return (uint64_t)blocks * MDEC_BLOCK_CLOCKS +
+           ((uint64_t)words * MDEC_OUT_192_WORDS_CLOCKS + 96) / 192;
 }
 
 static const u8 scan[64] = {
@@ -265,6 +305,7 @@ static void MDEC_in_locked(void* buf, int size) {
         }
         decode(data, data + words * 4);
         mdec.start_us = Psyz_KernelNowUs();
+        mdec.out_started = 0;
         break;
     }
     case 2: {
@@ -305,9 +346,25 @@ static void MDEC_out_locked(void* buf, int size) {
     memcpy(buf, mdec.output + mdec.cursor, (size_t)size * 4);
     mdec.cursor += (size_t)size * 4;
     uint64_t units = (mdec.cursor + unit_bytes() - 1) / unit_bytes();
-    uint64_t ready = mdec.start_us + units * MDEC_UNIT_NS / 1000;
+    uint64_t ready = mdec.start_us + units * unit_clocks() * 1000000 / 33868800;
+    // the decoder works on this transfer's units from its start (where the
+    // CPU has got to, a callback's handler time included)
+    uint64_t these = ((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes();
+    uint64_t issue = Psyz_KernelCpuClocks() + these * unit_clocks();
+    if (!mdec.out_started) { // the decode's start after the input's
+        issue += MDEC_FIRST_OUT_CLOCKS;
+        mdec.out_started = 1;
+    }
+    issue = issue * 1000000 / 33868800;
+    if (issue > ready)
+        ready = issue;
+    if (Psyz_MdecTrace()) {
+        fprintf(stderr, "mdec out %d words at %llu clocks, ready %llu us\n",
+                size, (unsigned long long)Psyz_KernelCpuClocks(),
+                (unsigned long long)ready);
+    }
     if (mdec_instant || ready <= Psyz_KernelNowUs()) {
-        Psyz_DmaComplete(1);
+        Psyz_DmaIrqComplete(1, 0);
         return;
     }
     mdec.out_pending = 1;
@@ -354,7 +411,9 @@ int MDEC_out_sync(void) {
         if (Psyz_KernelOfflineClock() || due <= now) {
             // due, or no time can pass here (inside an interrupt)
             Psyz_KernelCancel(out_done);
-            out_done();
+            mdec.out_pending = 0;
+            out_host = 0;
+            Psyz_DmaIrqComplete(1, 0);
         } else {
             Psyz_KernelUnlockInterrupts();
             Psyz_KernelPoll();

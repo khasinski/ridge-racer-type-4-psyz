@@ -197,6 +197,11 @@ static int cd_read_retry_locked(int mode) {
             return ReadAttr.remaining;
         }
     }
+#ifdef __psyz
+    else {
+        Psyz_CdCpu(CD_READ_KEEP_MODE_CYCLES);
+    }
+#endif
     ReadAttr.pos = CdPosToInt(CdLastPos());
     CdReadyCallback(cb_read);
     if (ReadAttr.read_mode & 1) {
@@ -206,6 +211,9 @@ static int cd_read_retry_locked(int mode) {
     CdControlF(CdlReadN, NULL);
     ReadAttr.remaining = ReadAttr.num_sectors;
     ReadAttr.start_time2 = VSync(-1);
+#ifdef __psyz
+    Psyz_CdCpu(CD_READ_END_CYCLES);
+#endif
     return ReadAttr.remaining;
 }
 
@@ -279,7 +287,7 @@ int CdReadSync(int mode, u_char* result) {
     do {
 #ifdef __psyz
         // The drive reads on while the caller polls.
-        Psyz_CdPollQuery();
+        Psyz_CdPollCycles(CD_READ_SYNC_TURN_CYCLES);
 #endif
         CD_LOCK();
         if (VSync(-1) > ReadAttr.start_time + 1200) {
@@ -295,10 +303,17 @@ int CdReadSync(int mode, u_char* result) {
         // mode 0 also waits for the read's ending Pause
     } while (mode == 0 && (ret > 0 || (ret == 0 && read_pause_pending)));
 
+#ifdef __psyz
+    // the Pause may complete meanwhile: its look comes after CdReady
+    Psyz_CdPollCycles(CD_READ_SYNC_END_CYCLES);
+#endif
     CdReady(1, result);
     if (ret == 0 && read_pause_pending) {
         ret = 1;
     }
+#ifdef __psyz
+    Psyz_CdCpu(CD_READ_SYNC_RETURN_CYCLES);
+#endif
 #ifdef __psyz
     if (ret == 0) {
         read_pause_irq();

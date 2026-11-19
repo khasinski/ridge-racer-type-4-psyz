@@ -27,6 +27,7 @@ void Psyz_CdPollDrive(void);
 /* A drive query in a busy loop (CdReadSync): spends its PS1 time and
  * delivers what the drive has read meanwhile. */
 void Psyz_CdPollQuery(void);
+void Psyz_CdPollCycles(unsigned cycles);
 /* PS1 CPU time of LIBCD's own code (timing_profile.h); none with
  * PSYZ_CD_TIMING=instant. */
 void Psyz_CdCpu(unsigned cycles);

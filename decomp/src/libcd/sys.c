@@ -123,7 +123,7 @@ CdlCB CdReadyCallback(CdlCB func) {
 
 static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
 #ifdef __psyz
-    Psyz_CdCpu(CD_CONTROL_CYCLES);
+    Psyz_CdCpu(arg3 ? CD_CONTROL_F_CYCLES : CD_CONTROL_CYCLES);
 #endif
     CdlCB old = CdSyncCallback(NULL);
     int count = 4;
@@ -138,9 +138,8 @@ static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
             CdSyncCallback(old);
             if (!CD_cw(com, param, result, arg3)) {
 #ifdef __psyz
-                if (!arg3) {
-                    Psyz_CdCpu(CD_CONTROL_RETURN_CYCLES);
-                }
+                Psyz_CdCpu(arg3 ? CD_CONTROL_F_RETURN_CYCLES
+                                : CD_CONTROL_RETURN_CYCLES);
 #endif
                 return 0;
             }
@@ -163,6 +162,11 @@ int CdControlB(u_char com, u_char* param, u_char* result) {
     if (cd_cw(com, param, result, 0)) {
         return 0;
     }
+#ifdef __psyz
+    // CD_sync's turn that sees the command done: CdControlB returns
+    // 292-487 clocks after a plain CdControl would on DuckStation [mark]
+    Psyz_CdCpu(CD_SYNC_POLL_CYCLES);
+#endif
     return CD_sync(CdlSync, result) == CdlComplete;
 }
 

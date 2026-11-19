@@ -25,5 +25,8 @@ int CdRead2(long mode) {
         CdReadyCallback(StCdInterrupt2);
     }
     CD_UNLOCK();
+#ifdef __psyz
+    Psyz_CdCpu(CD_READ2_CYCLES);
+#endif
     return CdControl(CdlReadS, NULL, NULL);
 }

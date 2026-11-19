@@ -75,12 +75,46 @@ void Psyz_KernelCancel(void (*fn)(void));
  * again at each Psyz_AudioInit, so set it before the first PsyZ call and do
  * not change it), PSYZ_SPU_TIMING, PSYZ_CD_TIMING, PSYZ_CARD_TIMING (until
  * the Psyz_*SetInstantTiming setter), PSYZ_CD_TRACE, PSYZ_CARD_TRACE,
- * PSYZ_SPU_KEY_TRACE, PSYZ_SPU_REG_TRACE, PSYZ_CARD_UNPLUG and
+ * PSYZ_SPU_KEY_TRACE, PSYZ_SPU_REG_TRACE, PSYZ_MDEC_TRACE, PSYZ_IRQ_TRACE (each
+ * interrupt's exception window), PSYZ_CARD_UNPLUG and
  * PSYZ_CARD_UNFORMATTED (once per slot, until Psyz_CardSetSlotState), and
  * the renderer's (README.md). */
 
 // Completes a native synchronous DMA transfer without recursive callbacks.
 void Psyz_DmaComplete(unsigned channel);
+
+// A DMA transfer's completion that raises its interrupt (the channels
+// whose interrupt the game enables run their callback in its exception):
+// host 0 a new exception, 1 raised during a root counter's or the vblank's
+// exception and 2 during a device's, which libetc's dispatcher then takes.
+void Psyz_DmaIrqComplete(unsigned channel, int host);
+// Whether the MDEC's output DMA is under way (its CHCR busy bit).
+int Psyz_MdecOutBusy(void);
+// PSYZ_MDEC_TRACE=1: each output transfer and its interrupt, with the
+// clock (stderr).
+int Psyz_MdecTrace(void);
+// A device interrupt's exception now, running handler within it: `before`
+// clocks before it and `after` after it, the window for the vblanks it
+// hides (libetc's last status read exit_clocks before its end).
+// Offline clock only; elsewhere it just calls handler.
+void Psyz_KernelDeviceIrq(void (*handler)(void), unsigned before,
+                          unsigned after, unsigned exit_clocks);
+// The latest exception's end on the offline clock (0 elsewhere), *device
+// set when it was a device's (CD); the vblank's is noted by libapi.c.
+uint64_t Psyz_KernelExceptionEndNs(int* device);
+void Psyz_KernelNoteException(uint64_t at_ns, unsigned cycles);
+// A busy wait from start_ns that a device's time ends at until_ns (CD_cw's
+// for an acknowledge): the handlers that ran during it took the CPU's spin,
+// not time after it, but for what outlasts until_ns (own_ns: the awaited
+// interrupt's own exception, not counted). debt_before: the time owed
+// before the wait (Psyz_KernelDebtClocks).
+void Psyz_KernelSettleWait(long debt_before, uint64_t start_ns,
+                           uint64_t until_ns, uint64_t own_ns);
+// The handlers' time owed now (clocks), for a handler's own span.
+long Psyz_KernelDebtClocks(void);
+// Where the CPU has got to in system clocks: in a device handler, after
+// that handler's time so far. Offline clock only (0 elsewhere).
+uint64_t Psyz_KernelCpuClocks(void);
 
 // Raises the vblank interrupt; VSync calls it once per emulated frame.
 void Psyz_KernelVBlank(void);
@@ -91,6 +125,7 @@ void Psyz_CdServiceDrive(void);
 // the PS1 time of the call (StGetNext's ring poll, or another query).
 void Psyz_CdPollDrive(void);
 void Psyz_CdPollQuery(void);
+void Psyz_CdPollCycles(unsigned cycles);
 
 // Offline clock only: spends `us` (`ns`) of emulated time, for a native
 // busy wait on a device that runs on that clock; blanks it crosses happen in
@@ -151,6 +186,9 @@ void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged);
 // (a DMA it waits for there: the blank reaches the CPU after it).
 void Psyz_KernelDispatchTail(uint64_t at_ns, unsigned cycles, unsigned charged,
                              unsigned open_tail);
+// The device exception recorded at at_ns takes `clocks` more (or fewer),
+// handler time too (a stream sector's, once its callback has run).
+void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks);
 // The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
 // thread from then on, like a handler's time. Offline clock only.
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);
