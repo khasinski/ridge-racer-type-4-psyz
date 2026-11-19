@@ -35,6 +35,9 @@ unsigned int Psyz_RandState(void);
  * once and the time is spent with Psyz_SpendCycles. A length below one does
  * nothing (but the call); memcpy and memset return dst, as the BIOS does. */
 void Psyz_BiosBzero(void* dst, int len);
+/* The time of bzero(len) only, for a host structure cleared with memset
+ * whose PS1 size is len. */
+void Psyz_BiosBzeroTime(int len);
 void* Psyz_BiosMemcpy(void* dst, const void* src, int len);
 void* Psyz_BiosMemset(void* dst, int c, int len);
 

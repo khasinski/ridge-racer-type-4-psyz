@@ -544,11 +544,13 @@ int psyz_get_errno(void) {
 
 static void BiosByteLoopTime(unsigned base, unsigned per_byte, int len) {
     uint64_t cycles = base + (len > 0 ? (uint64_t)len * per_byte : 0);
+    Psyz_KernelRomCode(1);
     while (cycles > UINT32_MAX) {
         Psyz_SpendCycles(UINT32_MAX);
         cycles -= UINT32_MAX;
     }
     Psyz_SpendCycles((unsigned)cycles);
+    Psyz_KernelRomCode(0);
 }
 
 void Psyz_BiosBzero(void* dst, int len) {
@@ -556,6 +558,10 @@ void Psyz_BiosBzero(void* dst, int len) {
         memset(dst, 0, (size_t)len);
     }
     BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, dst ? len : 0);
+}
+
+void Psyz_BiosBzeroTime(int len) {
+    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, len);
 }
 
 void* Psyz_BiosMemset(void* dst, int c, int len) {

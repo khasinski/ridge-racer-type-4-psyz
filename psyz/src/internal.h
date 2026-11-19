@@ -182,6 +182,9 @@ void Psyz_VSyncBlank(void);
 // vblank handler, when VSync returns (kernel.c). Take returns the time owed
 // and clears it (a busy wait absorbs it).
 void Psyz_KernelInterruptCycles(unsigned cycles);
+// The CPU runs the ROM's code (a BIOS byte loop) while depth > 0: each
+// exception it takes there costs BIOS_ROM_IRQ_REFETCH_CYCLES more.
+void Psyz_KernelRomCode(int enter);
 unsigned Psyz_KernelTakeInterruptCycles(void);
 // Whether a blank at blank_ns came while the exception of another
 // interrupt was dispatched, after its BIOS chains tested for a vblank

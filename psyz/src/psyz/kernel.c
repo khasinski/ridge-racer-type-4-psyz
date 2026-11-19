@@ -735,10 +735,17 @@ static void RecordDispatch(uint64_t at_ns, unsigned cycles, int device) {
     RecordDispatchExit(at_ns, cycles, device, 0);
 }
 
+static int rom_code; // Psyz_KernelRomCode's depth
+
+void Psyz_KernelRomCode(int enter) { rom_code += enter ? 1 : -1; }
+
+static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CYCLES : 0; }
+
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
     irq_latched &= ~(1u << line);
-    unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0);
+    unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0) +
+                     RomRefetch();
     /* a blank during another interrupt's exception, before libetc's last
      * look at the status: served in it (DuckStation: VSync(0) returns 4209
      * clocks after a blank 1100 clocks into a root counter's exception,
@@ -801,7 +808,7 @@ void Psyz_KernelDeviceIrq(void (*handler)(void), unsigned before,
     }
     long debt = AtomicLoad(&interrupt_debt);
     handler_debt_base = debt;
-    Psyz_KernelInterruptCycles(before);
+    Psyz_KernelInterruptCycles(before + (outer < 0 ? RomRefetch() : 0));
     handler();
     Psyz_KernelInterruptCycles(after); // the return
     handler_debt_base = outer;

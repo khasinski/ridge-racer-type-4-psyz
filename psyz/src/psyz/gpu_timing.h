@@ -21,6 +21,9 @@ void Psyz_GpuTimingWait(void);
 // is set when the CPU waits for that (an idle queue, the GPU still busy).
 uint64_t Psyz_GpuListStartNs(uint64_t now_ns, uint64_t dma_free_ns,
                              uint64_t gpu_end_ns, int* cpu_waits);
+// Whether the GPU's DMA holds the bus at at_ns: 1 in a slice (the CPU
+// stalled), 2 in a halt between slices, with its end in *until_ns.
+int Psyz_GpuDmaAtNs(uint64_t at_ns, uint64_t* until_ns);
 // GPU ticks of GP0 commands (DuckStation's costs), updating the draw state.
 uint64_t Psyz_GpuCommandTicks(const u_long* words, int n);
 #endif

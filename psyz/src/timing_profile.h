@@ -54,6 +54,13 @@ enum {
      * recompiler gives the same within 3 clocks (bzero 6, 48 and 480
      * bytes, memcpy 8 bytes) */
     BIOS_FILL_CYCLES = 328,
+    /* An interrupt taken in the ROM's code costs its uncached instruction
+     * fetches again after the return (the pipeline's prefetch is lost):
+     * on DuckStation's exact timing the AudioState bzero's 30 exceptions
+     * (port vsyncs 130-139) make it 1239 clocks longer than on the
+     * recompiler, which takes them between its blocks; with the same
+     * exceptions' lengths (DSF_EXC) [trace] */
+    BIOS_ROM_IRQ_REFETCH_CYCLES = 41,
     BIOS_FILL_BYTE_CYCLES = 132,
     BIOS_COPY_CYCLES = 258,
     BIOS_COPY_BYTE_CYCLES = 204,
@@ -226,9 +233,15 @@ enum {
      * driver takes its turn up to 1143 (1165: 2 of 18, 1170: 2 of 5) and
      * none from 1175 [field]; 34 later since the exceptions take
      * KERNEL_IRQ_CYCLES' 18 more (the blanks' positions in the timer's
-     * exceptions moved by 34). */
-    BIOS_CHAIN_PAD_TEST_CLOCKS = 1056 + 34,
-    BIOS_CHAIN_CARD_TEST_CLOCKS = 1155 + 34,
+     * exceptions moved by 34). Refit to DuckStation's exact timing
+     * (tools/port/DUCKSTATION.md; the recompiler entered the exceptions up
+     * to 50 clocks late and the boot put the timer 1.9k clocks off): in
+     * the 19 ds_compare scenarios libpad makes its exchange at every blank
+     * up to 1179 clocks into a root counter's exception and at none from
+     * 1207 (a ticking one's or not), the card driver takes its turn up to
+     * 1278 and at none from 1311 [field] */
+    BIOS_CHAIN_PAD_TEST_CLOCKS = 1190,
+    BIOS_CHAIN_CARD_TEST_CLOCKS = 1295,
     /* A device's exception (the CD drive's) reaches those tests this much
      * sooner: the root counters' handlers, which deliver their event in a
      * counter's exception, only test theirs. On DuckStation a blank 845 to
@@ -245,7 +258,12 @@ enum {
      * those exceptions (a ticking sequencer's about 30 clocks short of
      * DuckStation's) a blank 301 before the end raises its own and ones
      * 356 and 410 before it do not (the Garage's save vsyncs 4492 and
-     * 4361, Save and Load's 4230) [exc] */
+     * 4361, Save and Load's 4230) [exc]. On DuckStation's exact timing
+     * the blanks of the 19 ds_compare scenarios 200 clocks or less before
+     * a root counter exception's end raise their own and those 220 or more
+     * before it do not, but 210 here makes Save and Load and two cards
+     * differ from DuckStation's fields 2603 and 2621 on (4414 and none
+     * with 330): kept. */
     LIBETC_DISPATCH_EXIT_CLOCKS = 330,
 };
 
@@ -335,8 +353,12 @@ enum {
      * waits, the DMA event) besides its DMA: its 97 chunks take 1.219M
      * clocks in SsInit on the recompiler [mark] (the entry of the next
      * function, as CD_CW_ISSUE_CYCLES); refit to SpuInit's 1,248,339 to
-     * _SsInit, the two vblanks within it included (ds_frames.py). */
-    SPU_CLEAR_CHUNK_CYCLES = 4410,
+     * _SsInit, the two vblanks within it included (ds_frames.py); 26 more
+     * on DuckStation's exact timing, whose vblanks there come after the
+     * chunks' DMA exceptions instead of inside them (the 96 chunks' DMA
+     * starts 1,203,793 clocks apart unmarked, 2549 more than on the
+     * recompiler: DUCKSTATION_DMA_TRACE). */
+    SPU_CLEAR_CHUNK_CYCLES = 4410 + 26,
     /* SpuInit (cold): _spu_init's resets and waits and SpuStart, 29.2k up
      * to SsInit's SpuClearReverbWorkArea [mark] */
     SPU_INIT_CYCLES = 29230,
@@ -569,6 +591,11 @@ enum {
      * exceptions (medians) */
     ST_SECTOR_IRQ_CLOCKS = 2736,
     ST_COPY_CYCLES = 1930,
+    /* ... and 455 more for a sector left for the MDEC callback: there its
+     * DecDCTout comes 4471 clocks after the slice's exception (median of
+     * 459 such slices, Versus with two cards, DUCKSTATION_DMA_TRACE: the
+     * output DMA's first slice), 2086 without the copy [trace] */
+    ST_DEFERRED_COPY_EXTRA_CYCLES = 455,
     ST_FRAME_DONE_CYCLES = 396,
     CD_ACK_IRQ_CLOCKS = 2400,
     /* ... and for each byte of the first response past the status that
@@ -645,21 +672,25 @@ enum {
     CD_SEARCH_CMP_CYCLES = 747,
     CD_SEARCH_FOUND_CYCLES = 2699,
     /* The MDEC decodes a block in 448 clocks (DuckStation's mdec.cpp: a
-     * colour macroblock is 6 blocks) and does not run ahead of its output
-     * DMA: on DuckStation each of the attract movie's 16x176 slices (11
-     * 24-bit macroblocks of 192 words) raises its DMA interrupt 30245-30750
-     * clocks after the callback's call to output it (DSF_MARKS
-     * ovl668_mdec_out, DSF_EXC; 2001 slices, mean 30500, hardly depending
-     * on the slice's input: 0.05 clocks a byte), 2772 a macroblock, so 84
-     * for its 192 words [exc] (attract fields 956-1099) */
+     * colour macroblock is 6 blocks, 2688) and starts a unit only once its
+     * output FIFO is empty; the output DMA moves a 192-word macroblock in
+     * 32-word blocks of 34 clocks (the RAM's 17 per 16 words), at most
+     * 100 clocks a slice while the MDEC decodes, the DMA halted 100 clocks
+     * after each (dma.cpp's SLICE_SIZE_WHEN_DECODING_MDEC, DMAHaltTicks):
+     * 3 blocks, the halt, 3 blocks, and the next macroblock's decode from
+     * the read that empties the FIFO, 2958 clocks a macroblock. On
+     * DuckStation (DUCKSTATION_DMA_TRACE: MDEC copy-outs, the DMA's slices
+     * and halts, two-cards and Versus with two cards, 2700 slices of 11
+     * macroblocks) 2960 a macroblock, a slice's first 2650 after the
+     * previous one's exception, its interrupt 304 after its last [trace] */
     MDEC_BLOCK_CLOCKS = 448,
-    MDEC_OUT_192_WORDS_CLOCKS = 84,
-    /* The first output transfer after a decode's input began (DecDCTin)
-     * raises its interrupt this much later than the others: a frame's
-     * first slice 32406-32420 clocks after the movie player's call to
-     * output it, the callbacks' 30449, in every frame of the attract's
-     * movie [exc] */
-    MDEC_FIRST_OUT_CLOCKS = 1961,
+    MDEC_DMA_BLOCK_CLOCKS = 34,
+    MDEC_DMA_SLICE_CLOCKS = 100,
+    MDEC_DMA_HALT_CLOCKS = 100,
+    MDEC_UNIT_DMA_CLOCKS = 270, // a macroblock's DMA without a PS1 clock
+    /* The decode's first macroblock reaches the FIFO this long after
+     * DecDCTin (2698 after the input DMA's start on DuckStation) [trace] */
+    MDEC_IN_TO_FIRST_UNIT_CLOCKS = 3028,
 };
 
 #endif

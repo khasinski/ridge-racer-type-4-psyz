@@ -6,6 +6,7 @@
 #include <string.h>
 #include "../internal.h"
 #include "../timing_profile.h"
+#include "gpu_timing.h"
 #include "../../../decomp/src/libpress/libpress_private.h"
 
 /* Native implementation of the MDEC commands used by LIBPRESS. Serialized
@@ -16,17 +17,38 @@ static struct {
     size_t capacity, length, cursor;
     u32 command;
     int error;
-    uint64_t start_ns; // the decode of the current input began
-    int out_pending;   // an output transfer waits for its macroblocks
-    int out_started;   // an output transfer came since the input began
-    uint64_t out_ns;   // and completes at this time
+    int out_pending;   // an output transfer is under way (CHCR busy)
+    uint64_t out_ns;   // its interrupt's time, once its last block is out
 } mdec;
 
-/* The decoder takes its PS1 time: a macroblock (a block in the mono
- * depths) leaves it every unit_clocks() (timing_profile.h), so an output
+/* The decoder and its output DMA unit by unit, as DuckStation runs them
+ * (mdec.cpp, dma.cpp at the reference commit): a unit (a macroblock, 192
+ * words in 24-bit) reaches the output FIFO MDEC_UNIT_CLOCKS after the
+ * decoder starts it, and the decoder starts the next one only once the
+ * FIFO is empty again. The output DMA (sync mode 1, 32-word blocks of 34
+ * clocks) takes a full FIFO in slices of at most MDEC_DMA_SLICE_CLOCKS
+ * with the DMA halted MDEC_DMA_HALT_CLOCKS between them (the halt is the
+ * whole DMA's: a GPU transfer's slices and halts hold it too), so a
+ * macroblock takes 2958 clocks: 3 blocks, the halt, 3 blocks, the next
+ * decode 2688 from the read that empties the FIFO. Times are clocks on
+ * the CPU's clock. A GPU DMA slice stalls the CPU, so an event due during
+ * one runs at its end, its slice then shortened by the delay (one block a
+ * slice). */
+static struct {
+    int busy;            // the decoder holds a decode
+    unsigned left;       // units still to decode (from the input)
+    unsigned unit_blocks; // DMA blocks a unit
+    int full;            // a unit waits in the FIFO
+    unsigned blocks;     // blocks of the FIFO's unit still to go out
+    unsigned out_units;  // units the enabled transfer still takes
+    int step;            // the pending event: 1 copy-out, 2 unhalt
+    uint64_t due;        // its time
+} mdp;
+
+/* The decoder takes its PS1 time (the pipeline below), so an output
  * transfer completes, and raises its DMA callback, once the decoder has
- * produced its words. Psyz_MdecSetInstantTiming(1) completes transfers at
- * once. */
+ * produced its words and the DMA has moved them. Psyz_MdecSetInstantTiming(1)
+ * completes transfers at once. */
 static int mdec_instant;
 
 int Psyz_MdecTrace(void) {
@@ -99,20 +121,134 @@ int Psyz_MdecOutBusy(void) {
     return busy;
 }
 
+static void pipe_event(void);
+
 static void cancel_out(void) {
     if (mdec.out_pending) {
         Psyz_KernelCancel(out_done);
         mdec.out_pending = 0;
         out_host = 0;
     }
+    mdp.out_units = 0;
 }
 
-/* Clocks per output unit: its blocks' decode, then its words' DMA. */
+// the decoder stops: no unit in progress or waiting
+static void pipe_reset(void) {
+    Psyz_KernelCancel(pipe_event);
+    mdp.busy = mdp.full = 0;
+    mdp.left = mdp.blocks = mdp.out_units = 0;
+    mdp.step = 0;
+}
+
+/* Clocks of a unit's decode: its blocks' (a colour macroblock is 6). */
 static uint64_t unit_clocks(void) {
     unsigned blocks = unit_bytes() >= 512 ? 6 : 1;
-    unsigned words = unit_bytes() / 4;
-    return (uint64_t)blocks * MDEC_BLOCK_CLOCKS +
-           ((uint64_t)words * MDEC_OUT_192_WORDS_CLOCKS + 96) / 192;
+    return (uint64_t)blocks * MDEC_BLOCK_CLOCKS;
+}
+
+static uint64_t clocks_to_ns(uint64_t clocks) { // rounded up: due by then
+    return clocks / 33868800u * 1000000000u +
+           (clocks % 33868800u * 1000000000u + 33868799u) / 33868800u;
+}
+static uint64_t ns_to_clocks(uint64_t ns) { return Psyz_NsToClocks(ns); }
+
+static void pipe_post(int step, uint64_t due) {
+    mdp.step = step;
+    mdp.due = due;
+    Psyz_KernelPostAtNs(clocks_to_ns(due), pipe_event);
+}
+
+// the transfer's last block is out: its interrupt
+static void out_irq_at(uint64_t clocks) {
+    mdec.out_ns = clocks_to_ns(clocks);
+    if (Psyz_MdecTrace()) {
+        fprintf(stderr, "mdec ready %llu clocks\n", (unsigned long long)clocks);
+    }
+    Psyz_KernelPostAtNs(mdec.out_ns, out_done);
+}
+
+// The decoder starts its next unit, the FIFO being empty from `at`.
+static void pipe_decode(uint64_t at) {
+    if (!mdp.left) {
+        mdp.busy = 0;
+        return;
+    }
+    mdp.left--;
+    pipe_post(1, at + unit_clocks());
+}
+
+/* The output DMA takes the FIFO's unit from `due`, the time its event is
+ * for, the emulator running it at `at` (later when it ran it late), as
+ * dma.cpp does: a slice of MDEC_DMA_SLICE_CLOCKS less that delay (a block
+ * at least), then the halt, scheduled from the event's time and the
+ * transfers made in the same run of the events, which goes on to the
+ * events already due then. */
+static void pipe_transfer(uint64_t due, uint64_t at) {
+    const unsigned block = MDEC_DMA_BLOCK_CLOCKS;
+    uint64_t moved = 0; // this run's transfers (the CPU's pending clocks)
+    for (;;) {
+        uint64_t late = at > due ? at - due : 0;
+        unsigned limit = late < MDEC_DMA_SLICE_CLOCKS
+                             ? MDEC_DMA_SLICE_CLOCKS - (unsigned)late : 1;
+        unsigned k = (limit + block - 1) / block;
+        if (k > mdp.blocks) {
+            k = mdp.blocks;
+        }
+        mdp.blocks -= k;
+        moved += (uint64_t)k * block;
+        if (!mdp.blocks) {
+            // the read of its last block empties the FIFO
+            mdp.full = 0;
+            if (mdp.out_units && --mdp.out_units == 0) {
+                out_irq_at(at + moved);
+            }
+            pipe_decode(due + moved - block);
+            return;
+        }
+        uint64_t unhalt = due + moved + MDEC_DMA_HALT_CLOCKS;
+        if (unhalt > at) {
+            pipe_post(2, unhalt);
+            return;
+        }
+        due = unhalt; // already due: in the same run of the events
+    }
+}
+
+/* When an event due at *due runs: at the end of a GPU DMA slice it falls
+ * in (the CPU is stalled), after a GPU halt (the halt is the DMA's; the
+ * MDEC's channel goes first when it ends). On DuckStation's recompiler an
+ * event also waits for the end of the recompiled block being executed
+ * (the kernel's register restore before an exception's rfe, about 270
+ * clocks, put the second macroblock's halt 231 clocks late in 33-79% of
+ * the movies' slices); the exact reference runs it at its clock
+ * (tools/port/DUCKSTATION.md), as the console does. */
+static uint64_t pipe_run_at(uint64_t* due) {
+    uint64_t at = *due, until;
+    int kind = Psyz_GpuDmaAtNs(clocks_to_ns(at), &until);
+    if (kind == 2) {
+        *due = at = ns_to_clocks(until);
+    } else if (kind == 1) {
+        at = ns_to_clocks(until);
+    }
+    return at;
+}
+
+static void pipe_event(void) {
+    Psyz_KernelLockInterrupts();
+    int step = mdp.step;
+    uint64_t due = mdp.due;
+    mdp.step = 0;
+    if (step) {
+        uint64_t at = pipe_run_at(&due);
+        if (step == 1) { // a unit reaches the FIFO
+            mdp.full = 1;
+            mdp.blocks = mdp.unit_blocks;
+        }
+        if (mdp.out_units) {
+            pipe_transfer(due, at);
+        }
+    }
+    Psyz_KernelUnlockInterrupts();
 }
 
 static const u8 scan[64] = {
@@ -296,6 +432,7 @@ static void MDEC_reset_locked(int mode) {
         return;
     }
     cancel_out();
+    pipe_reset();
     mdec.length = mdec.cursor = 0;
     mdec.command = 0;
     mdec.error = 0;
@@ -321,8 +458,21 @@ static void MDEC_in_locked(void* buf, int size) {
             break;
         }
         decode(data, data + words * 4);
-        mdec.start_ns = Psyz_KernelNowNs();
-        mdec.out_started = 0;
+        pipe_reset();
+        if (Psyz_MdecTrace()) {
+            fprintf(stderr, "mdec in %u words at %llu clocks\n", words,
+                    (unsigned long long)Psyz_EmulatedClocks());
+        }
+        if (Psyz_KernelOfflineClock()) {
+            mdp.busy = 1;
+            mdp.left = (unsigned)(mdec.length / unit_bytes());
+            mdp.unit_blocks = (unit_bytes() / 4 + 31) / 32;
+            if (mdp.left) {
+                // the decode's first unit, from the input DMA's start
+                mdp.left--;
+                pipe_post(1, Psyz_EmulatedClocks() + MDEC_IN_TO_FIRST_UNIT_CLOCKS);
+            }
+        }
         break;
     }
     case 2: {
@@ -362,33 +512,39 @@ static void MDEC_out_locked(void* buf, int size) {
     cancel_out();
     memcpy(buf, mdec.output + mdec.cursor, (size_t)size * 4);
     mdec.cursor += (size_t)size * 4;
-    uint64_t units = (mdec.cursor + unit_bytes() - 1) / unit_bytes();
-    // in ns: whole microseconds lost up to 33 clocks a slice
-    uint64_t ready = mdec.start_ns + units * unit_clocks() * 1000000000 / 33868800;
-    // the decoder works on this transfer's units from its start (where the
-    // CPU has got to, a callback's handler time included)
-    uint64_t these = ((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes();
-    uint64_t issue = Psyz_KernelCpuClocks() - out_early_clocks + these * unit_clocks();
+    unsigned units = (unsigned)(((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes());
+    // the CHCR write: where the CPU has got to, a callback's handler time
+    // included, less what a root counter's early look saves (out_done)
+    uint64_t start = Psyz_EmulatedClocks() - out_early_clocks;
     out_early_clocks = 0;
-    if (!mdec.out_started) { // the decode's start after the input's
-        issue += MDEC_FIRST_OUT_CLOCKS;
-        mdec.out_started = 1;
-    }
-    issue = Psyz_ClocksToNs(issue);
-    if (issue > ready)
-        ready = issue;
     if (Psyz_MdecTrace()) {
-        fprintf(stderr, "mdec out %d words at %llu clocks, ready %llu ns\n",
-                size, (unsigned long long)Psyz_KernelCpuClocks(),
-                (unsigned long long)ready);
+        fprintf(stderr, "mdec out %d words at %llu clocks, unit %s\n", size,
+                (unsigned long long)start, mdp.full ? "waiting" : "decoding");
     }
-    if (mdec_instant || ready <= Psyz_KernelNowNs()) {
+    if (mdec_instant) {
         Psyz_DmaIrqComplete(1, 0);
         return;
     }
     mdec.out_pending = 1;
-    mdec.out_ns = ready;
-    Psyz_KernelPostAtNs(ready, out_done);
+    if (!Psyz_KernelOfflineClock() || !mdp.busy) {
+        // no PS1 clock (or no decode under way): the units' nominal time
+        mdec.out_ns = Psyz_KernelNowNs() +
+                      clocks_to_ns((uint64_t)units * (unit_clocks() + MDEC_UNIT_DMA_CLOCKS));
+        Psyz_KernelPostAtNs(mdec.out_ns, out_done);
+        return;
+    }
+    mdp.out_units = units;
+    if (mdp.step == 1 && mdp.due <= start) {
+        // in a handler the clock has not reached it yet: it came before
+        Psyz_KernelCancel(pipe_event);
+        mdp.step = 0;
+        mdp.full = 1;
+        mdp.blocks = mdp.unit_blocks;
+    }
+    if (mdp.full) { // a unit waits: the DMA starts at once (a new
+        // transfer starts even while the DMA is halted)
+        pipe_transfer(start, start);
+    }
 }
 /* The timed completion and DMA callbacks hold the same recursive lock.
  * In particular, never cancel a transfer after another thread has already
@@ -432,6 +588,7 @@ int MDEC_out_sync(void) {
             Psyz_KernelCancel(out_done);
             mdec.out_pending = 0;
             out_host = 0;
+            mdp.out_units = 0;
             Psyz_DmaIrqComplete(1, 0);
         } else {
             Psyz_KernelUnlockInterrupts();

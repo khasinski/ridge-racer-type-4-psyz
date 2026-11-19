@@ -2053,7 +2053,8 @@ void StCdInterrupt(void) {
     u_char* payload =
         (u_char*)&StRingAddr[StRingSize] + (size_t)slot * ST_SLOT_BYTES;
     memcpy(payload, sector_data + 24 + sizeof(StHEADER), ST_SLOT_BYTES);
-    st_charge(ST_COPY_CYCLES);
+    st_charge(ST_COPY_CYCLES +
+              (sector_data == st_deferred_data ? ST_DEFERRED_COPY_EXTRA_CYCLES : 0));
     *dst = h;
     dst->id = ST_SLOT_FILLING;
     CdIntToPos(sector, &dst->loc);

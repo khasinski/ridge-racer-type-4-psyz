@@ -294,18 +294,55 @@ static void end_first_slice(void) {
     }
 }
 
+/* The DMA's recent slices and halts, for the MDEC's output DMA that shares
+ * them (Psyz_GpuDmaAtNs). */
+enum { BUS_SPANS = 64 };
+static struct {
+    uint64_t from_ns, to_ns;
+    int halt;
+} bus[BUS_SPANS];
+static unsigned bus_next;
+
+static void note_span(uint64_t from_ns, uint64_t to_ns, int halt) {
+    unsigned last = (bus_next + BUS_SPANS - 1) % BUS_SPANS;
+    if (bus[last].to_ns == from_ns && bus[last].halt == halt && bus[last].to_ns) {
+        bus[last].to_ns = to_ns; // the same slice goes on
+        return;
+    }
+    bus[bus_next].from_ns = from_ns;
+    bus[bus_next].to_ns = to_ns;
+    bus[bus_next].halt = halt;
+    bus_next = (bus_next + 1) % BUS_SPANS;
+}
+
+int Psyz_GpuDmaAtNs(uint64_t at_ns, uint64_t* until_ns) {
+    for (unsigned k = 1; k <= BUS_SPANS; k++) {
+        unsigned i = (bus_next + BUS_SPANS - k) % BUS_SPANS;
+        if (!bus[i].to_ns) {
+            break;
+        }
+        if (at_ns >= bus[i].from_ns && at_ns < bus[i].to_ns) {
+            *until_ns = bus[i].to_ns;
+            return bus[i].halt ? 2 : 1;
+        }
+    }
+    return 0;
+}
+
 /* The CPU loses `clocks` of DMA at the DMA's position, in slices. */
 static void dma_stall(unsigned clocks) {
     while (clocks) {
         unsigned room = DMA_SLICE_CLOCKS - g.slice;
         unsigned take = clocks < room ? clocks : room;
         if (g.masked != 1) Psyz_KernelStallAt(g.dma_ns, take);
+        note_span(g.dma_ns, g.dma_ns + clocks_ns(take), 0);
         g.dma_ns += clocks_ns(take);
         g.slice += take;
         clocks -= take;
         if (g.slice >= DMA_SLICE_CLOCKS) {
             end_first_slice();
             g.slice = 0;
+            note_span(g.dma_ns, g.dma_ns + clocks_ns(DMA_HALT_CLOCKS), 1);
             g.dma_ns += clocks_ns(DMA_HALT_CLOCKS);
         }
     }
