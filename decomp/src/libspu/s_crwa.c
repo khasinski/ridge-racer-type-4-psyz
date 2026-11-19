@@ -61,9 +61,13 @@ long SpuClearReverbWorkArea(long rev_mode) {
         // interrupt's exception, in which a blank is served (DuckStation:
         // one 327 clocks into it adds 606 clocks, a separate vblank
         // exception 2387)
-        Psyz_SpendCycles(size * SPU_DMA_CLOCKS_PER_BYTE -
-                         size * SPU_CLEAR_DMA_SAVED_PER_64_BYTES / 64 +
-                         SPU_CLEAR_CHUNK_CYCLES - SPU_CLEAR_DMA_IRQ_CLOCKS);
+        {
+            // signed: below 6 bytes the interrupt's part exceeds the rest
+            long cycles = (long)size * SPU_DMA_CLOCKS_PER_BYTE -
+                          (long)size * SPU_CLEAR_DMA_SAVED_PER_64_BYTES / 64 +
+                          (long)SPU_CLEAR_CHUNK_CYCLES - (long)SPU_CLEAR_DMA_IRQ_CLOCKS;
+            Psyz_SpendCycles(cycles > 0 ? (unsigned)cycles : 0);
+        }
         Psyz_KernelDispatch(Psyz_KernelNowNs(), SPU_CLEAR_DMA_IRQ_CLOCKS,
                             SPU_CLEAR_DMA_IRQ_CLOCKS);
         _spu_DmaDone();

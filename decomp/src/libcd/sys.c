@@ -121,7 +121,8 @@ CdlCB CdReadyCallback(CdlCB func) {
 #include "libcd_stream.h"
 #endif
 
-static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
+static inline int cd_cw_ret(u8 com, u8* param, u_char* result, s32 arg3,
+                            unsigned return_cycles) {
 #ifdef __psyz
     Psyz_CdCpu(arg3 ? CD_CONTROL_F_CYCLES : CD_CONTROL_CYCLES);
 #endif
@@ -138,8 +139,9 @@ static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
             CdSyncCallback(old);
             if (!CD_cw(com, param, result, arg3)) {
 #ifdef __psyz
-                Psyz_CdCpu(arg3 ? CD_CONTROL_F_RETURN_CYCLES
-                                : CD_CONTROL_RETURN_CYCLES);
+                Psyz_CdCpu(return_cycles);
+#else
+                (void)return_cycles;
 #endif
                 return 0;
             }
@@ -149,6 +151,25 @@ static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
     CdSyncCallback(old);
     return -1;
 }
+
+static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
+#ifdef __psyz
+    return cd_cw_ret(com, param, result, arg3,
+                     arg3 ? CD_CONTROL_F_RETURN_CYCLES : CD_CONTROL_RETURN_CYCLES);
+#else
+    return cd_cw_ret(com, param, result, arg3, 0);
+#endif
+}
+
+#ifdef __psyz
+/* CdControl whose caller's own code after it is charged with its return
+ * (CdRead2's, which can be less than nothing on top of CdControl's own
+ * return charge: timing_profile.h CD_READ2_CYCLES) */
+int Psyz_CdControlThen(u_char com, u_char* param, u_char* result, int then_cycles) {
+    int cycles = (int)CD_CONTROL_RETURN_CYCLES + then_cycles;
+    return cd_cw_ret(com, param, result, 0, cycles > 0 ? (unsigned)cycles : 0) == 0;
+}
+#endif
 
 int CdControl(u_char com, u_char* param, u_char* result) {
     return cd_cw(com, param, result, 0) == 0;

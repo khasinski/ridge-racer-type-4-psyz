@@ -99,6 +99,20 @@ void* DMACallback(int dma, void (*func)()) {
  * interrupt's exception (Psyz_DmaIrqComplete); the others' at once. */
 static int dma_irq_host = -1; // Psyz_DmaIrqComplete: its exception's host
 
+/* The MDEC output exception's handlers: a stream sector whose interrupt
+ * libetc's dispatcher sees first, then the callback (libcd.c) */
+static void (*mdec_callback)(void);
+static uint64_t mdec_entry_ns;
+static int mdec_own_exception;
+static void MdecExceptionHandlers(void) {
+    void (*callback)(void) = mdec_callback;
+    if (mdec_own_exception) {
+        Psyz_CdServeInDmaException(mdec_entry_ns);
+    }
+    callback();
+    Psyz_CdAfterDmaCallback();
+}
+
 static void DispatchDma(unsigned channel, void (*callback)(void)) {
     if (channel != 1 || dma_irq_host < 0) {
         callback();
@@ -117,6 +131,10 @@ static void DispatchDma(unsigned channel, void (*callback)(void)) {
         fprintf(stderr, "mdec irq host %d at %llu clocks\n", dma_irq_host,
                 (unsigned long long)Psyz_KernelCpuClocks());
     }
+    mdec_own_exception = !dma_irq_host; // from now
+    mdec_callback = callback;
+    mdec_entry_ns = Psyz_KernelNowNs();
+    callback = MdecExceptionHandlers;
     Psyz_KernelDeviceIrq(callback, before, after, DMA_DISPATCH_EXIT_CLOCKS);
 }
 

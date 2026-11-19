@@ -142,6 +142,11 @@ enum {
     PS1_DRAWENV_SIZE = 0x5C,
     PS1_DISPENV_SIZE = 0x14,
 };
+/* PutDrawEnv's and DrawOTagEnv's charge after their packet's DMA starts
+ * (less than nothing without the BIOS memcpy: an unsigned charge would wrap) */
+_Static_assert((int)PUT_DRAW_ENV_CYCLES - (int)PUT_DRAW_ENV_TO_EXEC_CYCLES +
+                       (int)GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE) >= 0,
+               "PutDrawEnv's charge after its packet's DMA below nothing");
 #else
 #define GPU_TIME(cycles)
 #endif

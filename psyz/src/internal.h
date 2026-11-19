@@ -99,6 +99,15 @@ void Psyz_DmaComplete(unsigned channel);
 // host 0 a new exception, 1 raised during a root counter's or the vblank's
 // exception and 2 during a device's, which libetc's dispatcher then takes.
 void Psyz_DmaIrqComplete(unsigned channel, int host);
+// An MDEC output interrupt's exception that began at entry_ns: the stream
+// sector whose interrupt libetc's dispatcher sees there first (libcd.c).
+void Psyz_CdServeInDmaException(uint64_t entry_ns);
+// ... and the work its callback left for after it (a frame's completion).
+void Psyz_CdAfterDmaCallback(void);
+// A DMA slice that stalls the CPU (the MDEC output's, at `at` clocks), and
+// the clocks of those between from_ns and to_ns (kernel.c).
+void Psyz_KernelNoteDmaSlice(uint64_t at, unsigned clocks);
+unsigned Psyz_KernelDmaClocksIn(uint64_t from_ns, uint64_t to_ns);
 // Whether the MDEC's output DMA is under way (its CHCR busy bit).
 int Psyz_MdecOutBusy(void);
 // PSYZ_MDEC_TRACE=1: each output transfer and its interrupt, with the

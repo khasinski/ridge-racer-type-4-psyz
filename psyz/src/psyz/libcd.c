@@ -1764,6 +1764,9 @@ static uint64_t error_ready_ns;
 /* StCdInterrupt from a stream sector's ready callback: its clocks there. */
 static int st_irq_called;
 static unsigned st_irq_extra;
+/* deliver_data_sector inside an MDEC output interrupt's exception, before
+ * its callback (Psyz_CdServeInDmaException): 1, 2 with the BIOS chains */
+static int sector_in_dma;
 /* While a read's ready callback runs from a sector's interrupt: where the
  * CPU has got to in the handler, for a command it issues (CD_cw). */
 static uint64_t sector_callback_ns;
@@ -1807,7 +1810,14 @@ static void deliver_data_sector(void) {
     if (is_played_audio_sector()) {
         return;
     }
-    drive_irq(irq_ns, CD_DATA_IRQ_CLOCKS, CD_DATA_IRQ_CLOCKS);
+    if (sector_in_dma) {
+        if (drive_trace()) {
+            fprintf(stderr, "cd irq %" PRIu64 " in dma sector %d\n", Psyz_NsToClocks(irq_ns),
+                    sector);
+        }
+    } else {
+        drive_irq(irq_ns, CD_DATA_IRQ_CLOCKS, CD_DATA_IRQ_CLOCKS);
+    }
     if (!CD_cbready) {
         return;
     }
@@ -1828,7 +1838,12 @@ static void deliver_data_sector(void) {
     CdlCB ready = CD_cbready;
     long debt = Psyz_KernelDebtClocks();
     ready(CdlDataReady, result);
-    if (st_irq_called && !drive_is_instant()) {
+    if (sector_in_dma) {
+        // served by libetc's dispatcher in the DMA's exception (no entry,
+        // no return of its own) before the DMA's callback
+        Psyz_KernelInterruptCycles(CD_IN_DMA_FIRST_CYCLES + st_irq_extra +
+                                   (sector_in_dma > 1 ? CD_IN_DMA_CHAIN_CYCLES : 0));
+    } else if (st_irq_called && !drive_is_instant()) {
         // a stream sector's exception: StCdInterrupt's own path
         Psyz_KernelExtendDispatch(irq_ns,
                                   (int)ST_SECTOR_IRQ_CLOCKS -
@@ -1944,6 +1959,42 @@ static void drive_schedule(void) {
     if (next) {
         Psyz_KernelPostAtNs(next, drive_timer);
     }
+}
+
+/* A stream sector whose INT1 comes early in an MDEC output interrupt's
+ * exception, before libetc's dispatcher first reads the interrupt status
+ * there (CD_IN_DMA_FIRST_LOOK_CLOCKS), is served first, in that exception:
+ * the output DMA has ended, so StCdInterrupt copies it into the ring, and
+ * the MDEC callback's DecDCTout comes after it. */
+void Psyz_CdServeInDmaException(uint64_t entry_ns) {
+    Psyz_KernelLockInterrupts();
+    if (drive_is_instant() || drive_servicing || !data_read_active || !CD_cbready ||
+        !StRgb24 || !StRingAddr) {
+        Psyz_KernelUnlockInterrupts();
+        return;
+    }
+    uint64_t look = entry_ns + ((uint64_t)CD_IN_DMA_FIRST_LOOK_CLOCKS * 1000000000u) / 33868800u;
+    uint64_t chain = entry_ns + ((uint64_t)CD_IN_DMA_CHAIN_LOOK_CLOCKS * 1000000000u) / 33868800u;
+    drive_servicing = 1;
+    for (;;) {
+        uint64_t next = drive_start_ns +
+            ((drive_delivered + 1) * 1000000000 + drive_rate() - 1) / drive_rate();
+        // raised before the exception began it was the exception's own
+        if (next < entry_ns || next > look || !data_read_active || !CD_cbready) {
+            break;
+        }
+        unsigned generation = drive_generation;
+        int sector = data_sector_number;
+        sector_in_dma = next <= chain ? 2 : 1;
+        deliver_data_sector();
+        sector_in_dma = 0;
+        if (generation != drive_generation || data_sector_number == sector) {
+            break;
+        }
+    }
+    drive_servicing = 0;
+    drive_schedule();
+    Psyz_KernelUnlockInterrupts();
 }
 
 static void drive_poll(unsigned ns) {
@@ -2063,6 +2114,22 @@ static int st_begin_frame(const StHEADER* h) {
 static u_char st_deferred_data[SECTOR_SIZE];
 static int st_deferred_sector = -1;
 
+/* A frame's completion in the MDEC callback's exception (a sector it
+ * copies, or one served before it): CdDataCallback's DMA callback, which
+ * libetc's dispatcher runs after the MDEC's, so after its DecDCTout
+ * (DuckStation: the deferred copy's DecDCTout 17 clocks later when it
+ * completes a frame, against ST_FRAME_DONE_CYCLES in a sector's own
+ * exception) [trace] */
+static unsigned st_after_callback;
+
+void Psyz_CdAfterDmaCallback(void) {
+    unsigned cycles = st_after_callback;
+    st_after_callback = 0;
+    if (cycles) {
+        Psyz_KernelInterruptCycles(cycles);
+    }
+}
+
 static void st_charge(unsigned cycles) {
     if (drive_ready_sector >= 0) {
         st_irq_extra += cycles; // the sector's exception (deliver_data_sector)
@@ -2124,7 +2191,11 @@ void StCdInterrupt(void) {
     Stframe_no = (s32)h.frameCount;
     StRingIdx1 = st_frame.slot + st_frame.count;
     StFinalSector = 1;
-    st_charge(ST_FRAME_DONE_CYCLES);
+    if (sector_in_dma || drive_ready_sector < 0) {
+        st_after_callback += ST_FRAME_DONE_CYCLES;
+    } else {
+        st_charge(ST_FRAME_DONE_CYCLES);
+    }
     Psyz_DmaComplete(3); // data_ready_callback publishes the frame
     if (StFunc2 && StEndFrame && h.frameCount >= (u32)StEndFrame) {
         StFunc2();

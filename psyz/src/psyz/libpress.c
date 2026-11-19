@@ -84,24 +84,42 @@ static unsigned unit_bytes(void) {
  * libetc's dispatcher then takes it within the same exception. */
 static int out_host;
 /* A root counter's exception: libetc's dispatcher looks at the interrupt
- * status before the timer's tick runs, and takes the DMA's interrupt then
- * if it has come (its callback DMA_IN_RCNT_TO_HANDLER_CLOCKS in), else
- * after the tick. The port runs the callback at the exception's end
- * either way; its output starts as early as on the console. */
-static uint64_t out_early_clocks; // the callback's time saved so
+ * status at points of its work (DMA_RCNT_*_LOOK_CLOCKS, later by the output
+ * DMA's own stalls), and takes the DMA's interrupt at the first after it
+ * came, with its output DMA_RCNT_*_OUT_CLOCKS in; after the last, at the
+ * exception's end. The port runs the callback at the exception's end either
+ * way and starts its output where the console's comes (out_shift_clocks:
+ * earlier, or later where the exception's end comes before it). */
+static uint64_t clocks_to_ns(uint64_t clocks);
+static uint64_t ns_to_clocks(uint64_t ns);
+static int64_t out_shift_clocks; // clocks the output comes before the callback's
 static void out_done(void) {
     int device = 0;
     uint64_t end = Psyz_KernelExceptionEndNs(&device);
-    if (!mdec_instant && end > Psyz_KernelNowNs()) {
+    uint64_t now = Psyz_KernelNowNs();
+    if (!mdec_instant && end > now) {
         int rcnt = 0;
         uint64_t start = Psyz_KernelExceptionStartNs(&rcnt);
-        uint64_t look = start + (uint64_t)DMA_RCNT_FIRST_LOOK_CLOCKS * 1000000000u / 33868800u;
-        out_early_clocks = 0;
-        if (rcnt && !device && Psyz_KernelNowNs() <= look) {
-            uint64_t cb = start + (uint64_t)DMA_IN_RCNT_TO_HANDLER_CLOCKS * 1000000000u / 33868800u;
-            uint64_t late = end + (uint64_t)DMA_AFTER_LINE_TO_HANDLER_CYCLES * 1000000000u / 33868800u;
-            if (late > cb)
-                out_early_clocks = (late - cb) * 33868800u / 1000000000u;
+        out_shift_clocks = 0;
+        if (rcnt && !device) {
+            static const unsigned look[] = {DMA_RCNT_FIRST_LOOK_CLOCKS,
+                                            DMA_RCNT_SECOND_LOOK_CLOCKS,
+                                            DMA_RCNT_THIRD_LOOK_CLOCKS};
+            static const unsigned out[] = {DMA_RCNT_FIRST_OUT_CLOCKS,
+                                           DMA_RCNT_SECOND_OUT_CLOCKS,
+                                           DMA_RCNT_THIRD_OUT_CLOCKS};
+            for (unsigned k = 0; k < 3; k++) {
+                uint64_t at = start + clocks_to_ns(look[k]);
+                at += clocks_to_ns(Psyz_KernelDmaClocksIn(start, at));
+                if (now > at) {
+                    continue;
+                }
+                // the callback at the exception's end, the output out[k] in
+                int64_t late = (int64_t)ns_to_clocks(end) + DMA_AFTER_LINE_TO_HANDLER_CYCLES +
+                               DMA_CALLBACK_TO_OUT_CLOCKS;
+                out_shift_clocks = late - (int64_t)(ns_to_clocks(start) + out[k]);
+                break;
+            }
         }
         out_host = device ? 2 : 1;
         Psyz_KernelPostAtNs(end, out_done);
@@ -111,7 +129,7 @@ static void out_done(void) {
     int host = out_host;
     out_host = 0;
     Psyz_DmaIrqComplete(1, host);
-    out_early_clocks = 0; // its callback output nothing
+    out_shift_clocks = 0; // its callback output nothing
 }
 
 int Psyz_MdecOutBusy(void) {
@@ -195,6 +213,7 @@ static void pipe_transfer(uint64_t due, uint64_t at) {
             k = mdp.blocks;
         }
         mdp.blocks -= k;
+        Psyz_KernelNoteDmaSlice((at > due ? at : due) + moved, k * block);
         moved += (uint64_t)k * block;
         if (!mdp.blocks) {
             // the read of its last block empties the FIFO
@@ -515,8 +534,8 @@ static void MDEC_out_locked(void* buf, int size) {
     unsigned units = (unsigned)(((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes());
     // the CHCR write: where the CPU has got to, a callback's handler time
     // included, less what a root counter's early look saves (out_done)
-    uint64_t start = Psyz_EmulatedClocks() - out_early_clocks;
-    out_early_clocks = 0;
+    uint64_t start = (uint64_t)((int64_t)Psyz_EmulatedClocks() - out_shift_clocks);
+    out_shift_clocks = 0;
     if (Psyz_MdecTrace()) {
         fprintf(stderr, "mdec out %d words at %llu clocks, unit %s\n", size,
                 (unsigned long long)start, mdp.full ? "waiting" : "decoding");

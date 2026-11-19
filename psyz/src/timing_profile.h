@@ -113,6 +113,15 @@ enum {
      * sector's 9708 alone; VSync(0) 1615 sooner after a blank inside a
      * root counter's exception, two-cards vsync 904) [exc] */
     SHARED_EXCEPTION_SAVED_CYCLES = 2724 - 1123,
+    /* A CD interrupt raised during a DMA interrupt's exception after
+     * libetc's dispatcher first looked at the status there
+     * (CD_IN_DMA_FIRST_LOOK_CLOCKS) and before its last look is served by
+     * the dispatcher in it, after the DMA's callback: a stream sector left
+     * for the MDEC callback adds 803 clocks to an MDEC output exception,
+     * 3110 alone (DuckStation: no exception of its own for a sector raised
+     * up to 5606 clocks into the MDEC exception, one at its end from 5719
+     * in) [exc] [trace] */
+    CD_IN_DMA_EXCEPTION_SAVED_CYCLES = 3110 - 803,
     /* ... and a root counter's raised during the vblank's exception adds
      * 618 (a non-ticking one) or 6546 (a tick) to it, against 2741 and
      * 8660 alone (DSF_EXC, the unformatted card's opening movie poll,
@@ -141,16 +150,25 @@ enum {
      * 4850-5490 in), and the exception ends 4470 after the callback starts
      * (4300 standalone). [exc] */
     DMA_AFTER_LINE_TO_HANDLER_CYCLES = 300,
-    /* In a root counter's exception libetc's dispatcher first looks at the
-     * interrupt status this far in, before the timer's tick: a DMA
-     * interrupt that has come by then has its callback early, one that
-     * comes later after the tick (300 after its end, as above). On
-     * DuckStation (Versus and opening movies, DSF_EXC with MDEC output
-     * marks, 74 such slices) the output starts 2815-3360 clocks after the
-     * root counter's exception (median 3326) for an interrupt due up to
-     * 2647 in, 8.9k-9.3k for one due from 2865. [exc] */
-    DMA_RCNT_FIRST_LOOK_CLOCKS = 2756,
-    DMA_IN_RCNT_TO_HANDLER_CLOCKS = 3326 - 203,
+    /* In a root counter's exception libetc's dispatcher looks at the
+     * interrupt status at points of its work, the output DMA's stalls
+     * included: an MDEC output interrupt raised up to 1475 clocks in has
+     * its DecDCTout 3520 in (before the timer's tick), one up to 2148 in
+     * 5267 in, one up to 2460 in 5859 in, a later one after the exception
+     * (300 after its end, as above). On DuckStation's exact timing
+     * (DUCKSTATION_DMA_TRACE, all 25 scenarios' movies: 1600 slices raised
+     * in a timer's exception, the output DMA's first block) the boundaries
+     * move by up to 30 clocks with the output DMA's blocks before them and
+     * the outputs come within 100 of these, ticking timer or not [trace] */
+    DMA_RCNT_FIRST_LOOK_CLOCKS = 1475,
+    DMA_RCNT_SECOND_LOOK_CLOCKS = 2148,
+    DMA_RCNT_THIRD_LOOK_CLOCKS = 2460,
+    DMA_RCNT_FIRST_OUT_CLOCKS = 3520,
+    DMA_RCNT_SECOND_OUT_CLOCKS = 5267,
+    DMA_RCNT_THIRD_OUT_CLOCKS = 5859,
+    /* the movie player's MDEC callback to its DecDCTout (the game's
+     * SLICE_CALLBACK_TO_DCTOUT_CYCLES) */
+    DMA_CALLBACK_TO_OUT_CLOCKS = 203,
     DMA_AFTER_DEVICE_TO_HANDLER_CYCLES = 1900,
     DMA_NESTED_RETURN_CYCLES = 1091,
     /* libetc's dispatcher reads the interrupt status for the last time
@@ -683,6 +701,19 @@ enum {
      * output DMA's first slice), 2086 without the copy [trace] */
     ST_DEFERRED_COPY_EXTRA_CYCLES = 455,
     ST_FRAME_DONE_CYCLES = 396,
+    /* A stream sector whose interrupt comes in an MDEC output exception
+     * before libetc's dispatcher first reads the status there (1750
+     * clocks in: DuckStation copies a sector raised 1692 in, leaves one
+     * raised 1805 in for the next callback) is served first, within the
+     * exception: the callback's DecDCTout 3130 clocks later than alone
+     * with the copy, 528 more when it came before the BIOS chains looked
+     * (up to 734 in; from 790 not) [trace] (DUCKSTATION_DMA_TRACE,
+     * DUCKSTATION_CD_SECTORS: the Versus movie with two cards, 30 such
+     * sectors, clocks from the exception's entry) */
+    CD_IN_DMA_FIRST_LOOK_CLOCKS = 1750,
+    CD_IN_DMA_CHAIN_LOOK_CLOCKS = 762,
+    CD_IN_DMA_FIRST_CYCLES = 3130 - ST_COPY_CYCLES,
+    CD_IN_DMA_CHAIN_CYCLES = 528,
     CD_ACK_IRQ_CLOCKS = 2400,
     /* ... and for each byte of the first response past the status that
      * LIBCD's handler reads: a GetlocP's acknowledge (8 bytes) takes 3087
@@ -736,17 +767,16 @@ enum {
     CD_CONTROL_F_RETURN_CYCLES = 77,
     /* CdRead2's own code from its Setmode's return to its ReadS's CdControl
      * (the stream mode, CdDataCallback, CdReadyCallback): DuckStation's
-     * Setmode acknowledge to ReadS's CD_cw 3234 clocks in the movies, less
-     * CD_CW_ACK_CYCLES and CD_CW_ACK_CHAIN_CYCLES,
-     * CD_CONTROL_RETURN_CYCLES and CD_CONTROL_CYCLES [mark] (DSF_MARKS
-     * CdRead2, CdDataCallback, CdReadyCallback, CdControl, CD_cw: the
-     * attract's and Versus's movie). Unmarked (DUCKSTATION_CD_TRACE) the
-     * Setmode's acknowledge to the ReadS's is 28637 clocks in the Versus
-     * movie, 77 less than the port's, so the movie's sectors come 72-85
-     * clocks late throughout (cdoff); taking the 77 out puts the opening
-     * movie's frames off from field 832 (the MDEC slices' model was fitted
-     * with the late sectors): TECH_DEBT F14 */
-    CD_READ2_CYCLES = 3234 - 2620 - 327 - 150 - 73,
+     * Setmode acknowledge to ReadS's CD_cw 3234 clocks in the movies with
+     * the marks (DSF_MARKS CdRead2, CdDataCallback, CdReadyCallback,
+     * CdControl, CD_cw: the attract's and Versus's movie), 77 less unmarked
+     * (DUCKSTATION_CD_TRACE: the Setmode's acknowledge to the ReadS's 28637
+     * clocks in the Versus movie), less CD_CW_ACK_CYCLES and
+     * CD_CW_ACK_CHAIN_CYCLES, CD_CONTROL_RETURN_CYCLES and
+     * CD_CONTROL_CYCLES [trace]: less than nothing, so it is charged with
+     * the Setmode's return (Psyz_CdControlThen; cdread2.c asserts the sum
+     * stays a charge) */
+    CD_READ2_CYCLES = 3234 - 77 - 2620 - 327 - 150 - 73,
     /* CdRead's setup up to its first command, the call included: 397
      * clocks to its Setmode's CdControl on DuckStation, 492 to its ReadN's
      * CdControlF when the mode stays; and from that CdControlF's return to

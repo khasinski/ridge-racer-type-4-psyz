@@ -31,6 +31,9 @@ void Psyz_CdPollCycles(unsigned cycles);
 /* PS1 CPU time of LIBCD's own code (timing_profile.h); none with
  * PSYZ_CD_TIMING=instant. */
 void Psyz_CdCpu(unsigned cycles);
+/* CdControl, then `then_cycles` of the caller's own code (negative: less
+ * than CdControl's own return charge, never below nothing) */
+int Psyz_CdControlThen(u_char com, u_char* param, u_char* result, int then_cycles);
 unsigned Psyz_CdDoneIrqCycles(void);
 #include "../../../psyz/src/timing_profile.h"
 #endif
