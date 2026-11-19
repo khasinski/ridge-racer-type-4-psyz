@@ -307,8 +307,13 @@ void Psyz_CardVBlank(int turn) {
         return;
     }
     if (r->load && state == PSYZ_CARD_UNFORMATTED) {
-        r->transfers = 1; // sector 0 holds no directory
+        /* sector 0 holds no directory: the load ends with that frame,
+         * once the card has answered it (DuckStation: an unformatted
+         * card's _card_load, CARDREAD 0 and its CARDEND 267k clocks after
+         * the vblank, the game's next request two fields later) */
+        r->transfers = 1;
         r->parse = 0;
+        r->sector = 1;
     }
     if (--r->transfers > 0) {
         return;
