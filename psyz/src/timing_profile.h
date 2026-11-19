@@ -118,6 +118,15 @@ enum {
      * 8660 alone (DSF_EXC, the unformatted card's opening movie poll,
      * vsyncs 455-743: 20 in 290 fields) [exc] */
     RCNT_IN_VBLANK_SAVED_CYCLES = 2115,
+    /* A blank that comes in another interrupt's exception after the BIOS
+     * chains' vblank tests (no libpad exchange, no card driver turn) adds
+     * only libetc's dispatcher's vblank work to it: the exception ends
+     * 172-225 clocks later than alone, the frame's PutDispEnv the same
+     * (DSF_EXC, Versus with two cards: a ticking timer's exception 8845
+     * and 8888 clocks with the blank 1388 and 5703 in, a stream sector's
+     * 5608 with it 2144 in, vsyncs 1052, 1086, 1140), where the port
+     * charged a shared exception's 1209 [exc] */
+    HIDDEN_VBLANK_CYCLES = 190,
     /* ... of which this much comes before the callback starts (the
      * MDEC output callback 1883 after the exception, its DecDCTout 2086
      * after it) [exc] */

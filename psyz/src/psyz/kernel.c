@@ -226,10 +226,14 @@ static AtomicWord interrupt_debt;
 
 static unsigned TakeInterruptDebt(void) {
     long debt = AtomicLoad(&interrupt_debt);
-    while (debt && !AtomicCas(&interrupt_debt, debt, 0)) {
+    /* a balance below zero (time a shared exception saved beyond what was
+     * still owed) is left to offset the next handlers' time: taken as
+     * unsigned it was 126.8 s of PS1 time at once (a course 7 load's
+     * VSync(0), the time saved off a CD acknowledge that charges none) */
+    while (debt > 0 && !AtomicCas(&interrupt_debt, debt, 0)) {
         debt = AtomicLoad(&interrupt_debt);
     }
-    return (unsigned)debt;
+    return debt > 0 ? (unsigned)debt : 0;
 }
 
 void Psyz_KernelInterruptCycles(unsigned cycles) {
@@ -687,6 +691,7 @@ static int InOpenException(uint64_t at_ns) {
     return 0;
 }
 
+static unsigned dispatch_charged; // Psyz_KernelDispatchTail's, for RecordDispatchExit
 static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
                                unsigned exit) {
     at_ns = Psyz_KernelUnmaskedNs(at_ns); // its exception begins at the unmask
@@ -716,6 +721,20 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
                 shared = dispatches[i].ns == at_ns && !dispatches[i].device;
             }
         }
+        /* raised during the vblank's exception, before libetc's last look
+         * at the status: served in it, after the vblank's handlers
+         * (DuckStation: a stream sector 13.3k clocks after the blank puts
+         * the frame's PutDrawEnv 3864 clocks later, a sector after the
+         * exception 5153 later; Versus movie vsyncs 865-869) [mark] */
+        if (vblank_exception_end_ns > vblank_exception_ns &&
+            at_ns >= vblank_exception_ns &&
+            at_ns + (uint64_t)LIBETC_DISPATCH_EXIT_CLOCKS * 1000000000u / SYSTEM_CLOCK_HZ <
+                vblank_exception_end_ns) {
+            if (vblank_exception_end_ns > start) {
+                start = vblank_exception_end_ns;
+            }
+            shared = 1;
+        }
         unsigned saved = shared ? SHARED_EXCEPTION_SAVED_CYCLES : 0;
         /* pending together when the exception began (a root counter's and
          * a CD sector's, both held by a masked wait): one exception, whose
@@ -724,7 +743,11 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
          * the timer's interrupt in it, where alone it takes 2724) [exc] */
         if (saved && cycles > saved) {
             cycles -= saved;
-            AtomicAdd(&interrupt_debt, -(long)saved);
+            /* only from the handler time this dispatch charged: an
+             * acknowledge CD_cw does not wait for charges none, and the
+             * debt must not go below what is owed */
+            unsigned from_debt = saved < dispatch_charged ? saved : dispatch_charged;
+            AtomicAdd(&interrupt_debt, -(long)from_debt);
         }
         cycles = StallsInWindow(start, cycles) +
                  (unsigned)((start - at_ns) * SYSTEM_CLOCK_HZ / 1000000000u);
@@ -782,6 +805,13 @@ static void ServiceLine(int line, uint64_t at_ns) {
      * at 5824) [exc] */
     if (line == IRQ_VBLANK && InOpenException(at_ns)) {
         entry -= SHARED_EXCEPTION_SAVED_CYCLES;
+        if (Psyz_KernelBlankInDispatch(at_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
+                                       LIBETC_DISPATCH_EXIT_CLOCKS)) {
+            // past the chains' tests: libetc's dispatcher's work only
+            entry = HIDDEN_VBLANK_CYCLES > VBLANK_HANDLER_CYCLES
+                        ? HIDDEN_VBLANK_CYCLES - VBLANK_HANDLER_CYCLES
+                        : 0;
+        }
     } else if (line != IRQ_VBLANK && vblank_exception_end_ns > vblank_exception_ns &&
                at_ns >= vblank_exception_ns &&
                at_ns + (uint64_t)LIBETC_DISPATCH_EXIT_CLOCKS * 1000000000u / SYSTEM_CLOCK_HZ <
@@ -935,7 +965,9 @@ void Psyz_KernelDispatchTail(uint64_t at_ns, unsigned cycles, unsigned charged,
         return;
     }
     Psyz_KernelInterruptCycles(charged);
+    dispatch_charged = charged;
     RecordDispatch(at_ns, cycles, 1);
+    dispatch_charged = 0;
     dispatches[(dispatch_next + DISPATCH_RING - 1) % DISPATCH_RING].open_tail = open_tail;
 }
 
