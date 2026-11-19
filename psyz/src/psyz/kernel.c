@@ -272,9 +272,16 @@ static void SpendNs(uint64_t ns) {
     }
 }
 
+static long handler_debt_base; // below
 unsigned long long Psyz_EmulatedClocks(void) {
     if (!UsesAudioClock()) {
         return 0;
+    }
+    if (OwnsKernel() && handler_debt_base >= 0) {
+        /* in a device's handler: where it has got to, not the main
+         * thread's time owed (a movie slice callback's LoadImage DMA came
+         * up to 30k clocks late, after its exception) */
+        return Psyz_KernelCpuClocks();
     }
     uint64_t ns = AtomicTimeLoad(&cpu_ns);
     return ns * SYSTEM_CLOCK_HZ / 1000000000u +
@@ -298,6 +305,33 @@ void Psyz_KernelWaitUntilNs(uint64_t at_ns) {
         return;
     }
     Psyz_SpendTime((unsigned)(at_ns - now));
+}
+
+/* A wait the PS1 spins with the interrupts masked (libgpu's _addque2 polls
+ * GPUSTAT's ready bit between SetIntrMask(0) and the restore): the
+ * interrupts that come meanwhile are taken at its end. Inside a handler or
+ * a critical section it is Psyz_KernelWaitUntilNs. */
+static uint64_t masked_from_ns, masked_to_ns; // the latest masked wait
+
+uint64_t Psyz_KernelUnmaskedNs(uint64_t at_ns) {
+    return at_ns >= masked_from_ns && at_ns < masked_to_ns ? masked_to_ns : at_ns;
+}
+
+void Psyz_KernelWaitMaskedUntilNs(uint64_t at_ns) {
+    if (!UsesAudioClock() || OwnsKernel()) {
+        Psyz_KernelWaitUntilNs(at_ns);
+        return;
+    }
+    uint64_t now = AtomicTimeLoad(&cpu_ns) +
+                   (uint64_t)AtomicLoad(&interrupt_debt) * 1000000000u / SYSTEM_CLOCK_HZ;
+    if (at_ns <= now) {
+        return;
+    }
+    PS1_EnterCriticalSection();
+    masked_from_ns = now;
+    masked_to_ns = at_ns;
+    Psyz_SpendCycles((unsigned)((at_ns - now) * SYSTEM_CLOCK_HZ / 1000000000u));
+    PS1_ExitCriticalSection();
 }
 
 /* CPU stalls at their times (Psyz_KernelStallAt): a small queue in time
@@ -530,15 +564,24 @@ static int dispatch_seen;
 /* The latest exception's end on the offline clock, and whether it was a
  * device's: the CPU runs that exception's handlers until then, so a DMA
  * interrupt raised meanwhile waits for libetc's dispatcher (libetc.c). */
-static uint64_t exception_end_ns;
-static int exception_end_device;
+static uint64_t exception_end_ns, exception_start_ns;
+static int exception_end_device, exception_root_counter;
 
 static void NoteException(uint64_t at_ns, unsigned cycles, int device) {
     uint64_t end = at_ns + (uint64_t)cycles * 1000000000u / SYSTEM_CLOCK_HZ;
     if (end >= exception_end_ns) {
         exception_end_ns = end;
         exception_end_device = device;
+        exception_start_ns = at_ns;
+        exception_root_counter = !device;
     }
+}
+
+uint64_t Psyz_KernelExceptionStartNs(int* root_counter) {
+    if (root_counter) {
+        *root_counter = exception_root_counter;
+    }
+    return UsesAudioClock() ? exception_start_ns : 0;
 }
 
 static uint64_t vblank_exception_ns, vblank_exception_end_ns;
@@ -546,6 +589,9 @@ static uint64_t vblank_exception_ns, vblank_exception_end_ns;
 void Psyz_KernelNoteException(uint64_t at_ns, unsigned cycles) {
     if (UsesAudioClock()) {
         NoteException(at_ns, cycles, 0);
+        if (exception_start_ns == at_ns) {
+            exception_root_counter = 0; // the vblank's
+        }
         vblank_exception_ns = at_ns;
         vblank_exception_end_ns =
             at_ns + (uint64_t)cycles * 1000000000u / SYSTEM_CLOCK_HZ;
@@ -594,8 +640,29 @@ uint64_t Psyz_KernelExceptionEndNs(int* device) {
 
 long Psyz_KernelDebtClocks(void) { return AtomicLoad(&interrupt_debt); }
 
+/* An interrupt raised while another's exception runs, before libetc's
+ * dispatcher looks at the interrupt status for the last time, is served in
+ * that exception (InOpenException): it does not take the kernel's entry and
+ * return again (SHARED_EXCEPTION_SAVED_CYCLES). */
+static int InOpenException(uint64_t at_ns) {
+    for (int i = 0; i < DISPATCH_RING; i++) {
+        unsigned exit = dispatches[i].exit ? dispatches[i].exit : LIBETC_DISPATCH_EXIT_CLOCKS;
+        if (!dispatches[i].cycles || dispatches[i].cycles <= exit ||
+            dispatches[i].ns > at_ns) {
+            continue;
+        }
+        uint64_t last = dispatches[i].ns +
+            (uint64_t)(dispatches[i].cycles - exit) * 1000000000u / SYSTEM_CLOCK_HZ;
+        if (at_ns < last) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
                                unsigned exit) {
+    at_ns = Psyz_KernelUnmaskedNs(at_ns); // its exception begins at the unmask
     if (!UsesAudioClock()) {
         return;
     }
@@ -610,6 +677,7 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
          * an MDEC output exception is hidden (Versus with two cards, vsync
          * 1142) */
         uint64_t start = at_ns;
+        int shared = 0;
         for (int i = 0; i < DISPATCH_RING; i++) {
             if (!dispatches[i].cycles || dispatches[i].ns > at_ns) {
                 continue;
@@ -618,7 +686,18 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
                                                   1000000000u / SYSTEM_CLOCK_HZ;
             if (end > start && end - at_ns < 100000000u) {
                 start = end;
+                shared = dispatches[i].ns == at_ns && !dispatches[i].device;
             }
+        }
+        unsigned saved = shared ? SHARED_EXCEPTION_SAVED_CYCLES : 0;
+        /* pending together when the exception began (a root counter's and
+         * a CD sector's, both held by a masked wait): one exception, whose
+         * entry and return the second does not repeat (DuckStation: the
+         * Versus movie's stream sector exception 9708 clocks, 10831 with
+         * the timer's interrupt in it, where alone it takes 2724) [exc] */
+        if (saved && cycles > saved) {
+            cycles -= saved;
+            AtomicAdd(&interrupt_debt, -(long)saved);
         }
         cycles = StallsInWindow(start, cycles) +
                  (unsigned)((start - at_ns) * SYSTEM_CLOCK_HZ / 1000000000u);
@@ -651,8 +730,16 @@ static void RecordDispatch(uint64_t at_ns, unsigned cycles, int device) {
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
     irq_latched &= ~(1u << line);
-    Psyz_KernelInterruptCycles(KERNEL_IRQ_CYCLES +
-                               (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0));
+    unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0);
+    /* a blank during another interrupt's exception, before libetc's last
+     * look at the status: served in it (DuckStation: VSync(0) returns 4209
+     * clocks after a blank 1100 clocks into a root counter's exception,
+     * two-cards vsync 904, where a separate exception after it would end
+     * at 5824) [exc] */
+    if (line == IRQ_VBLANK && InOpenException(at_ns)) {
+        entry -= SHARED_EXCEPTION_SAVED_CYCLES;
+    }
+    Psyz_KernelInterruptCycles(entry);
     switch (line) {
     case IRQ_VBLANK:
         DeliverLocked(RCntCNT3, EvSpINT);
@@ -724,6 +811,7 @@ void Psyz_KernelExtendDispatch(uint64_t at_ns, int clocks) {
     if (!UsesAudioClock() || !dispatch_seen) {
         return;
     }
+    at_ns = Psyz_KernelUnmaskedNs(at_ns); // as RecordDispatchExit
     for (unsigned k = 1; k <= DISPATCH_RING; k++) {
         unsigned i = (dispatch_next + DISPATCH_RING - k) % DISPATCH_RING;
         if (dispatches[i].ns != at_ns || !dispatches[i].device) {

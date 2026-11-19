@@ -92,6 +92,13 @@ enum {
      * its LoadImage's return, less the stubs' 24) against a root counter
      * interrupt's 2724 [exc] */
     DMA_IRQ_DISPATCH_CYCLES = 80,
+    /* An interrupt pending as another's exception begins, or a blank
+     * that comes during one, is served in it: it adds 1123 clocks where
+     * its own exception takes 2724 (a non-ticking root counter's with a
+     * stream sector's, Versus movie vsyncs 845-869: 10831 against the
+     * sector's 9708 alone; VSync(0) 1615 sooner after a blank inside a
+     * root counter's exception, two-cards vsync 904) [exc] */
+    SHARED_EXCEPTION_SAVED_CYCLES = 2724 - 1123,
     /* ... of which this much comes before the callback starts (the
      * MDEC output callback 1883 after the exception, its DecDCTout 2086
      * after it) [exc] */
@@ -106,6 +113,16 @@ enum {
      * 4850-5490 in), and the exception ends 4470 after the callback starts
      * (4300 standalone). [exc] */
     DMA_AFTER_LINE_TO_HANDLER_CYCLES = 300,
+    /* In a root counter's exception libetc's dispatcher first looks at the
+     * interrupt status this far in, before the timer's tick: a DMA
+     * interrupt that has come by then has its callback early, one that
+     * comes later after the tick (300 after its end, as above). On
+     * DuckStation (Versus and opening movies, DSF_EXC with MDEC output
+     * marks, 74 such slices) the output starts 2815-3360 clocks after the
+     * root counter's exception (median 3326) for an interrupt due up to
+     * 2647 in, 8.9k-9.3k for one due from 2865. [exc] */
+    DMA_RCNT_FIRST_LOOK_CLOCKS = 2756,
+    DMA_IN_RCNT_TO_HANDLER_CLOCKS = 3326 - 203,
     DMA_AFTER_DEVICE_TO_HANDLER_CYCLES = 1900,
     DMA_NESTED_RETURN_CYCLES = 1091,
     /* libetc's dispatcher reads the interrupt status for the last time
@@ -242,6 +259,13 @@ enum {
     SET_DISP_MASK_CYCLES = 175,
     INIT_GEOM_CYCLES = 48903,
     PUT_DRAW_ENV_CYCLES = 790,
+    /* The part of PutDrawEnv (and DrawOTag) before _addque2's exec (_cwc)
+     * starts the packet's DMA: SetDrawEnv2, then _addque2 up to its
+     * SetIntrMask(0) and one look at GPUSTAT (DSF_MARKS PutDrawEnv,
+     * _addque2, SetIntrMask, _cwc: 586 + 142 + 87 + 12 for _cwc's stores,
+     * every frame of the Versus movie, fields 841-869). Its BIOS memcpy
+     * comes after the restore. [mark] */
+    PUT_DRAW_ENV_TO_EXEC_CYCLES = 827,
     /* PutDispEnv sets the display mode only when the display area or the
      * interlace flags change (a double-buffered screen, every call: the
      * Time Attack's 4941); the 480-line menus keep theirs and take 4620
@@ -251,6 +275,7 @@ enum {
     PUT_DISP_ENV_MODE_CYCLES = 321,
     GET_ENV_CYCLES = 40,
     DRAW_OTAG_CYCLES = 468,
+    DRAW_OTAG_TO_EXEC_CYCLES = 40 + 142 + 87 + 12, // as PutDrawEnv's [mark]
     CLEAR_OTAG_R_CYCLES = 330,
     LOAD_IMAGE_CYCLES = 830,
     DRAW_SYNC_CYCLES = 246, // an idle GPU queue
@@ -261,6 +286,16 @@ enum {
      * 1000-clock slices, and moves on as the GPU takes the commands. [model] */
     DRAW_OTAG_NODE_CYCLES = 8,
     DRAW_OTAG_BLOCK_CYCLES = 5,
+    /* _addque2 waits for an idle GPU with the interrupts masked and runs
+     * its exec once the GPU is idle: the exec's DMA starts this much after
+     * the drawing ends (the Versus movie: _cwc 61524 clocks after
+     * PutDrawEnv's, its 480x256 fill 61448 and the packet's DMA 23), and
+     * the mask is restored this much after the DMA's first slice (_cwc to
+     * the restore 1059 with a 1000-clock slice; the exception of an
+     * interrupt that came during the wait 93126 clocks after the blank,
+     * DSF_EXC unmarked). [mark] */
+    ADDQUE2_POLL_EXIT_CLOCKS = 42,
+    ADDQUE2_RESTORE_CLOCKS = 45,
     /* AddPrim/AddPrims, SetSemiTrans/SetShadeTex, and the primitive setters
      * (SetPolyF3 .. SetLineG4, the same few stores as SetSprt). [call]
      * 686859c */

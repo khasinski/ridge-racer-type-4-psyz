@@ -55,6 +55,8 @@ static struct {
     int clut_8bit;
     int clut_valid;
     unsigned e3, e4;
+    int masked;            // _addque2 waited: 1 in its first slice, 2 after
+    uint64_t first_end_ns; // where that slice ended
 } g = {0, 0, 0, 0, 0, 0, 0, 1024, 512, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 static uint64_t clocks_ns(uint64_t clocks) { return clocks * 1000000000u / 33868800u; }
@@ -282,16 +284,27 @@ static uint64_t now_ns(void) {
     return Psyz_EmulatedClocks() * 1000000000u / 33868800u;
 }
 
+/* The first slice of a list _addque2 started after its wait ends before
+ * the mask's restore: the masked wait spends it (Psyz_GpuTimingEnd). It
+ * ends after DMA_SLICE_CLOCKS or where the DMA waits for the GPU. */
+static void end_first_slice(void) {
+    if (g.masked == 1) {
+        g.masked = 2;
+        g.first_end_ns = g.dma_ns;
+    }
+}
+
 /* The CPU loses `clocks` of DMA at the DMA's position, in slices. */
 static void dma_stall(unsigned clocks) {
     while (clocks) {
         unsigned room = DMA_SLICE_CLOCKS - g.slice;
         unsigned take = clocks < room ? clocks : room;
-        Psyz_KernelStallAt(g.dma_ns, take);
+        if (g.masked != 1) Psyz_KernelStallAt(g.dma_ns, take);
         g.dma_ns += clocks_ns(take);
         g.slice += take;
         clocks -= take;
         if (g.slice >= DMA_SLICE_CLOCKS) {
+            end_first_slice();
             g.slice = 0;
             g.dma_ns += clocks_ns(DMA_HALT_CLOCKS);
         }
@@ -337,7 +350,17 @@ void Psyz_GpuTimingBegin(void) {
     int cpu_waits;
     g.dma_ns = Psyz_GpuListStartNs(now, g.dma_free_ns, g.gpu_end_ns, &cpu_waits);
     g.slice = 0;
-    if (cpu_waits) Psyz_KernelWaitUntilNs(g.dma_ns);
+    /* _addque2 polls for the idle GPU with the interrupts masked, then
+     * starts the DMA and restores the mask after its first slice: on
+     * DuckStation a CD sector's or the timer's interrupt that comes during
+     * a movie frame's 43k-clock DrawOTag is taken then (Versus movie, odd
+     * fields: at 93126 clocks after the blank, due from 73.6k). */
+    g.masked = 0;
+    if (cpu_waits) {
+        g.dma_ns += clocks_ns(ADDQUE2_POLL_EXIT_CLOCKS);
+        g.masked = 1;
+        g.first_end_ns = g.dma_ns;
+    }
     list_nodes = list_words = 0;
     list_ticks = 0;
     if (gpu_trace())
@@ -354,6 +377,7 @@ void Psyz_GpuTimingNode(const u_long* words, int n) {
     uint64_t accept = g.gpu_end_ns > clocks_ns(RUN_AHEAD_GPU_TICKS / 2)
                           ? g.gpu_end_ns - clocks_ns(RUN_AHEAD_GPU_TICKS / 2) : 0;
     if (accept > g.dma_ns) {
+        end_first_slice();
         g.dma_ns = accept;
         g.slice = 0;
     }
@@ -370,6 +394,11 @@ void Psyz_GpuTimingEnd(void) {
     if (!g.active) return;
     g.active = 0;
     g.dma_free_ns = g.dma_ns;
+    if (g.masked) {
+        end_first_slice();
+        g.masked = 0;
+        Psyz_KernelWaitMaskedUntilNs(g.first_end_ns + clocks_ns(ADDQUE2_RESTORE_CLOCKS));
+    }
     if (gpu_trace())
         fprintf(stderr, "gpu: end packets %u words %u ticks %llu dma_end %llu gpu_end %llu\n",
                 list_nodes, list_words, (unsigned long long)list_ticks,

@@ -381,16 +381,14 @@ void DrawOTag(OT_TYPE* p) {
     if (info.level >= 2) {
         GPU_printf("DrawOTag(%08x)...\n", p);
     }
-#ifdef __psyz
-    GPU_TIME(DRAW_OTAG_CYCLES); // its list DMA: gpu_timing.c
-#else
-    GPU_TIME(DRAW_OTAG_CYCLES);
-#endif
+    // up to _addque2's exec, then the rest; its list DMA: gpu_timing.c
+    GPU_TIME(DRAW_OTAG_TO_EXEC_CYCLES);
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
     D_800B8920->addque2(
         (int (*)(u_long, u_long))D_800B8920->cwc, (u_long)p, 0, 0);
+    GPU_TIME(DRAW_OTAG_CYCLES - DRAW_OTAG_TO_EXEC_CYCLES);
 #ifdef PE_PS5_GPU_NATIVE
     Psyz_VideoMovieFrameQueued(native_accepted==0);
 #endif
@@ -403,10 +401,12 @@ DRAWENV* PutDrawEnv(DRAWENV* env) {
 
     SetDrawEnv2(&env->dr_env, env);
     termPrim(&env->dr_env);
+    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES); // the packet's DMA starts here
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
-    GPU_TIME(PUT_DRAW_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
+    GPU_TIME(PUT_DRAW_ENV_CYCLES - PUT_DRAW_ENV_TO_EXEC_CYCLES +
+             GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
     return env;
 }
 
@@ -416,13 +416,15 @@ void DrawOTagEnv(OT_TYPE* p, DRAWENV* env) {
     }
     SetDrawEnv2(&env->dr_env, env);
     setaddr(&env->dr_env, p);
+    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES); // as PutDrawEnv
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
-    GPU_TIME(PUT_DRAW_ENV_CYCLES + GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
+    GPU_TIME(PUT_DRAW_ENV_CYCLES - PUT_DRAW_ENV_TO_EXEC_CYCLES +
+             GPU_BIOS_MEMCPY_CYCLES(PS1_DRAWENV_SIZE));
 #ifdef PE_PS5_GPU_NATIVE
     Psyz_VideoMovieFrameQueued(native_accepted==0);
 #endif

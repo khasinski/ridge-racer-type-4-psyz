@@ -102,6 +102,9 @@ void Psyz_KernelDeviceIrq(void (*handler)(void), unsigned before,
 // The latest exception's end on the offline clock (0 elsewhere), *device
 // set when it was a device's (CD); the vblank's is noted by libapi.c.
 uint64_t Psyz_KernelExceptionEndNs(int* device);
+// Where the latest exception began, and whether it is a root counter's
+// (not the vblank's, not a device's).
+uint64_t Psyz_KernelExceptionStartNs(int* root_counter);
 void Psyz_KernelNoteException(uint64_t at_ns, unsigned cycles);
 // A busy wait from start_ns that a device's time ends at until_ns (CD_cw's
 // for an acknowledge): the handlers that ran during it took the CPU's spin,
@@ -199,6 +202,11 @@ uint64_t Psyz_KernelNowNs(void);
 // counted): interrupts meanwhile fall within it. In a handler it
 // lengthens the handler. Offline clock only.
 void Psyz_KernelWaitUntilNs(uint64_t at_ns);
+// The same with the interrupts masked: those that come are taken at its end.
+void Psyz_KernelWaitMaskedUntilNs(uint64_t at_ns);
+// An interrupt due at at_ns is taken then, or at the end of the masked
+// wait it came in.
+uint64_t Psyz_KernelUnmaskedNs(uint64_t at_ns);
 // PSYZ_PAD_TRACE: clocks from the latest such exception to at_ns, and
 // its handlers' clocks; 0 when there was none before.
 // Distance in clocks of a blank to the nearest boundary of

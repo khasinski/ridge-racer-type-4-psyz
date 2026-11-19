@@ -367,12 +367,19 @@ int VSync(int mode) {
         fprintf(stderr, "pad: vsync return handler %llu ns wait %u lines\n",
                 (unsigned long long)handler_ns, wait_lines);
     if (handler_ns > wait_ns) {
-        wait_ns = handler_ns;
+        /* the vblank's exception: an interrupt that comes before it ends
+         * is served in it and lengthens it, where a poll of GPUSTAT takes
+         * it within its spin (DuckStation: a stream sector 4.6k clocks
+         * after the blank, Versus movie vsync 935, makes the exception
+         * 28485 clocks, 24654 without) */
+        vsync_return_lines = (unsigned)((handler_ns + LineNs() / 2) / LineNs());
+        Psyz_SpendCycles((unsigned)(handler_ns * 33868800u / 1000000000u));
+    } else {
+        if (wait_ns) {
+            Psyz_SpendTime((unsigned)wait_ns);
+        }
+        vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
     }
-    if (wait_ns) {
-        Psyz_SpendTime((unsigned)wait_ns);
-    }
-    vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
     if (Psyz_KernelOfflineClock()) {
         Psyz_SpendCycles(VSYNC_RETURN_CYCLES);
     }

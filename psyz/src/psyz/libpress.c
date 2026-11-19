@@ -16,10 +16,10 @@ static struct {
     size_t capacity, length, cursor;
     u32 command;
     int error;
-    uint64_t start_us; // the decode of the current input began
+    uint64_t start_ns; // the decode of the current input began
     int out_pending;   // an output transfer waits for its macroblocks
     int out_started;   // an output transfer came since the input began
-    uint64_t out_us;   // and completes at this time
+    uint64_t out_ns;   // and completes at this time
 } mdec;
 
 /* The decoder takes its PS1 time: a macroblock (a block in the mono
@@ -61,10 +61,26 @@ static unsigned unit_bytes(void) {
  * a root counter's, the CD drive's) it waits for that exception's handlers:
  * libetc's dispatcher then takes it within the same exception. */
 static int out_host;
+/* A root counter's exception: libetc's dispatcher looks at the interrupt
+ * status before the timer's tick runs, and takes the DMA's interrupt then
+ * if it has come (its callback DMA_IN_RCNT_TO_HANDLER_CLOCKS in), else
+ * after the tick. The port runs the callback at the exception's end
+ * either way; its output starts as early as on the console. */
+static uint64_t out_early_clocks; // the callback's time saved so
 static void out_done(void) {
     int device = 0;
     uint64_t end = Psyz_KernelExceptionEndNs(&device);
     if (!mdec_instant && end > Psyz_KernelNowNs()) {
+        int rcnt = 0;
+        uint64_t start = Psyz_KernelExceptionStartNs(&rcnt);
+        uint64_t look = start + (uint64_t)DMA_RCNT_FIRST_LOOK_CLOCKS * 1000000000u / 33868800u;
+        out_early_clocks = 0;
+        if (rcnt && !device && Psyz_KernelNowNs() <= look) {
+            uint64_t cb = start + (uint64_t)DMA_IN_RCNT_TO_HANDLER_CLOCKS * 1000000000u / 33868800u;
+            uint64_t late = end + (uint64_t)DMA_AFTER_LINE_TO_HANDLER_CYCLES * 1000000000u / 33868800u;
+            if (late > cb)
+                out_early_clocks = (late - cb) * 33868800u / 1000000000u;
+        }
         out_host = device ? 2 : 1;
         Psyz_KernelPostAtNs(end, out_done);
         return;
@@ -73,6 +89,7 @@ static void out_done(void) {
     int host = out_host;
     out_host = 0;
     Psyz_DmaIrqComplete(1, host);
+    out_early_clocks = 0; // its callback output nothing
 }
 
 int Psyz_MdecOutBusy(void) {
@@ -304,7 +321,7 @@ static void MDEC_in_locked(void* buf, int size) {
             break;
         }
         decode(data, data + words * 4);
-        mdec.start_us = Psyz_KernelNowUs();
+        mdec.start_ns = Psyz_KernelNowNs();
         mdec.out_started = 0;
         break;
     }
@@ -346,30 +363,32 @@ static void MDEC_out_locked(void* buf, int size) {
     memcpy(buf, mdec.output + mdec.cursor, (size_t)size * 4);
     mdec.cursor += (size_t)size * 4;
     uint64_t units = (mdec.cursor + unit_bytes() - 1) / unit_bytes();
-    uint64_t ready = mdec.start_us + units * unit_clocks() * 1000000 / 33868800;
+    // in ns: whole microseconds lost up to 33 clocks a slice
+    uint64_t ready = mdec.start_ns + units * unit_clocks() * 1000000000 / 33868800;
     // the decoder works on this transfer's units from its start (where the
     // CPU has got to, a callback's handler time included)
     uint64_t these = ((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes();
-    uint64_t issue = Psyz_KernelCpuClocks() + these * unit_clocks();
+    uint64_t issue = Psyz_KernelCpuClocks() - out_early_clocks + these * unit_clocks();
+    out_early_clocks = 0;
     if (!mdec.out_started) { // the decode's start after the input's
         issue += MDEC_FIRST_OUT_CLOCKS;
         mdec.out_started = 1;
     }
-    issue = issue * 1000000 / 33868800;
+    issue = issue * 1000000000 / 33868800;
     if (issue > ready)
         ready = issue;
     if (Psyz_MdecTrace()) {
-        fprintf(stderr, "mdec out %d words at %llu clocks, ready %llu us\n",
+        fprintf(stderr, "mdec out %d words at %llu clocks, ready %llu ns\n",
                 size, (unsigned long long)Psyz_KernelCpuClocks(),
                 (unsigned long long)ready);
     }
-    if (mdec_instant || ready <= Psyz_KernelNowUs()) {
+    if (mdec_instant || ready <= Psyz_KernelNowNs()) {
         Psyz_DmaIrqComplete(1, 0);
         return;
     }
     mdec.out_pending = 1;
-    mdec.out_us = ready;
-    Psyz_KernelPostAt(ready, out_done);
+    mdec.out_ns = ready;
+    Psyz_KernelPostAtNs(ready, out_done);
 }
 /* The timed completion and DMA callbacks hold the same recursive lock.
  * In particular, never cancel a transfer after another thread has already
@@ -399,14 +418,14 @@ int MDEC_out_sync(void) {
     // DecDCToutSync(0) waits for the transfer, without starving the IRQ thread.
     Psyz_KernelLockInterrupts();
     while (mdec.out_pending) {
-        uint64_t now = Psyz_KernelNowUs();
-        uint64_t due = mdec.out_us;
+        uint64_t now = Psyz_KernelNowNs();
+        uint64_t due = mdec.out_ns;
         Psyz_KernelUnlockInterrupts();
         uint64_t now_ns = Psyz_KernelNowNs();
-        int advanced = due > now && Psyz_AudioWaitNs(due * 1000 - now_ns) &&
+        int advanced = due > now && Psyz_AudioWaitNs(due - now_ns) &&
                        Psyz_KernelNowNs() != now_ns;
         Psyz_KernelLockInterrupts();
-        if (advanced || !mdec.out_pending || mdec.out_us != due)
+        if (advanced || !mdec.out_pending || mdec.out_ns != due)
             continue;
         if (Psyz_KernelOfflineClock() || due <= now) {
             // due, or no time can pass here (inside an interrupt)

@@ -1730,6 +1730,7 @@ static void deliver_data_sector(void) {
     // its INT1: drive_start_us + n periods, rounded up as drive_schedule
     uint64_t irq_us = drive_start_us +
         (drive_delivered * 1000000 + drive_rate() - 1) / drive_rate();
+    irq_us = Psyz_KernelUnmaskedNs(irq_us * 1000) / 1000;
     if (read_data_sector(sector) < 0) {
         data_read_active = 0;
         CD_status &= ~CdlStatRead;
