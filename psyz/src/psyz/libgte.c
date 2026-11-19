@@ -2450,16 +2450,32 @@ void Psyz_GteCopyQueuedPgxpSxy(
         FLAG_UPDATE_ERROR();                                                   \
     } while (0)
 
-void Psyz_GteRtps(void) {
+/* Commands executed, by opcode (Psyz_GteOpCount): the game's CPU time
+ * model counts the GTE work of its renderers with them. */
+static unsigned long long gte_op_count[64];
+
+unsigned long long Psyz_GteOpCount(unsigned op) { return gte_op_count[op & 0x3F]; }
+
+static void RtpsFast(void) {
     unsigned sxy;
     RTPS_BODY(1, 0, sxy);
     (void)sxy;
 }
 
-void Psyz_GteRtpt(void) {
+static void RtptFast(void) {
     unsigned sxy0, sxy1, sxy2;
     RTPT_BODY(1, 0, sxy0, sxy1, sxy2);
     (void)sxy0, (void)sxy1, (void)sxy2;
+}
+
+void Psyz_GteRtps(void) {
+    gte_op_count[0x01]++;
+    RtpsFast();
+}
+
+void Psyz_GteRtpt(void) {
+    gte_op_count[0x30]++;
+    RtptFast();
 }
 
 // Perspective Transformation. cmd25 is the full 25-bit cop2 imm.
@@ -2467,7 +2483,7 @@ static void RTPS(unsigned int cmd25) {
     int sf = CMD_SF(cmd25), lm = CMD_LM(cmd25);
     unsigned sxy;
     if (sf && !lm) {
-        Psyz_GteRtps();
+        RtpsFast();
         return;
     }
     RTPS_BODY(sf, lm, sxy);
@@ -2478,7 +2494,7 @@ static void RTPT(unsigned int cmd25) {
     int sf = CMD_SF(cmd25), lm = CMD_LM(cmd25);
     unsigned sxy0, sxy1, sxy2;
     if (sf && !lm) {
-        Psyz_GteRtpt();
+        RtptFast();
         return;
     }
     RTPT_BODY(sf, lm, sxy0, sxy1, sxy2);
@@ -3062,7 +3078,10 @@ void Psyz_GteLcir(void) {
     mat_vec(sf, lm, L2.m, IR1, IR2, IR3, 0, 0, 0);
     FLAG_UPDATE_ERROR();
 }
-void Psyz_GteNclip(void) { NCLIP(); }
+void Psyz_GteNclip(void) {
+    gte_op_count[0x06]++;
+    NCLIP();
+}
 void Psyz_GteRt(void) {
     FLAG = 0;
     mat_vec(1, 0, M.m, V0.vx, V0.vy, V0.vz, M.t[0], M.t[1], M.t[2]);
@@ -3972,4 +3991,7 @@ static void (*const gte_ops[64])(unsigned int cmd) = {
     NOOP, NOOP,  NOOP,  NOOP, NOOP, GPF,       GPL,       NCCT, // 38-3F
 };
 
-void Psyz_GteCommand(unsigned int cmd) { gte_ops[cmd & 0x3F](cmd); }
+void Psyz_GteCommand(unsigned int cmd) {
+    gte_op_count[cmd & 0x3F]++;
+    gte_ops[cmd & 0x3F](cmd);
+}

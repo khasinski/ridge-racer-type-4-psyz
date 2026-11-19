@@ -413,6 +413,13 @@ enum {
      * an average; with it the race's ticks were 2k clocks long, which hid
      * blanks DuckStation's take) [mark] */
     SS_VM_FLUSH_CYCLES = 3143,
+    /* ... of which this much comes after its key-on write (SpuSetKey(SPU_ON)'s
+     * register write, its return, SpuSetReverbVoice, SpuSetNoiseVoice):
+     * the write 729 clocks after DuckStation's SpuSetKey mark with the whole
+     * flush charged before it (Time Attack, 7237 ticks, DSF_MARKS
+     * SsSeqCalledTbyT,SpuSetKey against PSYZ_SPU_KEY_TIME), the write about
+     * 25 clocks into SpuSetKey [mark] */
+    SS_VM_FLUSH_TAIL_CYCLES = 704,
     SS_VM_FLUSH_ENVELOPE_CYCLES = 98,
     SS_VM_FLUSH_VOICE_CYCLES = 601,
     SS_VM_FLUSH_WRITE_CYCLES = 37,

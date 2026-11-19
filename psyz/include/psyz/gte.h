@@ -81,6 +81,14 @@ void Psyz_GteCtrlWrite(unsigned reg, unsigned int value);
  */
 #ifdef __psyz
 void Psyz_GteCommand(unsigned int cmd);
+/**
+ * @brief The GTE commands of this opcode (bits 0-5) executed so far
+ *
+ * Counts Psyz_GteCommand and the direct RTPS, RTPT and NCLIP calls
+ * (Psyz_GteRtps, Psyz_GteRtpt, Psyz_GteNclip), not the library routines'
+ * own: for a game's model of its renderers' CPU time.
+ */
+unsigned long long Psyz_GteOpCount(unsigned op);
 #else
 #define Psyz_GteCommand(cmd)                                                   \
     __asm__ volatile("nop;"                                                    \

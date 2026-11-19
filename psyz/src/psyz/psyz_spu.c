@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "spu_voice.h"
+#include "../internal.h"
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(SPU_RXX) == 0x200, "SPU_RXX must be 0x200 bytes");
@@ -182,6 +183,32 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
         if (reg_trace && reg_offset < 0x1A0) {
             fprintf(stderr, "PSYZ-SPU reg frame=%ld off=%03x val=%04x\n",
                     (long)VSync(-1), reg_offset, value);
+        }
+    }
+    /* A write in an interrupt handler lands where its code has got to (a
+     * sequencer tick's key-on after _SsVmFlush's work, 3.6k-10k clocks into
+     * the tick on DuckStation), not at the exception's start, where the
+     * clock stops for the handler: the samples before it are mixed first
+     * (to the next blank at most, which the handler cannot pass). */
+    uint64_t at_ns = getenv("PSYZ_SPU_AT_START") ? 0 : Psyz_KernelHandlerPositionNs();
+    if (at_ns) {
+        uint64_t blank = Psyz_AudioNextBlankNs();
+        Psyz_AudioMixTo(at_ns < blank ? at_ns : blank);
+    }
+    {
+        static int key_time = -1;
+        if (key_time < 0) {
+            const char* trace = getenv("PSYZ_SPU_KEY_TIME");
+            key_time = trace && *trace && *trace != '0';
+        }
+        if (key_time && (value || at_ns) &&
+            (reg_offset == offsetof(SPU_RXX, key_on[0]) ||
+             reg_offset == offsetof(SPU_RXX, key_on[1]))) {
+            unsigned long long clocks =
+                at_ns ? (unsigned long long)Psyz_NsToClocks(at_ns)
+                      : Psyz_EmulatedClocks();
+            fprintf(stderr, "PSYZ-SPU keywrite tick=%llu off=%03x val=%04x handler=%d\n",
+                    clocks, reg_offset, value, at_ns != 0);
         }
     }
     // Register strobes latch at a sample boundary. Serialize their pending

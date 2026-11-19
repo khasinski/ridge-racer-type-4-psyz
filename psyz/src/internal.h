@@ -129,6 +129,10 @@ long Psyz_KernelDebtClocks(void);
 // Where the CPU has got to in system clocks: in a device handler, after
 // that handler's time so far. Offline clock only (0 elsewhere).
 uint64_t Psyz_KernelCpuClocks(void);
+// Inside an interrupt handler (a device's, a root counter's or the
+// vblank's): where its code has got to in ns, the exception's time plus
+// the handler time charged since; 0 outside one or on a real-time clock.
+uint64_t Psyz_KernelHandlerPositionNs(void);
 
 // Raises the vblank interrupt; VSync calls it once per emulated frame.
 void Psyz_KernelVBlank(void);

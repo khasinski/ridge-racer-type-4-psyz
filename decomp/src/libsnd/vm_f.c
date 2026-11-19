@@ -220,7 +220,8 @@ void _SsVmFlush(void) {
         }
     }
     if (!_ss_flush_uncharged) {
-        SS_CPU(SS_VM_FLUSH_CYCLES + _SsVmMaxVoice * SS_VM_FLUSH_ENVELOPE_CYCLES);
+        SS_CPU(SS_VM_FLUSH_CYCLES - SS_VM_FLUSH_TAIL_CYCLES +
+               _SsVmMaxVoice * SS_VM_FLUSH_ENVELOPE_CYCLES);
     }
     for (i = 0; i < NUM_VOICES; i++) {
         if (_svm_sreg_dirty[i] && !_ss_flush_uncharged) {
@@ -247,6 +248,11 @@ void _SsVmFlush(void) {
     }
     SpuSetKey(SPU_OFF, ((u8)_svm_okof2 << 16) | _svm_okof1);
     SpuSetKey(SPU_ON, ((u8)_svm_okon2 << 16) | _svm_okon1);
+#ifdef __psyz
+    if (!_ss_flush_uncharged) {
+        SS_CPU(SS_VM_FLUSH_TAIL_CYCLES); // the key-on write is behind it
+    }
+#endif
     SpuSetReverbVoice(SPU_BIT, ((u8)_svm_orev2 << 16) | _svm_orev1);
     SpuSetNoiseVoice(SPU_BIT, ((u8)_svm_onos2 << 16) | _svm_onos1);
     _svm_okof1 = 0;

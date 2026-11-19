@@ -652,6 +652,25 @@ long Psyz_KernelDebtClocks(void) { return AtomicLoad(&interrupt_debt); }
  * dispatcher looks at the interrupt status for the last time, is served in
  * that exception (InOpenException): it does not take the kernel's entry and
  * return again (SHARED_EXCEPTION_SAVED_CYCLES). */
+/* The open exception's last look at the interrupt status (the latest of
+ * those at_ns falls in before it), 0 when at_ns is in none. */
+static uint64_t OpenExceptionLastNs(uint64_t at_ns) {
+    uint64_t latest = 0;
+    for (int i = 0; i < DISPATCH_RING; i++) {
+        unsigned exit = dispatches[i].exit ? dispatches[i].exit : LIBETC_DISPATCH_EXIT_CLOCKS;
+        if (!dispatches[i].cycles || dispatches[i].cycles <= exit ||
+            dispatches[i].ns > at_ns) {
+            continue;
+        }
+        uint64_t last = dispatches[i].ns +
+            (uint64_t)(dispatches[i].cycles - exit) * 1000000000u / SYSTEM_CLOCK_HZ;
+        if (at_ns < last && last > latest) {
+            latest = last;
+        }
+    }
+    return latest;
+}
+
 static int InOpenException(uint64_t at_ns) {
     for (int i = 0; i < DISPATCH_RING; i++) {
         unsigned exit = dispatches[i].exit ? dispatches[i].exit : LIBETC_DISPATCH_EXIT_CLOCKS;
@@ -741,8 +760,18 @@ void Psyz_KernelRomCode(int enter) { rom_code += enter ? 1 : -1; }
 
 static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CYCLES : 0; }
 
+/* The root counter or vblank handler running (ServiceLine): its exception's
+ * time and the handler time owed when it began, for where its writes land
+ * (Psyz_KernelHandlerPositionNs); line_debt_base -1 outside one. */
+static uint64_t line_at_ns;
+static long line_debt_base = -1;
+
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
+    uint64_t outer_at_ns = line_at_ns;
+    long outer_base = line_debt_base;
+    line_at_ns = at_ns;
+    line_debt_base = debt;
     irq_latched &= ~(1u << line);
     unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0) +
                      RomRefetch();
@@ -762,6 +791,19 @@ static void ServiceLine(int line, uint64_t at_ns) {
          * vblank exception with the timer's tick in it 26.8k clocks, with
          * a non-ticking one 20.9k, alone 20.3k; the tick's own 8.6k) [exc] */
         entry -= RCNT_IN_VBLANK_SAVED_CYCLES;
+        /* its handler runs once the vblank's are done, at libetc's last
+         * look at the status: its writes land from there */
+        uint64_t last = vblank_exception_end_ns -
+            (uint64_t)LIBETC_DISPATCH_EXIT_CLOCKS * 1000000000u / SYSTEM_CLOCK_HZ;
+        if (last > line_at_ns) {
+            line_at_ns = last;
+        }
+    } else if (line != IRQ_VBLANK) {
+        /* the same in another interrupt's exception (a device's) */
+        uint64_t last = OpenExceptionLastNs(at_ns);
+        if (last > line_at_ns) {
+            line_at_ns = last;
+        }
     }
     Psyz_KernelInterruptCycles(entry);
     switch (line) {
@@ -778,6 +820,8 @@ static void ServiceLine(int line, uint64_t at_ns) {
     if (irq_callbacks[line]) {
         irq_callbacks[line]();
     }
+    line_at_ns = outer_at_ns;
+    line_debt_base = outer_base;
     if (line != IRQ_VBLANK) {
         unsigned window = (unsigned)(AtomicLoad(&interrupt_debt) - debt);
         // DMA stalls that come while the handler runs lengthen it
@@ -814,6 +858,24 @@ void Psyz_KernelDeviceIrq(void (*handler)(void), unsigned before,
     handler_debt_base = outer;
     unsigned window = (unsigned)(AtomicLoad(&interrupt_debt) - debt);
     RecordDispatchExit(at_ns, window, 1, exit_clocks);
+}
+
+uint64_t Psyz_KernelHandlerPositionNs(void) {
+    if (!UsesAudioClock() || !OwnsKernel()) {
+        return 0;
+    }
+    uint64_t at_ns;
+    long in;
+    if (handler_debt_base >= 0) { // a device's handler
+        at_ns = AtomicTimeLoad(&cpu_ns);
+        in = AtomicLoad(&interrupt_debt) - handler_debt_base;
+    } else if (line_debt_base >= 0 && in_interrupt) {
+        at_ns = line_at_ns;
+        in = AtomicLoad(&interrupt_debt) - line_debt_base;
+    } else {
+        return 0;
+    }
+    return at_ns + (uint64_t)(in > 0 ? in : 0) * 1000000000u / SYSTEM_CLOCK_HZ;
 }
 
 uint64_t Psyz_KernelCpuClocks(void) {
