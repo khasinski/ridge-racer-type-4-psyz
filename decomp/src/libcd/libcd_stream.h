@@ -31,6 +31,7 @@ void Psyz_CdPollCycles(unsigned cycles);
 /* PS1 CPU time of LIBCD's own code (timing_profile.h); none with
  * PSYZ_CD_TIMING=instant. */
 void Psyz_CdCpu(unsigned cycles);
+unsigned Psyz_CdDoneIrqCycles(void);
 #include "../../../psyz/src/timing_profile.h"
 #endif
 #endif

@@ -220,6 +220,9 @@ s32 CD_cachefile(s32 dirNum) {
     short* namePtr;
 
     if (dirNum == cached_dir_num_) {
+        // a search of the directory already cached: its path and
+        // directory lookups, which the read's costs cover otherwise
+        SEARCH_TIME(CD_SEARCH_CACHED_CYCLES);
         return 1;
     }
 

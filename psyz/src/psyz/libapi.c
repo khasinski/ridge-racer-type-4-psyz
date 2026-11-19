@@ -91,7 +91,7 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
  * controller exchange once PadStartCom ran, more with a pad in port 2 and
  * for longer packets (VBLANK_HANDLER_CYCLES, LIBPAD_*: timing_profile.h). */
 
-static uint64_t last_blank_us; // emulated time of the latest blank
+static uint64_t last_blank_ns; // emulated time of the latest blank
 
 /* libpad clocks the packet of a controller that sends more than a digital
  * pad's halfword of buttons byte by byte (LIBPAD_HALFWORD_CYCLES). */
@@ -177,7 +177,7 @@ void Psyz_VSyncBlank(void) {
     // on the offline clock the blank's exact time: it runs there
     uint64_t blank_ns = Psyz_KernelNowNs();
     long debt = Psyz_KernelDebtClocks();
-    last_blank_us = blank_ns / 1000;
+    last_blank_ns = blank_ns;
     Psyz_CardBlankBegin();
     Psyz_GpuCrtcBlank();
     int pad_exchange =
@@ -251,11 +251,11 @@ static unsigned LineNs(void) {
 }
 
 static unsigned LinesSinceBlank(void) {
-    uint64_t now_us = Psyz_KernelNowUs();
-    if (now_us <= last_blank_us) {
+    uint64_t now_ns = Psyz_KernelNowNs();
+    if (now_ns <= last_blank_ns) {
         return 0;
     }
-    return (unsigned)((now_us - last_blank_us) * 1000 / LineNs());
+    return (unsigned)((now_ns - last_blank_ns) / LineNs());
 }
 
 /* On a real-time clock the blanks come from the wall clock, also while the

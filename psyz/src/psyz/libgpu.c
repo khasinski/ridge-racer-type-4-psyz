@@ -599,7 +599,7 @@ static void CrtcVerticalRange(unsigned y1, unsigned y2) {
  * (Psyz_AudioDisplayRangeChanged). */
 static unsigned crtc_display_y, crtc_mode, crtc_field, crtc_display_field;
 static int crtc_flip_pending; // the next field start after the last vblank
-static uint64_t crtc_flip_us; // its time
+static uint64_t crtc_flip_ns; // its time
 
 static void CrtcFieldStart(void) {
     crtc_flip_pending = 0;
@@ -632,8 +632,8 @@ int Psyz_GpuCrtcOddLine(unsigned line) {
 }
 
 void Psyz_GpuCrtcBlank(void) {
-    uint64_t now = Psyz_KernelNowUs();
-    if (crtc_flip_pending && now >= crtc_flip_us) {
+    uint64_t now = Psyz_KernelNowNs();
+    if (crtc_flip_pending && now >= crtc_flip_ns) {
         CrtcFieldStart();
     }
     crtc_display_field = Psyz_GpuCrtcInterlaced480() ? crtc_field ^ 1 : 0;
@@ -641,7 +641,7 @@ void Psyz_GpuCrtcBlank(void) {
     unsigned lines = crtc_y2 < total ? total - crtc_y2 : 0;
     uint64_t line_ns = total == 314 ? 64017 : 63563;
     crtc_flip_pending = 1;
-    crtc_flip_us = now + lines * line_ns / 1000;
+    crtc_flip_ns = now + lines * line_ns;
 }
 
 /* A GPU reset leaves the display mode of the console's region: a PAL
@@ -706,7 +706,7 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         break;
     case 8:
         cmd &= 0xFFFFFF;
-        if (crtc_flip_pending && Psyz_KernelNowUs() >= crtc_flip_us) {
+        if (crtc_flip_pending && Psyz_KernelNowNs() >= crtc_flip_ns) {
             CrtcFieldStart(); // the field started in the old mode
         }
         crtc_mode = cmd & 0xFF;

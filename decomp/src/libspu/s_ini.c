@@ -6,6 +6,7 @@
 #ifdef __psyz
 #include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
+void Psyz_CdSpuDmaInstalled(void);
 #endif
 
 static int D_800D0B80[] = {0x15117350, 0x0040B49C};
@@ -43,6 +44,7 @@ void _SpuInit(int bHot) {
 #ifdef __psyz
     if (bHot == 0) {
         Psyz_SpendCycles(SPU_INIT_CYCLES);
+        Psyz_CdSpuDmaInstalled();
     }
 #endif
     _spu_rev_flag = 0;

@@ -5,9 +5,13 @@ s32 _SpuIsInAllocateArea_(u32);
 extern s32 _spu_zerobuf[];
 
 #ifdef __psyz
+#include <stdint.h>
 void Psyz_SpendCycles(unsigned cycles);
-/* The SPU DMA rate (spu.c) and the setup of each 1 KiB chunk (_spu_t's
- * waits, the DMA event): SPU_DMA_CLOCKS_PER_BYTE, SPU_CLEAR_CHUNK_CYCLES. */
+uint64_t Psyz_KernelNowNs(void);
+void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged);
+/* The SPU DMA rate (spu.c), the setup of each chunk (_spu_t's waits, the
+ * DMA event) and the DMA interrupt's exception at its end:
+ * SPU_DMA_CLOCKS_PER_BYTE, SPU_CLEAR_*. */
 #include "../../../psyz/src/timing_profile.h"
 #endif
 long SpuClearReverbWorkArea(long rev_mode) {
@@ -53,9 +57,15 @@ long SpuClearReverbWorkArea(long rev_mode) {
         SPUW(trans_addr, dstAddr >> _spu_mem_mode_plus);
         Psyz_SpuMemWrite(
             SPUR(trans_addr) << _spu_mem_mode_plus, _spu_zerobuf, size);
-        // the chunk's DMA and its setup take their PS1 time
-        Psyz_SpendCycles(size * SPU_DMA_CLOCKS_PER_BYTE +
-                         SPU_CLEAR_CHUNK_CYCLES);
+        // the chunk's setup and DMA take their PS1 time, then the DMA
+        // interrupt's exception, in which a blank is served (DuckStation:
+        // one 327 clocks into it adds 606 clocks, a separate vblank
+        // exception 2387)
+        Psyz_SpendCycles(size * SPU_DMA_CLOCKS_PER_BYTE -
+                         size * SPU_CLEAR_DMA_SAVED_PER_64_BYTES / 64 +
+                         SPU_CLEAR_CHUNK_CYCLES - SPU_CLEAR_DMA_IRQ_CLOCKS);
+        Psyz_KernelDispatch(Psyz_KernelNowNs(), SPU_CLEAR_DMA_IRQ_CLOCKS,
+                            SPU_CLEAR_DMA_IRQ_CLOCKS);
         _spu_DmaDone();
 #else
         _spu_t(2, dstAddr);

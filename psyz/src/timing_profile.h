@@ -259,17 +259,27 @@ enum {
      * the 19 ds_compare scenarios libpad makes its exchange at every blank
      * up to 1179 clocks into a root counter's exception and at none from
      * 1207 (a ticking one's or not), the card driver takes its turn up to
-     * 1278 and at none from 1311 [field] */
-    BIOS_CHAIN_PAD_TEST_CLOCKS = 1190,
-    BIOS_CHAIN_CARD_TEST_CLOCKS = 1295,
+     * 1278 and at none from 1311 [field]. Those were the port's positions,
+     * with the boot putting the sequencer's timer 132 clocks early; on
+     * DuckStation's own positions (DUCKSTATION_DMA_TRACE IRQX entries and
+     * VBLANK ticks of the 25 scenarios, the timer now within 8 clocks of
+     * DuckStation's phase) libpad exchanges up to 1056 clocks in and at
+     * none from 1083, the card driver turns up to 1172 and at none from
+     * 1179 [trace] */
+    BIOS_CHAIN_PAD_TEST_CLOCKS = 1070,
+    BIOS_CHAIN_CARD_TEST_CLOCKS = 1176,
     /* A device's exception (the CD drive's) reaches those tests this much
      * sooner: the root counters' handlers, which deliver their event in a
      * counter's exception, only test theirs. On DuckStation a blank 845 to
      * 2899 clocks into a CD exception has neither libpad's exchange nor a
      * card driver turn, one 365 to 414 clocks into it both (the card
      * scenarios of tools/port/ds_compare.py, DSF_EXC, DSF_PADLOG,
-     * DSF_CARDPORT): the tests come between, here 637 and 496 [exc] */
-    BIOS_RCNT_CHAIN_CYCLES = 560 - 58,
+     * DSF_CARDPORT): the tests come between, here 637 and 496 [exc]. On
+     * DuckStation's positions (IRQX of the 25 scenarios' CD exceptions)
+     * libpad exchanges up to 523 clocks in and at none from 576, the card
+     * driver turns up to 648 and at none from 711: 520 and 496 sooner than
+     * in a root counter's [trace] */
+    BIOS_RCNT_CHAIN_CYCLES = 510,
     /* ... refit: on DuckStation a blank 337 clocks or less before the end
      * of a root counter's or the CD drive's exception raises its own
      * (libpad's exchange and the card driver's turn in it), one 595 or
@@ -292,8 +302,14 @@ enum {
      * 193 clocks before the end of one (the port's window: 2742 clocks
      * not ticking, 8663 ticking) and at none from 223 (ta-full, vs-full,
      * the 27 ds_compare scenarios; the timer's blank every 131 fields
-     * moves 33 clocks through it) [field] */
-    LIBETC_RCNT_DISPATCH_EXIT_CLOCKS = 210,
+     * moves 33 clocks through it) [field]; those were the port's
+     * positions with the timer 134 clocks early (BIOS_CHAIN_*_TEST_CLOCKS).
+     * With the timer at DuckStation's phase: DuckStation's vblank
+     * exception follows the root counter's at once for blanks up to 339
+     * clocks before its end (DUCKSTATION_DMA_TRACE IRQX, the 25 scenarios)
+     * and 330 here has the fewest decision differences (610 against 670
+     * with 210, 636 with 270, 612 with 350) [trace] */
+    LIBETC_RCNT_DISPATCH_EXIT_CLOCKS = 330,
 };
 
 /* ---- libpad (libetc.c) ---- */
@@ -378,16 +394,21 @@ enum {
      * of 54256 and 282848 bytes then wait 262 and 1096 lines, as on
      * DuckStation [field] 414793b. */
     SPU_DMA_CLOCKS_PER_BYTE = 8,
-    /* SpuClearReverbWorkArea: the setup of each 1 KiB chunk (_spu_t's
-     * waits, the DMA event) besides its DMA: its 97 chunks take 1.219M
-     * clocks in SsInit on the recompiler [mark] (the entry of the next
-     * function, as CD_CW_ISSUE_CYCLES); refit to SpuInit's 1,248,339 to
-     * _SsInit, the two vblanks within it included (ds_frames.py); 26 more
-     * on DuckStation's exact timing, whose vblanks there come after the
-     * chunks' DMA exceptions instead of inside them (the 96 chunks' DMA
-     * starts 1,203,793 clocks apart unmarked, 2549 more than on the
-     * recompiler: DUCKSTATION_DMA_TRACE). */
-    SPU_CLEAR_CHUNK_CYCLES = 4410 + 26,
+    /* SpuClearReverbWorkArea: each chunk's time besides its DMA, from
+     * one chunk's DMA interrupt to the next's (_spu_t's waits, the DMA
+     * event, the interrupt's exception); its 97 chunks (96 of 1 KiB, one
+     * of 64 bytes) take 1.222M clocks in SsInit on DuckStation's exact
+     * timing (DSF_MARKS SpuClearReverbWorkArea:ret: 1,221,696, the two
+     * vblanks within it included; DUCKSTATION_DMA_TRACE) [exc] */
+    SPU_CLEAR_CHUNK_CYCLES = 4528,
+    /* ... the chunk's DMA interrupt's exception (kernel, libspu's DMA
+     * handler and its event, WaitEvent's return), part of that, and its
+     * DMA's clocks below SPU_DMA_CLOCKS_PER_BYTE: on DuckStation's exact
+     * timing the 96 chunks of 1 KiB take 12640 clocks from interrupt to
+     * interrupt and the last one of 64 bytes 5035, the exception 4.6k
+     * (DSF_EXC, 4672 with the marks' own; DUCKSTATION_DMA_TRACE IRQX) [exc] */
+    SPU_CLEAR_DMA_IRQ_CLOCKS = 4580,
+    SPU_CLEAR_DMA_SAVED_PER_64_BYTES = 5,
     /* SpuInit (cold): _spu_init's resets and waits and SpuStart, 29.2k up
      * to SsInit's SpuClearReverbWorkArea [mark] */
     SPU_INIT_CYCLES = 29230,
@@ -679,14 +700,25 @@ enum {
     /* ... and once the chain is installed: the acknowledges' exceptions
      * 2798 clocks on DuckStation, 327 more than before it [exc] */
     CD_CW_ACK_CHAIN_CYCLES = 327,
-    CD_DONE_IRQ_CYCLES = 2120,
+    /* A command's completion (its second response) to the CD_sync(0)
+     * loop's return: on DuckStation's exact timing an Init's completion to
+     * the Demute's acknowledge 27695 clocks in SoundSystemInit's CdReset,
+     * 27660 in the boot's CdInit, before SpuInit (CD_cw's issue and its
+     * 25000 included; DSF_MARKS CD_sync:ret: the wait's return 2650 and
+     * 2608 clocks after the completion) [exc] [mark] */
+    CD_DONE_IRQ_CYCLES = 2222,
+    CD_DONE_IRQ_BOOT_SAVED_CYCLES = 42,
     /* CdRead's ending Pause: its completion's sync callback (restoring the
      * caller's) and the wait loop's return, more than CD_DONE_IRQ_CYCLES;
      * the Pause done to the next read's Setloc acknowledge of the boot's
      * directory reads on DuckStation (31143 clocks; the commands and
      * CD_SEARCH_* between them as charged) [exc] */
-    CD_READ_PAUSE_CALLBACK_CYCLES = 220,
+    CD_READ_PAUSE_CALLBACK_CYCLES = 160,
+    /* CD_init to its first CD_cw: 4681 clocks the boot's first call, 4617
+     * a later one's (SoundSystemInit's CdReset: its ResetCallback finds
+     * the callbacks set up) on DuckStation's exact timing [mark] */
     CD_INIT_CYCLES = 4680,
+    CD_INIT_AGAIN_CYCLES = 4617,
     /* CdReset(1)'s CD_initvol (the SPU volume writes and CdMix) after
      * CD_init's last acknowledge, to the caller's next call (SoundSystemInit:
      * DuckStation's Demute acknowledge to SsSetSerialAttr 3167 clocks, less
@@ -708,7 +740,12 @@ enum {
      * CD_CW_ACK_CYCLES and CD_CW_ACK_CHAIN_CYCLES,
      * CD_CONTROL_RETURN_CYCLES and CD_CONTROL_CYCLES [mark] (DSF_MARKS
      * CdRead2, CdDataCallback, CdReadyCallback, CdControl, CD_cw: the
-     * attract's and Versus's movie) */
+     * attract's and Versus's movie). Unmarked (DUCKSTATION_CD_TRACE) the
+     * Setmode's acknowledge to the ReadS's is 28637 clocks in the Versus
+     * movie, 77 less than the port's, so the movie's sectors come 72-85
+     * clocks late throughout (cdoff); taking the 77 out puts the opening
+     * movie's frames off from field 832 (the MDEC slices' model was fitted
+     * with the late sectors): TECH_DEBT F14 */
     CD_READ2_CYCLES = 3234 - 2620 - 327 - 150 - 73,
     /* CdRead's setup up to its first command, the call included: 397
      * clocks to its Setmode's CdControl on DuckStation, 492 to its ReadN's
@@ -736,6 +773,13 @@ enum {
     CD_SEARCH_DIR_CYCLES = 14047 - 845,
     CD_SEARCH_CMP_CYCLES = 747,
     CD_SEARCH_FOUND_CYCLES = 2699,
+    /* ... and a search in the directory already cached (CdAudioFindStreamFile's
+     * R4.STR at the boot): on DuckStation's exact timing its CdControlB's
+     * return to CdAudioInit's Setmode acknowledge 37342 clocks [trace]
+     * (DSF_MARKS: CdSearchFile:ret 8493 with its marks' stubs, its
+     * DS_searchdir 580, DS_cachefile 87 and the found name's return 3437
+     * after its compare), 2156 more than the compares' charges [mark] */
+    CD_SEARCH_CACHED_CYCLES = 2156,
     /* The MDEC decodes a block in 448 clocks (DuckStation's mdec.cpp: a
      * colour macroblock is 6 blocks, 2688) and starts a unit only once its
      * output FIFO is empty; the output DMA moves a 192-word macroblock in

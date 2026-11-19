@@ -831,6 +831,14 @@ static void ServiceLine(int line, uint64_t at_ns) {
     } else if (line != IRQ_VBLANK) {
         /* the same in another interrupt's exception (a device's) */
         uint64_t last = OpenExceptionLastNs(at_ns);
+        if (last) {
+            /* ... which it shares as the vblank's (DuckStation: the
+             * timer's tick 4.5k clocks into a stream sector's exception
+             * puts the next movie frame 6.1k clocks later, the port's
+             * separate exception 8.3k; Versus with two cards, vsync
+             * 1056) [trace] */
+            entry -= RCNT_IN_VBLANK_SAVED_CYCLES;
+        }
         if (last > line_at_ns) {
             line_at_ns = last;
         }

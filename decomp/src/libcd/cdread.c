@@ -42,7 +42,7 @@ static volatile int read_pause_irq_owed;
 static void read_pause_irq(void) {
     if (read_pause_irq_owed) {
         read_pause_irq_owed = 0;
-        Psyz_CdCpu(CD_DONE_IRQ_CYCLES + CD_READ_PAUSE_CALLBACK_CYCLES);
+        Psyz_CdCpu(Psyz_CdDoneIrqCycles() + CD_READ_PAUSE_CALLBACK_CYCLES);
     }
 }
 #endif

@@ -96,7 +96,7 @@ void Psyz_CardBlankBegin(void) {
 }
 
 static int card_is_instant(void);
-static uint64_t card_fields_us(unsigned fields);
+static uint64_t card_fields_ns(unsigned fields);
 
 /* BIOS card driver timing (measured on DuckStation with the SCPH-1001 BIOS
  * and Ridge Racer Type 4, PAL). After StartCARD the driver's vblank handler
@@ -170,7 +170,7 @@ static struct {
     int parse_port;   // a directory read, finished at the next vblank
     int raw_port;     // the raw command's port (-1: none)
     int raw_state;    // 0 none, 1 waiting, 2 transferred, 3 answered
-    uint64_t last_vblank_us;
+    uint64_t last_vblank_ns;
     CardRequest req[2];
 } card_drv = {0, 0, -1, -1, -1, 0, 0, {{0}}};
 
@@ -219,8 +219,8 @@ static void card_finish(int port, unsigned spec) {
     }
 }
 
-static uint64_t card_clocks_us(uint64_t clocks) {
-    return (clocks * 1000000 + 33868800 / 2) / 33868800;
+static uint64_t card_clocks_ns(uint64_t clocks) {
+    return (clocks * 1000000000 + 33868800 / 2) / 33868800;
 }
 
 static void card_sector_done(int port) {
@@ -255,7 +255,7 @@ void Psyz_CardVBlank(int turn) {
     if (!card_drv.running) {
         return;
     }
-    card_drv.last_vblank_us = Psyz_KernelNowUs();
+    card_drv.last_vblank_ns = Psyz_KernelNowNs();
     if (!turn) {
         return;
     }
@@ -324,8 +324,8 @@ void Psyz_CardVBlank(int turn) {
     } else if (r->sector && state != PSYZ_CARD_NONE) {
         r->transfers = 1; // busy until the card has answered the frame
         r->answering = 1;
-        Psyz_KernelPostAt(card_drv.last_vblank_us +
-                              card_clocks_us(CARD_SECTOR_CLOCKS),
+        Psyz_KernelPostAtNs(card_drv.last_vblank_ns +
+                              card_clocks_ns(CARD_SECTOR_CLOCKS),
                           port ? card_sector_done1 : card_sector_done0);
     } else {
         card_finish(port, card_result(r));
@@ -337,14 +337,14 @@ void Psyz_CardVBlank(int turn) {
  * does not raise them in a wait (real time, or no audio clock yet) gets the
  * driver's vblank after a field and a half. */
 static void card_spin(void) {
-    uint64_t before = Psyz_KernelNowUs();
+    uint64_t before = Psyz_KernelNowNs();
     Psyz_SpendTime(CARD_SPIN_NS);
-    uint64_t now = Psyz_KernelNowUs();
+    uint64_t now = Psyz_KernelNowNs();
     // half a field of slack: a PAL field of the clock can end a spin late
     if (now == before ||
-        now - card_drv.last_vblank_us > card_fields_us(1) * 3 / 2) {
+        now - card_drv.last_vblank_ns > card_fields_ns(1) * 3 / 2) {
         Psyz_CardVBlank(1);
-        card_drv.last_vblank_us = now;
+        card_drv.last_vblank_ns = now;
     }
 }
 
@@ -536,7 +536,7 @@ static void card_driver_reset(int running) {
     card_drv.parse_port = -1;
     card_drv.raw_port = -1;
     card_drv.raw_state = 0;
-    card_drv.last_vblank_us = Psyz_KernelNowUs();
+    card_drv.last_vblank_ns = Psyz_KernelNowNs();
 }
 
 /* InitCARD installs the BIOS card driver's handlers in the interrupt
@@ -660,14 +660,14 @@ static int card_is_instant(void) {
     return card_instant;
 }
 
-static uint64_t card_fields_us(unsigned fields) {
+static uint64_t card_fields_ns(unsigned fields) {
     /* PS1 field: 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks, the GPU
      * clock being 33.8688 MHz * 709379/451584 (PAL, 53.203425 MHz) or
      * * 715909/451584 (NTSC, 53.693175 MHz). */
     if (GetVideoMode() == MODE_PAL) {
-        return (fields * 3406ull * 314 * 1000000 + 26601712) / 53203425;
+        return (fields * 3406ull * 314 * 1000000000 + 26601712) / 53203425;
     }
-    return (fields * 3413ull * 263 * 1000000 + 26846587) / 53693175;
+    return (fields * 3413ull * 263 * 1000000000 + 26846587) / 53693175;
 }
 
 static int card_file_transfers(long bytes, int write) {
@@ -679,7 +679,7 @@ static void card_spend_fields(unsigned fields) {
         return;
     }
     for (; fields; fields--) { // one field at a time keeps ns within 32 bits
-        Psyz_SpendTime((unsigned)(card_fields_us(1) * 1000));
+        Psyz_SpendTime((unsigned)card_fields_ns(1));
     }
 }
 
@@ -705,12 +705,12 @@ void Psyz_CardFileTransfer(long chan, long bytes, int async, int write) {
         }
         return;
     }
-    uint64_t us = card_fields_us((unsigned)(transfers * CARD_FIELDS_PER_FRAME)) +
-                  card_clocks_us(CARD_SECTOR_CLOCKS);
+    uint64_t ns = card_fields_ns((unsigned)(transfers * CARD_FIELDS_PER_FRAME)) +
+                  card_clocks_ns(CARD_SECTOR_CLOCKS);
     if (async) {
-        Psyz_KernelPostAt(Psyz_KernelNowUs() + us, card_async_done);
+        Psyz_KernelPostAtNs(Psyz_KernelNowNs() + ns, card_async_done);
     } else {
-        Psyz_SpendTime((unsigned)(card_clocks_us(CARD_SECTOR_CLOCKS) * 1000));
+        Psyz_SpendTime((unsigned)card_clocks_ns(CARD_SECTOR_CLOCKS));
         card_spend_fields((unsigned)(transfers * CARD_FIELDS_PER_FRAME));
     }
 }
