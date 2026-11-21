@@ -427,6 +427,20 @@ static void ServiceStalls(uint64_t now_ns) {
     }
 }
 
+/* The stalls still due before end_ns, taken out of the ring and returned:
+ * a DMA interrupt's handler that starts the transfer (the GPU queue's) has
+ * them in its exception's own time. */
+unsigned Psyz_KernelTakeStallsBeforeNs(uint64_t end_ns) {
+    unsigned taken = 0;
+    while (stall_len && stalls[stall_head].at_ns < end_ns) {
+        NoteStall(stalls[stall_head].at_ns, stalls[stall_head].clocks);
+        taken += stalls[stall_head].clocks;
+        stall_head = (stall_head + 1) % STALLS_MAX;
+        stall_len--;
+    }
+    return taken;
+}
+
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks) {
     if (!UsesAudioClock() || !clocks) {
         return;

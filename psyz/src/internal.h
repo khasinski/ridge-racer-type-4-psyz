@@ -71,6 +71,7 @@ void Psyz_KernelPost(void (*fn)(void));
 // A callback has one deadline: posting it again moves it.
 void Psyz_KernelPostAt(uint64_t at_us, void (*fn)(void));
 void Psyz_KernelPostAtNs(uint64_t at_ns, void (*fn)(void));
+unsigned Psyz_KernelTakeStallsBeforeNs(uint64_t end_ns);
 void Psyz_KernelCancel(void (*fn)(void));
 
 /* Host-side state the SDK's initialisation resets, besides the PS1 state the

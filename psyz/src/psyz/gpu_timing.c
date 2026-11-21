@@ -380,11 +380,43 @@ uint64_t Psyz_GpuListStartNs(uint64_t now_ns, uint64_t dma_free_ns,
     return now_ns;
 }
 
+/* The list DMA's interrupt that starts a queued transfer (libgpu's DMA
+ * callback, GPU_QUEUE_CALLBACK_CYCLES) */
+static void QueueCallback(void) {}
+static int queue_nested; // waited for another exception's end
+static void QueueInterrupt(void) {
+    int device = 0;
+    uint64_t end = Psyz_KernelExceptionEndNs(&device);
+    if (end > Psyz_KernelNowNs()) {
+        // during another exception libetc's dispatcher takes it in that one
+        queue_nested = 1;
+        Psyz_KernelPostAtNs(end, QueueInterrupt);
+        return;
+    }
+    if (queue_nested) {
+        queue_nested = 0;
+        Psyz_KernelDeviceIrq(QueueCallback, 0, GPU_QUEUE_NESTED_CYCLES, 0);
+        return;
+    }
+    unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
+    // the queued transfer's DMA, which its callback starts, stalls the CPU
+    // in the exception
+    unsigned total = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain +
+                     GPU_QUEUE_CALLBACK_CYCLES +
+                     Psyz_KernelTakeStallsBeforeNs(g.dma_free_ns + 1);
+    Psyz_KernelDeviceIrq(QueueCallback, DEVICE_IRQ_TO_HANDLER_CYCLES,
+                         total - DEVICE_IRQ_TO_HANDLER_CYCLES,
+                         DMA_DISPATCH_EXIT_CLOCKS);
+}
+
 void Psyz_GpuTimingBegin(void) {
     if (!timing_on()) return;
     uint64_t now = now_ns();
     g.active = 1;
     int cpu_waits;
+    // queued behind a transfer still in progress: its end's interrupt
+    if (g.dma_free_ns > now)
+        Psyz_KernelPostAtNs(g.dma_free_ns, QueueInterrupt);
     g.dma_ns = Psyz_GpuListStartNs(now, g.dma_free_ns, g.gpu_end_ns, &cpu_waits);
     g.slice = 0;
     /* _addque2 polls for the idle GPU with the interrupts masked, then

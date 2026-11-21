@@ -164,6 +164,19 @@ void cb_data(void) {
     }
 }
 
+/* The PS1 takes the interrupts that come while CD_cw works and waits for
+ * an acknowledge (DuckStation: the list DMA's queue exception 734 clocks
+ * into CdRead, its ReadN written after it; a root counter's in the
+ * Setmode's wait): the commands are not issued under the lock, which
+ * would hold those interrupts to its end. */
+#ifdef __psyz
+#define CD_UNLOCK_FOR_COMMAND() CD_UNLOCK()
+#define CD_RELOCK_AFTER_COMMAND() CD_LOCK()
+#else
+#define CD_UNLOCK_FOR_COMMAND()
+#define CD_RELOCK_AFTER_COMMAND()
+#endif
+
 static int cd_read_retry_locked(int mode) {
     u_char param;
 
@@ -183,8 +196,11 @@ static int cd_read_retry_locked(int mode) {
     }
     if (mode) {
         puts("CdRead: retry...\n");
+        CD_UNLOCK_FOR_COMMAND();
         CdControl(CdlPause, NULL, NULL);
-        if (CdControl(CdlSetloc, (u_char*)CdLastPos(), NULL) == 0) {
+        int set = CdControl(CdlSetloc, (u_char*)CdLastPos(), NULL);
+        CD_RELOCK_AFTER_COMMAND();
+        if (set == 0) {
             ReadAttr.remaining = -1;
             return ReadAttr.remaining;
         }
@@ -192,7 +208,10 @@ static int cd_read_retry_locked(int mode) {
     CdFlush();
     param = ReadAttr.mode;
     if (param != CdMode() || mode) {
-        if (CdControl(CdlSetmode, &param, NULL) == 0) {
+        CD_UNLOCK_FOR_COMMAND();
+        int set = CdControl(CdlSetmode, &param, NULL);
+        CD_RELOCK_AFTER_COMMAND();
+        if (set == 0) {
             ReadAttr.remaining = -1;
             return ReadAttr.remaining;
         }
@@ -208,7 +227,9 @@ static int cd_read_retry_locked(int mode) {
         CdDataCallback(cb_data);
     }
     ReadAttr.cur_buf = ReadAttr.buf;
+    CD_UNLOCK_FOR_COMMAND();
     CdControlF(CdlReadN, NULL);
+    CD_RELOCK_AFTER_COMMAND();
     ReadAttr.remaining = ReadAttr.num_sectors;
     ReadAttr.start_time2 = VSync(-1);
 #ifdef __psyz

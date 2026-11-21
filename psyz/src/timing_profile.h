@@ -177,6 +177,21 @@ enum {
      * exchange and the card driver's turn in it), one 566 or more before
      * is taken there (attract movie, DSF_EXC, DSF_PADLOG) [exc] */
     DMA_DISPATCH_EXIT_CLOCKS = 480,
+    /* libgpu's DMA callback for a transfer queued behind another (a
+     * DrawOTag called while the list before it is still in its DMA): the
+     * list DMA's interrupt at that transfer's end, whose callback starts
+     * the queued one. On DuckStation an 8446-clock exception with the card
+     * driver's chain (the Extra Trial's and the Grand Prix's race and load
+     * frames with the secondary ordering table: DSF_EXC, DICR 0x84940000)
+     * at the end of the list before the queued one: the dispatch and the
+     * queued list's DMA, which stalls the CPU in it (704 empty nodes and
+     * a packet, 5642 clocks, gpu_timing.c's stalls), the callback's own
+     * code within the DMA's halts [exc] */
+    GPU_QUEUE_CALLBACK_CYCLES = 0,
+    /* ... raised during a root counter's exception it is served in it:
+     * 494 clocks more (15911 against 15417, the Grand Prix's race loads)
+     * [exc] */
+    GPU_QUEUE_NESTED_CYCLES = 494,
     /* The card driver's chain (InitCARD) on every exception from then on:
      * a non-ticking RCnt interrupt takes 2748 in the menus [exc] */
     BIOS_CARD_CHAIN_CYCLES = 374,
