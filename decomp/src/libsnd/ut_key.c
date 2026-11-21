@@ -5,6 +5,8 @@
  * sequencer tick, see libsnd_private.h). */
 void Psyz_KernelLockInterrupts(void);
 void Psyz_KernelUnlockInterrupts(void);
+#include "../../../psyz/src/timing_profile.h"
+void Psyz_SpendCycles(unsigned cycles);
 #define SsUtKeyOn SsUtKeyOn_Unlocked
 #define SsUtKeyOff SsUtKeyOff_Unlocked
 #endif
@@ -116,6 +118,15 @@ short SsUtKeyOn(short vabId, short prog, short tone, short note, short fine,
     Psyz_KernelLockInterrupts();
     ret = SsUtKeyOn_Unlocked(vabId, prog, tone, note, fine, voll, volr);
     Psyz_KernelUnlockInterrupts();
+    /* its own PS1 time, outside the lock: the ticks that come meanwhile
+     * run at their time (a charge under the lock would lengthen the ticks
+     * deferred over it). On the PS1 such a tick finds _snd_ev_flag set and
+     * returns at once (DuckStation, the Versus card screen's field 6800),
+     * which the port does not model yet (docs/TECH_DEBT.md F14 in the
+     * game's repository) */
+    if (ret >= 0) {
+        Psyz_SpendCycles(SS_UT_KEY_ON_CYCLES);
+    }
     return ret;
 }
 

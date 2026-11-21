@@ -243,8 +243,11 @@ enum {
     LIBPAD_EMPTY_PORT1_SAVED_CYCLES = 3782,
     /* Each halfword of a controller's packet past the first: libpad's
      * handler takes 22.0k clocks with a JogCon in port 1 (three halfwords)
-     * against 15.6k with a digital pad. [rec] ds_irqlog, menus */
-    LIBPAD_HALFWORD_CYCLES = 3200,
+     * against 15.6k with a digital pad. [rec] ds_irqlog, menus. On the
+     * exact timing a DualShock's vblank exception takes 26779-26854 clocks
+     * (25-clock SIO phase steps; DSF_EXC, the opening movie, its wait loop
+     * and the menus), 3200 gave 26703 [exc] */
+    LIBPAD_HALFWORD_CYCLES = 3253,
     /* A vblank that arrives while another interrupt's exception runs
      * (libapi.c Psyz_VSyncBlank): the BIOS priority chains test for it
      * this long after that interrupt, libpad's verifier (_padIsVsync) and
@@ -503,6 +506,12 @@ enum {
     SS_UT_CHANGE_PITCH_MISS_CYCLES = 85,
     SS_UT_SET_VVOL_CYCLES = 33,
     SS_UT_KEY_ON_V_CYCLES = 1620,
+    /* SsUtKeyOn (the menus' sound effects, a voice allocated): 2726 and
+     * 2812 clocks on DuckStation's exact timing, its two calls in the
+     * Versus card screen's field 6800 (DSF_MARKS SsUtKeyOn:ret, DSF_EXC,
+     * 12.5 a stub taken off), against the port's charges within it, 514
+     * and 588 [mark] */
+    SS_UT_KEY_ON_CYCLES = 2190,
     SS_SND_PLAY_CYCLES = 132,
     SS_GET_SEQ_DATA_CYCLES = 332,
     /* _SsVmKeyOn by its paths, fit to 1739 calls on DuckStation (Save
@@ -828,8 +837,12 @@ enum {
     MDEC_DMA_HALT_CLOCKS = 100,
     MDEC_UNIT_DMA_CLOCKS = 270, // a macroblock's DMA without a PS1 clock
     /* The decode's first macroblock reaches the FIFO this long after
-     * DecDCTin (2698 after the input DMA's start on DuckStation) [trace] */
-    MDEC_IN_TO_FIRST_UNIT_CLOCKS = 3028,
+     * DecDCTin: 2688 after the input DMA's start, which comes 135 clocks
+     * after the movie player's call (DUCKSTATION_DMA_TRACE with DSF_MARKS on
+     * its step and DecDCTin's caller: 181 from the step's entry, 7 of them
+     * the second mark's stub, the step's own 46 before the call; the
+     * opening movie's frames, 834-880) [trace] */
+    MDEC_IN_TO_FIRST_UNIT_CLOCKS = 135 + 2688,
 };
 
 #endif
