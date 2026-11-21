@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsSeqClose SsSeqClose_Unlocked
 #define SsSepClose SsSepClose_Unlocked
 #endif
@@ -45,15 +45,15 @@ void SsSepClose(short sep_access_num) { _SsClose(sep_access_num); }
 #ifdef __psyz
 #undef SsSeqClose
 void SsSeqClose(short seq_access_num) {
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     SsSeqClose_Unlocked(seq_access_num);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
 }
 
 #undef SsSepClose
 void SsSepClose(short sep_access_num) {
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     SsSepClose_Unlocked(sep_access_num);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
 }
 #endif

@@ -215,9 +215,10 @@ extern struct SeqStruct* _ss_score[32];
 #ifdef __psyz
 /* The sequencer tick runs on the timer thread; the public sound API holds
  * these so that, as on the PS1, the tick never runs in the middle of it
- * (psyz/src/psyz/kernel.c). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+ * (psyz/src/psyz/kernel.c). The call's CPU time is spent at their end, so
+ * the interrupts that come during it are not held back. */
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #endif
 
 #ifdef __psyz

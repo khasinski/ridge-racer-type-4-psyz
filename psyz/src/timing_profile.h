@@ -697,9 +697,16 @@ enum {
      * 496 clocks before the end of such a sector's exception (3029 clocks,
      * the race's XA stream) is taken in it (vs-full vsync 17367, ta-full,
      * the course scenarios), not in its own exception as within CdRead's
-     * tail; so are ones 186 to 318 before it, which the port's exit
-     * (LIBETC_DISPATCH_EXIT_CLOCKS) still leaves out [field] */
+     * tail; so are ones 186 to 318 before it [field] */
     CD_GETSECTOR_DMA_WORD_X16 = 17,
+    /* ... and such an exception's exit (libetc's last status read before
+     * its end): on DuckStation's exact timing libpad exchanges at the
+     * blanks 47 to 165 clocks before the end of one (10 in the 29
+     * ds_compare scenarios) and at none from 236 to 324 (7: Versus, the
+     * Extra Trial's race, the Grand Prix rules, the DUAL SHOCK's movie),
+     * where LIBETC_DISPATCH_EXIT_CLOCKS (330) had them; 333 to 411 before
+     * it goes either way (4 and 4: not the window's length) [field] */
+    CD_OWN_CALLBACK_EXIT_CLOCKS = 200,
     /* A read's ready callback that issues a command (CdRead's ending
      * Pause): CD_cw comes this long after the sector's exception, before
      * the card driver's chain is installed and BIOS_CARD_CHAIN_CYCLES later

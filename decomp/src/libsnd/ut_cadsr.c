@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsUtChangeADSR SsUtChangeADSR_Unlocked
 #endif
 
@@ -30,9 +30,9 @@ short SsUtChangeADSR(short voice, short vabId, short prog, short old_note,
                      unsigned short adsr1, unsigned short adsr2) {
     short ret;
 
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     ret = SsUtChangeADSR_Unlocked(voice, vabId, prog, old_note, adsr1, adsr2);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
     return ret;
 }
 #endif

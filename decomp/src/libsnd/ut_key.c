@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 #define SsUtKeyOn SsUtKeyOn_Unlocked
@@ -115,9 +115,9 @@ short SsUtKeyOn(short vabId, short prog, short tone, short note, short fine,
                 short voll, short volr) {
     short ret;
 
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     ret = SsUtKeyOn_Unlocked(vabId, prog, tone, note, fine, voll, volr);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
     /* its own PS1 time, outside the lock: the ticks that come meanwhile
      * run at their time (a charge under the lock would lengthen the ticks
      * deferred over it). On the PS1 such a tick finds _snd_ev_flag set and
@@ -134,9 +134,9 @@ short SsUtKeyOn(short vabId, short prog, short tone, short note, short fine,
 short SsUtKeyOff(short voice, short vabId, short prog, short tone, short note) {
     short ret;
 
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     ret = SsUtKeyOff_Unlocked(voice, vabId, prog, tone, note);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
     return ret;
 }
 #endif

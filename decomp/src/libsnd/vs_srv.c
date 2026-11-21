@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsSetReservedVoice SsSetReservedVoice_Unlocked
 #endif
 
@@ -25,9 +25,9 @@ char SsSetReservedVoice(char voices) {
 char SsSetReservedVoice(char voices) {
     char ret;
 
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     ret = SsSetReservedVoice_Unlocked(voices);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
     return ret;
 }
 #endif

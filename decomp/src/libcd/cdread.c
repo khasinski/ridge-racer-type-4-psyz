@@ -168,7 +168,8 @@ void cb_data(void) {
  * an acknowledge (DuckStation: the list DMA's queue exception 734 clocks
  * into CdRead, its ReadN written after it; a root counter's in the
  * Setmode's wait): the commands are not issued under the lock, which
- * would hold those interrupts to its end. */
+ * would hold those interrupts to its end, nor is CdRead's own CPU time
+ * spent under it. */
 #ifdef __psyz
 #define CD_UNLOCK_FOR_COMMAND() CD_UNLOCK()
 #define CD_RELOCK_AFTER_COMMAND() CD_LOCK()
@@ -218,7 +219,9 @@ static int cd_read_retry_locked(int mode) {
     }
 #ifdef __psyz
     else {
+        CD_UNLOCK_FOR_COMMAND();
         Psyz_CdCpu(CD_READ_KEEP_MODE_CYCLES);
+        CD_RELOCK_AFTER_COMMAND();
     }
 #endif
     ReadAttr.pos = CdPosToInt(CdLastPos());
@@ -233,7 +236,9 @@ static int cd_read_retry_locked(int mode) {
     ReadAttr.remaining = ReadAttr.num_sectors;
     ReadAttr.start_time2 = VSync(-1);
 #ifdef __psyz
+    CD_UNLOCK_FOR_COMMAND();
     Psyz_CdCpu(CD_READ_END_CYCLES);
+    CD_RELOCK_AFTER_COMMAND();
 #endif
     return ReadAttr.remaining;
 }

@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsSetMarkCallback SsSetMarkCallback_Unlocked
 #endif
 
@@ -26,8 +26,8 @@ void SsSetMarkCallback(
 #undef SsSetMarkCallback
 void SsSetMarkCallback(
     short access_num, short seq_num, SsMarkCallbackProc proc) {
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     SsSetMarkCallback_Unlocked(access_num, seq_num, proc);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
 }
 #endif

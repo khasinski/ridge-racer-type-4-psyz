@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsUtAutoPan SsUtAutoPan_Unlocked
 #endif
 
@@ -24,9 +24,9 @@ short SsUtAutoPan(
     short voice, short start_pan, short end_pan, short delta_time) {
     short ret;
 
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     ret = SsUtAutoPan_Unlocked(voice, start_pan, end_pan, delta_time);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
     return ret;
 }
 #endif

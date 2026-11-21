@@ -1858,10 +1858,14 @@ static void deliver_data_sector(void) {
                                   (int)spent - (int)CD_READ_CALLBACK_CLOCKS,
                                   -(int)CD_READ_CALLBACK_CLOCKS);
         /* its last DMA is its own CdGetSector's (the XA player's 32
-         * words), which ends the exception sooner than CdRead's 512 */
-        Psyz_KernelDispatchOpenTail(irq_ns,
-                                    (unsigned)getsector_last_words * CD_GETSECTOR_DMA_WORD_X16 / 16 +
-                                        CD_DATA_DMA_TAIL_CLOCKS - 544);
+         * words), which ends the exception sooner than CdRead's 512, and
+         * libetc's last look at the status comes CD_OWN_CALLBACK_EXIT_CLOCKS
+         * before its end */
+        unsigned tail = (unsigned)getsector_last_words * CD_GETSECTOR_DMA_WORD_X16 / 16 +
+                        CD_DATA_DMA_TAIL_CLOCKS - 544;
+        Psyz_KernelDispatchOwnExit(irq_ns, tail > CD_OWN_CALLBACK_EXIT_CLOCKS
+                                               ? tail
+                                               : CD_OWN_CALLBACK_EXIT_CLOCKS);
     }
     st_irq_called = 0;
     sector_callback_ns = 0;

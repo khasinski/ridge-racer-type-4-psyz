@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockInterrupts(void);
-void Psyz_KernelUnlockInterrupts(void);
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 #define SsSeqCalledTbyT SsSeqCalledTbyT_Unlocked
 #endif
 
@@ -62,7 +62,7 @@ void SsSeqCalledTbyT(void) {
 #include "../../../psyz/src/timing_profile.h"
 void Psyz_SpendCycles(unsigned cycles);
 void SsSeqCalledTbyT(void) {
-    Psyz_KernelLockInterrupts();
+    Psyz_KernelLockApi();
     unsigned own = SS_TICK_CYCLES;
     for (int i = 0; i < _snd_seq_s_max; i++) {
         if (_snd_openflag & (1u << i)) {
@@ -71,6 +71,6 @@ void SsSeqCalledTbyT(void) {
     }
     SsSeqCalledTbyT_Unlocked();
     Psyz_SpendCycles(own);
-    Psyz_KernelUnlockInterrupts();
+    Psyz_KernelUnlockApi();
 }
 #endif

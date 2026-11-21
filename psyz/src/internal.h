@@ -226,6 +226,9 @@ void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt);
 /* The device dispatch at at_ns ends with a DMA of this many clocks before
  * its last 23 (a blank in it is not hidden). */
 void Psyz_KernelDispatchOpenTail(uint64_t at_ns, unsigned open_tail);
+/* ... ends with its own exit: a blank in its last `exit` clocks is not
+ * hidden, in place of the caller's exit and the open tail. */
+void Psyz_KernelDispatchOwnExit(uint64_t at_ns, unsigned exit);
 // The CPU stalls `clocks` at at_ns (a DMA moving data): owed to the main
 // thread from then on, like a handler's time. Offline clock only.
 void Psyz_KernelStallAt(uint64_t at_ns, unsigned clocks);
@@ -290,6 +293,9 @@ void Psyz_CardSyncTransfer(long chan);
 void Psyz_KernelPoll(void);
 void Psyz_KernelLockInterrupts(void);
 void Psyz_KernelUnlockInterrupts(void);
+/* ... for an API the PS1 runs unmasked: its CPU time spent at the end */
+void Psyz_KernelLockApi(void);
+void Psyz_KernelUnlockApi(void);
 
 // Subpixel GTE->GPU coordinate cache for optional geometry correction.
 /* Bounded diagnostic only; no cache entries, addresses or rendering policy altered. */

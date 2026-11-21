@@ -142,6 +142,8 @@ static void* kernel_lock;
  * does not synchronize this shared owner with the IRQ thread. */
 static AtomicTime lock_owner;
 static int lock_depth;
+static int api_outer;     // Psyz_KernelLockApi: the outermost lock, main thread
+static unsigned api_owed; // ... the CPU time charged under it so far
 static int in_critical_section;
 static int in_interrupt;
 
@@ -499,6 +501,10 @@ void Psyz_SpendCycles(unsigned cycles) {
         Psyz_KernelInterruptCycles(cycles);
         return;
     }
+    if (api_outer && OwnsKernel() && !in_critical_section) {
+        api_owed += cycles; // Psyz_KernelLockApi: at the lock's end
+        return;
+    }
     /* The main thread's work, also while it holds the kernel lock (a
      * library's section the interrupts must not enter, a critical
      * section): the interrupts that come wait for its end. */
@@ -525,6 +531,54 @@ static void KernelInit(void) {
 
 static int OwnsKernel(void) { return AtomicTimeLoad(&lock_owner) == Psyz_OsThreadSelf(); }
 
+/* PSYZ_LOCK_TRACE=1: a kernel deadline (root counter, device interrupt,
+ * posted callback) the main thread's clock passed while it held the kernel
+ * lock outside a handler, and so deferred to the lock's end, with the site
+ * that took the lock. */
+#if defined(__APPLE__) || defined(__linux__)
+#include <dlfcn.h>
+#define LOCK_TRACE_DLADDR 1
+#endif
+#include <stdio.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#define LOCK_CALLER() _ReturnAddress()
+#define LOCK_NOINLINE __declspec(noinline)
+#else
+#define LOCK_CALLER() __builtin_return_address(0)
+#define LOCK_NOINLINE __attribute__((noinline))
+#endif
+static void* lock_site;
+static uint64_t lock_deferred_ns; // first deadline passed under the lock
+static int LockTraceOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = getenv("PSYZ_LOCK_TRACE");
+        on = v && *v == '1';
+    }
+    return on;
+}
+static void LockTraceSite(void* site) {
+    if (LockTraceOn() && lock_depth == 0) lock_site = site;
+}
+static void LockTraceEnd(void) {
+    if (!lock_deferred_ns) return;
+    uint64_t now = AtomicTimeLoad(&cpu_ns);
+    const char* name = "?";
+    uintptr_t off = (uintptr_t)lock_site;
+#ifdef LOCK_TRACE_DLADDR
+    Dl_info info;
+    if (lock_site && dladdr(lock_site, &info) && info.dli_sname) {
+        name = info.dli_sname;
+        off = (uintptr_t)lock_site - (uintptr_t)info.dli_saddr;
+    }
+#endif
+    fprintf(stderr, "lock deferred %llu clocks at %llu by %s+0x%lx%s\n",
+            (unsigned long long)Psyz_NsToClocks(now - lock_deferred_ns),
+            (unsigned long long)Psyz_NsToClocks(lock_deferred_ns), name,
+            (unsigned long)off, in_critical_section ? " (critical)" : "");
+    lock_deferred_ns = 0;
+}
+
 static void KernelLock(void) {
     uintptr_t self = Psyz_OsThreadSelf();
     KernelInit();
@@ -541,6 +595,7 @@ static void KernelUnlock(void) {
     if (--lock_depth > 0) {
         return;
     }
+    if (lock_deferred_ns && !in_interrupt) LockTraceEnd();
     AtomicTimeStore(&lock_owner, 0);
     Psyz_OsUnlock(kernel_lock);
 }
@@ -586,6 +641,8 @@ static struct {
     unsigned cycles;
     int device;         // a device model's interrupt (Psyz_KernelDispatch)
     unsigned open_tail; // its last clocks, where a blank is not hidden
+    unsigned own_exit;  // when set: those last clocks, in place of the exit
+                        // and the open tail (Psyz_KernelDispatchOwnExit)
     unsigned exit; // libetc's last status read this long before its end (0:
                    // the caller's)
 } dispatches[DISPATCH_RING];
@@ -824,6 +881,7 @@ static void RecordDispatchExit(uint64_t at_ns, unsigned cycles, int device,
     dispatches[dispatch_next].cycles = cycles;
     dispatches[dispatch_next].device = device;
     dispatches[dispatch_next].open_tail = 0;
+    dispatches[dispatch_next].own_exit = 0;
     dispatches[dispatch_next].exit = exit;
     dispatch_next = (dispatch_next + 1) % DISPATCH_RING;
     dispatch_seen = 1;
@@ -1002,6 +1060,20 @@ void Psyz_KernelDispatchOpenTail(uint64_t at_ns, unsigned open_tail) {
     }
 }
 
+void Psyz_KernelDispatchOwnExit(uint64_t at_ns, unsigned exit) {
+    if (!UsesAudioClock() || !dispatch_seen) {
+        return;
+    }
+    at_ns = Psyz_KernelUnmaskedNs(at_ns);
+    for (unsigned k = 1; k <= DISPATCH_RING; k++) {
+        unsigned i = (dispatch_next + DISPATCH_RING - k) % DISPATCH_RING;
+        if (dispatches[i].ns == at_ns && dispatches[i].device) {
+            dispatches[i].own_exit = exit;
+            return;
+        }
+    }
+}
+
 void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt) {
     if (!UsesAudioClock() || !dispatch_seen) {
         return;
@@ -1028,6 +1100,7 @@ void Psyz_KernelResizeDispatch(uint64_t at_ns, int clocks, int debt) {
             // work after the sector's DMA (a stream sector's copy into the
             // ring): the DMA no longer ends the exception
             dispatches[i].open_tail = 0;
+            dispatches[i].own_exit = 0;
         }
         AtomicAdd(&interrupt_debt, (long)debt);
         if (exception_end_ns == old_end) { // the latest: it ends sooner too
@@ -1154,6 +1227,9 @@ int Psyz_KernelBlankInDispatch(uint64_t blank_ns, unsigned test_clocks,
         if (dispatches[i].open_tail > exit) {
             exit = dispatches[i].open_tail;
         }
+        if (dispatches[i].own_exit) {
+            exit = dispatches[i].own_exit;
+        }
         if (clocks > test && exit < dispatches[i].cycles &&
             clocks <= dispatches[i].cycles - exit) {
             return 1;
@@ -1187,6 +1263,9 @@ int Psyz_KernelBlankMargin(uint64_t blank_ns, unsigned test_clocks,
         test = TestWithStalls(dispatches[i].ns, test);
         if (dispatches[i].open_tail > exit) {
             exit = dispatches[i].open_tail;
+        }
+        if (dispatches[i].own_exit) {
+            exit = dispatches[i].own_exit;
         }
         long c = (long)clocks;
         long d1 = labs(c - (long)test);
@@ -1289,14 +1368,48 @@ void Psyz_KernelVBlank(void) {
  * _snd_ev_flag) holds the kernel lock: the interrupt callbacks, which run
  * under it on the timer thread, wait instead of running concurrently. A PS1
  * interrupt could not run in parallel, nor see the state half updated. */
-void Psyz_KernelLockInterrupts(void) { KernelLock(); }
+LOCK_NOINLINE void Psyz_KernelLockInterrupts(void) {
+    if (!OwnsKernel()) LockTraceSite(LOCK_CALLER());
+    KernelLock();
+}
 
 void Psyz_KernelUnlockInterrupts(void) { KernelUnlock(); }
 
-void PS1_EnterCriticalSection(void) {
+/* A library's API that the PS1 runs with the interrupts enabled (libsnd's,
+ * which only raises _snd_ev_flag against its sequencer tick): the lock keeps
+ * the port's handlers out of its state, but the CPU time the call spends
+ * (Psyz_SpendCycles) is spent at the lock's end, so that the interrupts
+ * that come meanwhile run at their own time, as on the PS1, instead of
+ * waiting for the call's end (PSYZ_LOCK_TRACE: the root counters' and the
+ * CD drive's interrupts held up to 1.6k clocks by SsUtChangePitch,
+ * SsUtKeyOnV, SsUtSetVVol and a key-on's voice allocation; PsyQ's libsnd
+ * masks none). Inside a handler or a critical section the time is spent
+ * where it is charged. */
+LOCK_NOINLINE void Psyz_KernelLockApi(void) {
+    if (!OwnsKernel()) LockTraceSite(LOCK_CALLER());
+    KernelLock();
+    if (lock_depth == 1 && !in_interrupt && !in_critical_section) {
+        api_outer = 1;
+    }
+}
+
+void Psyz_KernelUnlockApi(void) {
+    if (lock_depth == 1 && api_outer) {
+        unsigned owed = api_owed;
+        api_outer = 0;
+        api_owed = 0;
+        KernelUnlock();
+        Psyz_SpendCycles(owed);
+        return;
+    }
+    KernelUnlock();
+}
+
+LOCK_NOINLINE void PS1_EnterCriticalSection(void) {
     if (OwnsKernel()) {
         return; // already in one, or inside an interrupt handler
     }
+    LockTraceSite(LOCK_CALLER());
     KernelLock();
     in_critical_section = 1;
 }
@@ -1710,6 +1823,11 @@ void Psyz_KernelAdvanceToNs(uint64_t at_ns) {
         }
         uint64_t blank = Psyz_AudioNextBlankNs();
         uint64_t at = next < blank ? next : blank;
+        if (LockTraceOn() && OwnsKernel() && !in_interrupt &&
+            !lock_deferred_ns && AtomicLoad(&irq_thread_state)) {
+            uint64_t d = AtomicTimeLoad(&poll_deadline_ns);
+            if (d <= at_ns && d >= now) lock_deferred_ns = d;
+        }
         if (at > at_ns) {
             break;
         }
