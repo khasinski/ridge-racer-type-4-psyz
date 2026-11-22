@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE // dladdr and Dl_info for PSYZ_LOCK_TRACE
+#endif
 // PS1 kernel events, critical sections, root counters and the interrupt
 // controller behind libetc's callbacks.
 #ifdef __PSP__
