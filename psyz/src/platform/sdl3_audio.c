@@ -308,7 +308,8 @@ uint64_t Psyz_AudioNextBlankNs(void) {
         return UINT64_MAX;
     if (!field_open)
         OpenField();
-    return next_blank.ns;
+    // on the offline clock as DuckStation's CRTC takes it (libcd.c)
+    return Psyz_KernelOfflineClock() ? Psyz_VSyncBlankNs(next_blank.ns) : next_blank.ns;
 }
 
 /* A native busy wait spends emulated time as a PS1 spinning on a device

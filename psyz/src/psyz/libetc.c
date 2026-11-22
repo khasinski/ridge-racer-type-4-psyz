@@ -124,7 +124,8 @@ static void DispatchDma(unsigned channel, void (*callback)(void)) {
     unsigned after = total - before;
     if (dma_irq_host) { // raised during another exception: libetc's reread
         before = dma_irq_host == 2 ? DMA_AFTER_DEVICE_TO_HANDLER_CYCLES
-                                   : DMA_AFTER_LINE_TO_HANDLER_CYCLES;
+                 : dma_irq_host == 3 ? 0 // in a stream sector's, at its end (libpress.c)
+                                     : DMA_AFTER_LINE_TO_HANDLER_CYCLES;
         after = DMA_NESTED_RETURN_CYCLES;
     }
     if (Psyz_MdecTrace()) {

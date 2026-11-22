@@ -19,6 +19,7 @@ static struct {
     int error;
     int out_pending;   // an output transfer is under way (CHCR busy)
     uint64_t out_ns;   // its interrupt's time, once its last block is out
+    int out_known;     // ... known (its last unit's transfer has run)
 } mdec;
 
 /* The decoder and its output DMA unit by unit, as DuckStation runs them
@@ -91,8 +92,17 @@ static int out_host;
  * way and starts its output where the console's comes (out_shift_clocks:
  * earlier, or later where the exception's end comes before it). */
 static uint64_t clocks_to_ns(uint64_t clocks);
+static uint64_t unit_clocks(void);
 static uint64_t ns_to_clocks(uint64_t ns);
 static int64_t out_shift_clocks; // clocks the output comes before the callback's
+/* A stream sector's exception (libcd.c StCdInterrupt) libetc's dispatcher
+ * has not left yet takes the interrupt in it, after the sector's handlers:
+ * on DuckStation the callback's DecDCTout comes ST_IN_SECTOR_*_OUT_CLOCKS
+ * from the sector's exception (it copied the sector, the output DMA
+ * having ended before its look at it), or after the interrupt (it left
+ * the sector for the callback, which copies it first). The port runs the
+ * callback at the exception's end and starts its output there (out_at). */
+static uint64_t out_at_clocks;
 static void out_done(void) {
     int device = 0;
     uint64_t end = Psyz_KernelExceptionEndNs(&device);
@@ -101,6 +111,18 @@ static void out_done(void) {
         int rcnt = 0;
         uint64_t start = Psyz_KernelExceptionStartNs(&rcnt);
         out_shift_clocks = 0;
+        out_at_clocks = 0;
+        int sector = device ? Psyz_CdStreamSectorException(start) : 0;
+        if (sector && now + clocks_to_ns(LIBETC_DISPATCH_EXIT_CLOCKS) < end) {
+            uint64_t in = ns_to_clocks(now) - ns_to_clocks(start);
+            out_at_clocks = sector == 2 ? ns_to_clocks(now) + ST_IN_SECTOR_DEFERRED_OUT_CLOCKS
+                            : ns_to_clocks(start) + (in < ST_IN_SECTOR_STALL_READY_CLOCKS
+                                                         ? ST_IN_SECTOR_STALLED_OUT_CLOCKS
+                                                         : ST_IN_SECTOR_OUT_CLOCKS);
+            out_host = 3;
+            Psyz_KernelPostAtNs(end, out_done);
+            return;
+        }
         if (rcnt && !device) {
             static const unsigned look[] = {DMA_RCNT_FIRST_LOOK_CLOCKS,
                                             DMA_RCNT_SECOND_LOOK_CLOCKS,
@@ -126,15 +148,34 @@ static void out_done(void) {
         return;
     }
     mdec.out_pending = 0;
+    mdec.out_known = 0;
     int host = out_host;
     out_host = 0;
     Psyz_DmaIrqComplete(1, host);
     out_shift_clocks = 0; // its callback output nothing
+    out_at_clocks = 0;
 }
 
 int Psyz_MdecOutBusy(void) {
     Psyz_KernelLockInterrupts();
     int busy = mdec.out_pending;
+    Psyz_KernelUnlockInterrupts();
+    return busy;
+}
+
+/* Whether the output DMA is still under way at `at_ns`: by its interrupt's
+ * time, or while its last unit is not out yet by the decoder's state (each
+ * unit left a decode and its DMA). */
+int Psyz_MdecOutBusyAt(uint64_t at_ns) {
+    Psyz_KernelLockInterrupts();
+    int busy = mdec.out_pending;
+    if (busy && mdec.out_known) {
+        busy = mdec.out_ns > at_ns;
+    } else if (busy && mdp.out_units && mdp.step) {
+        uint64_t left = (uint64_t)(mdp.out_units - 1) * (unit_clocks() + MDEC_UNIT_DMA_CLOCKS) +
+                        (mdp.step == 1 ? MDEC_UNIT_DMA_CLOCKS : (uint64_t)mdp.blocks * MDEC_DMA_BLOCK_CLOCKS);
+        busy = clocks_to_ns(mdp.due + left) > at_ns;
+    }
     Psyz_KernelUnlockInterrupts();
     return busy;
 }
@@ -145,7 +186,9 @@ static void cancel_out(void) {
     if (mdec.out_pending) {
         Psyz_KernelCancel(out_done);
         mdec.out_pending = 0;
+        mdec.out_known = 0;
         out_host = 0;
+        out_at_clocks = 0;
     }
     mdp.out_units = 0;
 }
@@ -179,6 +222,7 @@ static void pipe_post(int step, uint64_t due) {
 // the transfer's last block is out: its interrupt
 static void out_irq_at(uint64_t clocks) {
     mdec.out_ns = clocks_to_ns(clocks);
+    mdec.out_known = 1;
     if (Psyz_MdecTrace()) {
         fprintf(stderr, "mdec ready %llu clocks\n", (unsigned long long)clocks);
     }
@@ -534,8 +578,10 @@ static void MDEC_out_locked(void* buf, int size) {
     unsigned units = (unsigned)(((uint64_t)size * 4 + unit_bytes() - 1) / unit_bytes());
     // the CHCR write: where the CPU has got to, a callback's handler time
     // included, less what a root counter's early look saves (out_done)
-    uint64_t start = (uint64_t)((int64_t)Psyz_EmulatedClocks() - out_shift_clocks);
+    uint64_t start = out_at_clocks ? out_at_clocks
+                                   : (uint64_t)((int64_t)Psyz_EmulatedClocks() - out_shift_clocks);
     out_shift_clocks = 0;
+    out_at_clocks = 0;
     if (Psyz_MdecTrace()) {
         fprintf(stderr, "mdec out %d words at %llu clocks, unit %s\n", size,
                 (unsigned long long)start, mdp.full ? "waiting" : "decoding");
@@ -549,6 +595,7 @@ static void MDEC_out_locked(void* buf, int size) {
         // no PS1 clock (or no decode under way): the units' nominal time
         mdec.out_ns = Psyz_KernelNowNs() +
                       clocks_to_ns((uint64_t)units * (unit_clocks() + MDEC_UNIT_DMA_CLOCKS));
+        mdec.out_known = 1;
         Psyz_KernelPostAtNs(mdec.out_ns, out_done);
         return;
     }

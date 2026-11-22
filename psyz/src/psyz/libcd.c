@@ -554,6 +554,17 @@ static uint64_t drive_seek_ticks(int from, int to) {
 
 static uint64_t drive_now(void) { return Psyz_KernelNowNs(); }
 
+/* The time the drive's interrupts are served at: on the offline clock
+ * DRIVE_EARLY_NS on, as their timers are posted that early: they come at
+ * whole clocks on DuckStation, which the offline clock's ns (the CPU's
+ * position, the commands' times) can round a few ns either way, and are
+ * taken at the instruction that starts at or after them (spend_chunks) */
+#define DRIVE_EARLY_NS 10
+static int drive_is_instant(void);
+static uint64_t drive_due_now(void) {
+    return Psyz_KernelNowNs() + (!drive_is_instant() && Psyz_KernelOfflineClock() ? DRIVE_EARLY_NS : 0);
+}
+
 // Mechanical delays count from the acknowledge.
 static uint64_t drive_ack_ns(u_char com) {
     return ticks_ns(com == CdlReset ? DRIVE_INIT_ACK_TICKS : DRIVE_ACK_TICKS);
@@ -661,6 +672,257 @@ static void drive_wait_done(uint64_t done_ns) {
     }
     drive_poll_until(done_ns);
     drive_cpu(Psyz_CdDoneIrqCycles());
+}
+
+/* ---- LIBCD's VSync(-1) polling loops on DuckStation's clock ----
+ *
+ * LIBCD's waits (CD_cw's for an acknowledge, CD_sync(0)'s for a completion,
+ * CdReadSync's, CdReady's) are loops whose every turn calls VSync(-1) for
+ * their timeout and then looks at a flag the drive's interrupt handler
+ * sets: they end at the first look after the interrupt's exception, so on
+ * the console their ends are quantized by the turns, not a fixed time after
+ * the interrupt. VSync(-1) reads GPUSTAT, then root counter 1 (hblank-
+ * clocked) twice, 3 and 15 clocks after it, and repeats the pair (18 clocks)
+ * while they differ; it returns 72 clocks after the GPUSTAT read. On
+ * DuckStation (gpu.cpp IsCRTCScanlinePending, timers.cpp ReadRegister) a
+ * counter read brings the CRTC up to date only once a line's end has passed
+ * since it last was, so the value changes at the first read after a line's
+ * end: the pair repeats exactly when a line ends after its first read and
+ * by its second (DUCKSTATION_IOREAD_TRACE: 230383 read pairs of the boot,
+ * none against): when DuckStation's scanline (ds_line) differs.
+ * An exception between the two reads (a vblank's, a CD interrupt's) makes
+ * the pair span it, which nearly always repeats it. */
+/* The CPU's position as DuckStation's system tick (the nearest clock: the
+ * offline clock keeps ns within one of it). */
+static uint64_t ds_tick(void) {
+    uint64_t ns = Psyz_KernelNowNs();
+    uint64_t clocks = ns / 1000000000u * 33868800u +
+                      (ns % 1000000000u * 33868800u + 500000000u) / 1000000000u;
+    return clocks + VSYNC_DS_ORIGIN_TICKS;
+}
+
+/* DuckStation's scanline at a system tick: its GPU ticks (system ticks x
+ * 709379 / 451584, gpu.cpp SystemTicksToCRTCTicks) from power-on, 3406 a
+ * line (DUCKSTATION_IOREAD_TRACE: every VSync(-1) read pair of the
+ * options boot, 479394, repeats exactly when this changes) */
+static uint64_t ds_gpu(uint64_t tick) { return tick * 709379u / 451584u; }
+static uint64_t ds_line(uint64_t tick) { return ds_gpu(tick) / 3406u; }
+
+/* DuckStation's CRTC: a GPUSTAT or a root counter 1 read updates it when a
+ * line has ended since it last was (gpu.cpp IsCRTCScanlinePending), and
+ * that update schedules its next blank from the update's sub-tick remainder
+ * (UpdateCRTCTickEvent: CRTCTicksToSystemTicks adds it, so the blank comes
+ * at ceil((G x 451584 + 2 x remainder) / 709379) for the blank line's GPU
+ * tick G); a read past that line's start begins the blank itself. Every
+ * blank of the boot's loops on DuckStation's exact timing comes there
+ * (CRTCL, VBLANK, IRQX). The blank's own update is one too. */
+static uint64_t crtc_sync_tick;
+static void crtc_read(uint64_t tick) {
+    if (ds_line(tick) != ds_line(crtc_sync_tick)) {
+        crtc_sync_tick = tick;
+    }
+}
+
+/* The port's blank at `grid_ns` (the exact field grid) as DuckStation takes
+ * it (a ns early: the offline clock's ns may round the clock down). */
+uint64_t Psyz_VSyncBlankNs(uint64_t grid_ns) {
+    if (drive_is_instant() || !Psyz_KernelOfflineClock() || !crtc_sync_tick) {
+        return grid_ns;
+    }
+    uint64_t tick = Psyz_NsToClocks(grid_ns) + 1 + VSYNC_DS_ORIGIN_TICKS;
+    uint64_t g = ds_gpu(tick) / 3406u * 3406u; // the blank line's start
+    uint64_t at;
+    if (ds_gpu(crtc_sync_tick) >= g) {
+        at = crtc_sync_tick;
+    } else {
+        uint64_t rem = crtc_sync_tick * 709379u % 451584u;
+        at = (g * 451584u + 2 * rem + 709378u) / 709379u;
+    }
+    if (at <= VSYNC_DS_ORIGIN_TICKS) {
+        return grid_ns;
+    }
+    uint64_t ns = Psyz_ClocksToNs(at - VSYNC_DS_ORIGIN_TICKS);
+    return ns > DRIVE_EARLY_NS ? ns - DRIVE_EARLY_NS : ns;
+}
+
+void Psyz_VSyncBlankTaken(void) {
+    if (crtc_sync_tick) {
+        crtc_sync_tick = ds_tick();
+    }
+}
+
+static int vsync_trace(void) {
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("PSYZ_VSYNC_TRACE") != NULL;
+    }
+    return trace;
+}
+
+/* LIBCD's code as DuckStation runs it, instruction by instruction: an
+ * interrupt is taken at the start of the first instruction at or after it
+ * comes (the exception's time spent there, Psyz_SpendCycles), so one that
+ * comes during a load (7 clocks) waits for its end; taken at a branch's
+ * delay slot it returns to the branch, a clock more. A chunk >= 2 is one
+ * instruction's clocks, < 0 that many one-clock instructions (spent at once
+ * unless an interrupt is due among them), 0 a one-clock delay slot [trace]
+ * (DUCKSTATION_PC_TRACE, IRQX). */
+/* ... the start of the instruction after the one being spent, where an
+ * interrupt that comes during it is taken (0 outside these spends) */
+static uint64_t insn_end_ns;
+static uint64_t dispatch_ns(uint64_t irq_ns) {
+    return insn_end_ns > irq_ns ? insn_end_ns : irq_ns;
+}
+
+static void spend_insn(unsigned clocks) {
+    insn_end_ns = Psyz_KernelNowNs() + ((uint64_t)clocks * 1000000000u + 33868799u) / 33868800u;
+    drive_cpu(clocks);
+    insn_end_ns = 0;
+}
+
+static unsigned spend_ones(unsigned n) {
+    unsigned long taken = Psyz_KernelExceptionCount();
+    while (n) {
+        uint64_t now = Psyz_KernelNowNs();
+        uint64_t next = Psyz_KernelNextEventNs();
+        unsigned k = n;
+        if (next > now && next < now + (uint64_t)n * 1000000000u / 33868800u) {
+            // to the first instruction that starts at or after it
+            k = (unsigned)(((next - now) * 33868800u + 999999999u) / 1000000000u);
+            k = k < 1 ? 1 : k > n ? n : k;
+        }
+        taken = Psyz_KernelExceptionCount();
+        spend_insn(k);
+        n -= k;
+    }
+    return Psyz_KernelExceptionCount() != taken; // at the last one's end
+}
+
+static void spend_chunks(const signed char* c, unsigned n) {
+    for (unsigned i = 0; i < n; i++) {
+        int at_end;
+        if (c[i] > 0) {
+            unsigned long taken = Psyz_KernelExceptionCount();
+            spend_insn((unsigned)c[i]);
+            at_end = Psyz_KernelExceptionCount() != taken;
+        } else {
+            at_end = spend_ones(c[i] ? (unsigned)-c[i] : 1);
+        }
+        if (at_end && i + 1 < n && c[i + 1] == 0) {
+            drive_cpu(1); // taken at the delay slot: the branch again
+        }
+    }
+}
+void Psyz_CdSpendChunks(const signed char* c, unsigned n) { spend_chunks(c, n); }
+
+#define SPEND(...)                                                                 \
+    do {                                                                           \
+        static const signed char chunks_[] = {__VA_ARGS__};                        \
+        spend_chunks(chunks_, sizeof(chunks_));                                    \
+    } while (0)
+
+/* VSync(-1) from the start of its GPUSTAT read (the read a clock in) to its
+ * return (73 clocks, 18 more a repeat); `ra` is the call's return address
+ * in the PAL executable, which DUCKSTATION_IOREAD_TRACE logs with each read
+ * (PSYZ_VSYNC_TRACE: the GPUSTAT read's clock, the call). The counter's
+ * reads a clock into their instructions, 3 and 15 clocks after GPUSTAT's. */
+static void vsync_query(unsigned ra) {
+    if (drive_is_instant() || !Psyz_KernelOfflineClock()) {
+        return;
+    }
+    if (vsync_trace()) {
+        fprintf(stderr, "vsr %" PRIu64 " %08x\n", ds_tick() + 1 - VSYNC_DS_ORIGIN_TICKS, ra);
+    }
+    crtc_read(ds_tick() + 1);
+    SPEND(3); // GPUSTAT
+    for (;;) {
+        uint64_t a = ds_line(ds_tick() + 1);
+        crtc_read(ds_tick() + 1);
+        SPEND(3, -2, 7);
+        uint64_t b = ds_line(ds_tick() + 1);
+        crtc_read(ds_tick() + 1);
+        SPEND(3, -2, 0);
+        if (a == b) {
+            break;
+        }
+        if (vsync_trace()) {
+            fprintf(stderr, "vsr retry %08x\n", ra);
+        }
+    }
+    SPEND(7, -1, 7, -3, 0, -1, 7, -1, 0, 7, 7, 7, -1, 0);
+}
+
+void Psyz_CdVSyncQuery(unsigned ra) { vsync_query(ra); }
+
+/* LIBCD's data-ready flag (0x800a6765): a data sector's interrupt sets it,
+ * CdReady(1) takes it, CD_cw clears it for a command that starts a read */
+static int ready_flag;
+int Psyz_CdTakeReadyFlag(void) {
+    int was = ready_flag;
+    ready_flag = 0;
+    return was;
+}
+
+/* VSync(-1) in an exception (CdRead's ready callback): its GPUSTAT read at
+ * `gs_ns`; its repeat's clocks (18 or 0), which lengthen the exception */
+static unsigned vsync_query_at(uint64_t gs_ns, unsigned ra) {
+    uint64_t tick = Psyz_NsToClocks(gs_ns + 15) + VSYNC_DS_ORIGIN_TICKS; // the nearest clock
+    if (vsync_trace()) {
+        fprintf(stderr, "vsr %" PRIu64 " %08x\n", tick - VSYNC_DS_ORIGIN_TICKS, ra);
+    }
+    crtc_read(tick);
+    crtc_read(tick + 3);
+    crtc_read(tick + 15);
+    if (ds_line(tick + 3) == ds_line(tick + 15)) {
+        return 0;
+    }
+    if (vsync_trace()) {
+        fprintf(stderr, "vsr retry %08x\n", ra);
+    }
+    crtc_read(tick + 21);
+    crtc_read(tick + 33);
+    return VSYNC_RETRY_CYCLES;
+}
+
+static uint64_t clocks_after(uint64_t ns, unsigned clocks) {
+    return ns + ((uint64_t)clocks * 1000000000u + 33868799u) / 33868800u;
+}
+
+/* CdRead's ready callback in a sector's exception, from the exception's
+ * start (its VSync(-1) calls' GPUSTAT reads, CD_cw's for the read's ending
+ * Pause, and that command's write, each later by the repeats before it) */
+static uint64_t cb_read_at_ns; // the exception's start; 0 when not in one
+static unsigned cb_read_repeats;
+
+static uint64_t loop_done_ns; // a CD_sync(0) loop's: its completion is served then
+static unsigned done_charge;
+static void drive_schedule(void);
+
+static int loop_model(void) { return !drive_is_instant() && Psyz_KernelOfflineClock(); }
+
+
+static void sync_loop(uint64_t done_ns) {
+    if (done_ns > Psyz_KernelNowNs() && drive.sync_cb_due) {
+        // the completion's exception where it comes, which the loop sees
+        if (!done_charge) {
+            done_charge = CD_DONE_EXCEPTION_CLOCKS + Psyz_KernelCdChainCycles();
+        }
+        loop_done_ns = done_ns;
+        Psyz_KernelLockInterrupts();
+        drive_schedule();
+        Psyz_KernelUnlockInterrupts();
+    }
+    vsync_query(0x8008ccbc);
+    SPEND(-20, 7, -1, 7, -4);
+    for (;;) {
+        vsync_query(0x8008cd08);
+        SPEND(-1, 7, -3, 0, -1, 7, -8, 0, -2, 0, -1, 0, -1, 7, -1, 0, -1, 0);
+        if (Psyz_KernelNowNs() >= done_ns) {
+            break; // the look (lbu) sees the completion
+        }
+        SPEND(7, -3, 0, -1, 0, -1, 0, -1, 0, -1, 7, -1, 7, -4);
+    }
+    loop_done_ns = 0;
 }
 
 // Compute the absolute sector of the disc lead-out, used by CdlGetTD with
@@ -1367,7 +1629,8 @@ static uint64_t drive_pause_ticks(uint64_t ack_ns) {
     if (lba >= 0) {
         uint64_t last_ns = drive.read_first_ns +
                            (uint64_t)(lba - drive.read_lba) * 1000000000 / drive_rate();
-        since = (int64_t)((ack_ns - last_ns) * DRIVE_CLOCK / 1000000000);
+        // (to the nearest clock: DuckStation's are whole, the ns round them)
+        since = (int64_t)(((ack_ns - last_ns) * DRIVE_CLOCK + 500000000) / 1000000000);
     }
     int64_t reach = (spt - (data_read_active ? 2 : 0)) * per_sector - since;
     int64_t least = drive_double_speed() ? 1000000 : 2000000;
@@ -1527,7 +1790,6 @@ static void psyz_demute() {
 static void callback(void) { NOT_IMPLEMENTED; }
 
 int CD_init(void) {
-    u_char nop_result[8];
     Psyz_KernelLockInterrupts();
     CD_com = 0;
     Psyz_AudioLock();
@@ -1545,9 +1807,11 @@ int CD_init(void) {
     Psyz_KernelUnlockInterrupts();
     static int init_calls;
     drive_cpu(init_calls++ ? CD_INIT_AGAIN_CYCLES : CD_INIT_CYCLES);
-    CD_cw(CdlNop, 0, nop_result, 0);
+    // (LIBCD's CD_init asks for no result: CdStatus has the shell's state)
+    CD_cw(CdlNop, 0, 0, 0);
+    drive_cpu(CD_INIT_STATUS_CYCLES);
     if (CdStatus() & CdlStatShellOpen) {
-        CD_cw(CdlNop, 0, nop_result, 0);
+        CD_cw(CdlNop, 0, 0, 0);
     }
     if (init_calls > 1) {
         drive_cpu(CD_INIT_NOP_TO_RESET_CYCLES);
@@ -1555,9 +1819,11 @@ int CD_init(void) {
     if (CD_cw(CdlReset, 0, 0, 0)) {
         return -1;
     }
+    drive_cpu(CD_INIT_CALL_CYCLES);
     if (CD_cw(CdlDemute, 0, 0, 0)) {
         return -1;
     }
+    drive_cpu(CD_INIT_SYNC_CALL_CYCLES);
     if (CD_sync(0, 0) != 2) {
         return -1;
     }
@@ -1626,7 +1892,14 @@ int CD_sync(int mode, u_char* result) {
         Psyz_KernelLockInterrupts();
         uint64_t done = drive.done_ns;
         Psyz_KernelUnlockInterrupts();
-        drive_wait_done(done);
+        if (loop_model()) {
+            // its first VSync(-1), its turns, its return from the look
+            drive_cpu(CD_SYNC_TO_VSYNC_CLOCKS);
+            sync_loop(done);
+            drive_cpu(CD_SYNC_RETURN_CYCLES + (result ? CD_CW_RESULT_COPY_CLOCKS : 0));
+        } else {
+            drive_wait_done(done);
+        }
         Psyz_CdServiceDrive();
     } else {
         Psyz_CdPollCycles(CD_SYNC_POLL_CYCLES);
@@ -1768,12 +2041,15 @@ static uint64_t error_ready_ns;
 /* StCdInterrupt from a stream sector's ready callback: its clocks there. */
 static int st_irq_called;
 static unsigned st_irq_extra;
+static uint64_t st_irq_ns; // the sector's interrupt (its exception's start)
 /* deliver_data_sector inside an MDEC output interrupt's exception, before
  * its callback (Psyz_CdServeInDmaException): 1, 2 with the BIOS chains */
 static int sector_in_dma;
 /* While a read's ready callback runs from a sector's interrupt: where the
  * CPU has got to in the handler, for a command it issues (CD_cw). */
 static uint64_t sector_callback_ns;
+// LIBCD's waits as DuckStation's loops: the main thread's on the offline clock
+int Psyz_CdLoopModel(void) { return loop_model() && !sector_callback_ns; }
 
 // The drive's interrupt for a sector, a command's acknowledge or its
 // completion: the exception's window for the vblanks it hides from the
@@ -1797,6 +2073,10 @@ static void drive_irq(uint64_t at_ns, unsigned cycles, unsigned charged) {
 
 void cb_read(u_char intr, u_char* result); // CdRead's ready callback
 
+static unsigned clocks_of_sector_irq(void) {
+    return CD_DATA_IRQ_CLOCKS + (Psyz_CardChainInstalled() ? 0 : CD_DATA_IRQ_BOOT_CLOCKS);
+}
+
 static void deliver_data_sector(void) {
     int sector = data_sector_number;
     drive_delivered++;
@@ -1817,6 +2097,7 @@ static void deliver_data_sector(void) {
     if (is_played_audio_sector()) {
         return;
     }
+    ready_flag = 1;
     if (sector_in_dma) {
         if (drive_trace()) {
             fprintf(stderr, "cd irq %" PRIu64 " in dma sector %d\n", Psyz_NsToClocks(irq_ns),
@@ -1825,10 +2106,24 @@ static void deliver_data_sector(void) {
     } else {
         unsigned clocks = CD_DATA_IRQ_CLOCKS +
                           (Psyz_CardChainInstalled() || drive_is_instant() ? 0 : CD_DATA_IRQ_BOOT_CLOCKS);
+        if (loop_model() && CD_cbready == (CdlCB)cb_read) {
+            irq_ns = dispatch_ns(irq_ns); // where the CPU takes it
+        }
         drive_irq(irq_ns, clocks, clocks);
     }
     if (!CD_cbready) {
         return;
+    }
+    int cb_loop = loop_model() && CD_cbready == (CdlCB)cb_read && !sector_in_dma;
+    if (cb_loop) {
+        /* cb_read's VSync(-1) calls before its check of the sectors left;
+         * with the card driver's chain the handler comes later (as
+         * CD_DATA_CALLBACK_CHAIN_CW_CLOCKS: unmeasured with the calls) */
+        cb_read_at_ns = clocks_after(irq_ns, Psyz_CardChainInstalled()
+                                                 ? BIOS_CARD_CHAIN_CYCLES + CD_DATA_CALLBACK_CHAIN_CW_CLOCKS
+                                                 : 0);
+        cb_read_repeats = vsync_query_at(clocks_after(cb_read_at_ns, CB_READ_VSYNC1_CLOCKS), 0x8008e998);
+        cb_read_repeats += vsync_query_at(clocks_after(cb_read_at_ns, CB_READ_VSYNC2_CLOCKS + cb_read_repeats), 0x8008e9c4);
     }
     if (!drive_is_instant()) {
         unsigned clocks = CD_DATA_CALLBACK_CW_CLOCKS +
@@ -1844,6 +2139,7 @@ static void deliver_data_sector(void) {
     unsigned generation = drive_generation;
     st_irq_called = 0;
     st_irq_extra = 0;
+    st_irq_ns = irq_ns;
     CdlCB ready = CD_cbready;
     long debt = Psyz_KernelDebtClocks();
     unsigned commands = cw_count;
@@ -1859,6 +2155,21 @@ static void deliver_data_sector(void) {
                                   (int)ST_SECTOR_IRQ_CLOCKS -
                                       (int)CD_DATA_IRQ_CLOCKS +
                                       (int)st_irq_extra);
+    } else if (cb_loop && cw_count != commands) {
+        /* CdRead's callback that ends the read with its Pause: on
+         * DuckStation its exception CB_READ_END_EXCEPTION_CLOCKS, its
+         * VSync(-1) calls' repeats more [trace] */
+        long spent = Psyz_KernelDebtClocks() - debt;
+        int total = (int)(CB_READ_END_EXCEPTION_CLOCKS + cb_read_repeats) -
+                    (Psyz_CardChainInstalled() ? (int)CD_DATA_IRQ_BOOT_CLOCKS : 0);
+        Psyz_KernelResizeDispatch(irq_ns, total - (int)clocks_of_sector_irq(),
+                                  total - (int)clocks_of_sector_irq() - (int)spent);
+    } else if (cb_loop) {
+        // its third VSync(-1) (sectors left), its repeats
+        unsigned r = cb_read_repeats + vsync_query_at(clocks_after(cb_read_at_ns, CB_READ_VSYNC3_CLOCKS + cb_read_repeats), 0x8008e9f8);
+        if (r) {
+            Psyz_KernelResizeDispatch(irq_ns, (int)r, (int)r);
+        }
     } else if (ready == (CdlCB)cb_read && cw_count != commands && !drive_is_instant()) {
         /* CdRead's callback that ends the read with its Pause: the
          * exception lasts the callback's work and the rest of it past the
@@ -1887,6 +2198,7 @@ static void deliver_data_sector(void) {
     }
     st_irq_called = 0;
     sector_callback_ns = 0;
+    cb_read_at_ns = 0;
     drive_ready_sector = -1;
     if (generation == drive_generation) { // the callback issued no new read
         data_sector_valid = 0;
@@ -1899,12 +2211,11 @@ static void deliver_data_sector(void) {
  * CdRead's ending Pause (cdread.c), whose completion's exception comes in
  * whatever the CPU then runs (DuckStation: 2477 clocks in the boot's
  * CdReadSync loops, before the card driver's chain) [mark] */
-static unsigned done_charge;
 void Psyz_CdChargeDone(unsigned clocks) { done_charge = clocks; }
 
 // A command's completion raises CdSyncCallback once its time has come.
 static void service_sync_callback(void) {
-    if (!drive.sync_cb_due || drive_now() < drive.done_ns) {
+    if (!drive.sync_cb_due || drive_due_now() < drive.done_ns) {
         return;
     }
     drive.sync_cb_due = 0;
@@ -1922,8 +2233,6 @@ static void service_sync_callback(void) {
     }
 }
 
-static void drive_schedule(void);
-
 void Psyz_CdServiceDrive(void) {
     /* Both main-thread polls and the timed IRQ callback service this state.
      * The recursive kernel lock also serializes callbacks with command work. */
@@ -1935,7 +2244,7 @@ void Psyz_CdServiceDrive(void) {
     drive_servicing = 1;
     drive_update_status(drive_now());
     service_sync_callback();
-    if (error_ready_due && drive_now() >= error_ready_ns) {
+    if (error_ready_due && drive_due_now() >= error_ready_ns) {
         error_ready_due = 0;
         if (CD_cbready) {
             u_char result[8];
@@ -1950,7 +2259,7 @@ void Psyz_CdServiceDrive(void) {
         }
     }
     if (data_read_active && CD_cbready) {
-        uint64_t due = drive_sectors_due(drive_now());
+        uint64_t due = drive_sectors_due(drive_due_now());
         if (drive_is_instant() && !(CD_mode & CdlModeRT)) {
             due = drive_delivered + DRIVE_MAX_BURST; // as fast as polled
         } else if (due > drive_delivered + DRIVE_MAX_BURST) {
@@ -1982,7 +2291,7 @@ static void drive_schedule(void) {
         next = drive_start_ns +
                ((drive_delivered + 1) * 1000000000 + drive_rate() - 1) / drive_rate();
     }
-    if (drive.sync_cb_due && CD_cbsync &&
+    if (drive.sync_cb_due && (CD_cbsync || loop_done_ns) &&
         (!next || drive.done_ns < next)) {
         next = drive.done_ns;
     }
@@ -1990,7 +2299,9 @@ static void drive_schedule(void) {
         next = error_ready_ns;
     }
     if (next) {
-        Psyz_KernelPostAtNs(next, drive_timer);
+        /* a ns early: the offline clock's ns may round the clock of the
+         * instruction DuckStation takes it at down (libcd.c spend_chunks) */
+        Psyz_KernelPostAtNs(next - (next > DRIVE_EARLY_NS && loop_model() ? DRIVE_EARLY_NS : 0), drive_timer);
     }
 }
 
@@ -2146,6 +2457,18 @@ static int st_begin_frame(const StHEADER* h) {
  * ST_COPY_CYCLES, ST_FRAME_DONE_CYCLES (timing_profile.h). */
 static u_char st_deferred_data[SECTOR_SIZE];
 static int st_deferred_sector = -1;
+/* The latest stream sector's exception (its interrupt's time) and whether
+ * StCdInterrupt left its sector (2) or copied it (1), for an MDEC output
+ * interrupt that comes in it (libpress.c out_done) */
+static uint64_t st_sector_irq_ns;
+static int st_sector_kind;
+
+int Psyz_CdStreamSectorException(uint64_t start_ns) {
+    Psyz_KernelLockInterrupts();
+    int kind = st_sector_kind && st_sector_irq_ns == start_ns ? st_sector_kind : 0;
+    Psyz_KernelUnlockInterrupts();
+    return kind;
+}
 
 /* A frame's completion in the MDEC callback's exception (a sector it
  * copies, or one served before it): CdDataCallback's DMA callback, which
@@ -2185,10 +2508,25 @@ void StCdInterrupt(void) {
     if (sector < 0 || !StRingAddr || StRingSize < 2) {
         return; // DataEnd/DiskError or no ring: nothing to store
     }
-    if (StRgb24 && drive_ready_sector >= 0 && Psyz_MdecOutBusy()) {
+    /* its look at DMA1's CHCR comes ST_SECTOR_BUSY_LOOK_CLOCKS into the
+     * sector's exception: an output DMA that has ended by then is not busy
+     * (DuckStation: StCdInterrupt 2310-3059 clocks in, the output's
+     * interrupt 2212 in or sooner copied, 2659 left) [trace] */
+    int sector_exception = drive_ready_sector >= 0 && !sector_in_dma && Psyz_KernelOfflineClock() &&
+                           !drive_is_instant();
+    if (sector_exception) {
+        st_sector_irq_ns = st_irq_ns;
+        st_sector_kind = 1;
+    }
+    if (StRgb24 && drive_ready_sector >= 0 &&
+        (sector_exception ? Psyz_MdecOutBusyAt(st_irq_ns + ((uint64_t)ST_SECTOR_BUSY_LOOK_CLOCKS * 1000000000u) / 33868800u)
+                          : Psyz_MdecOutBusy())) {
         memcpy(st_deferred_data, data_sector, SECTOR_SIZE);
         st_deferred_sector = sector;
         StCdIntrFlag = 1;
+        if (sector_exception) {
+            st_sector_kind = 2;
+        }
         return;
     }
     StCdIntrFlag = 0;
@@ -2261,6 +2599,23 @@ static unsigned cd_param_bytes(u_char com) {
     }
 }
 
+/* Commands after which LIBCD's CD_cw clears the ready flag too (the PAL
+ * executable's table at 0x800a65cc): those that start reading or playing */
+static int cd_readies(u_char com) {
+    switch (com) {
+    case CdlPlay:
+    case CdlForward:
+    case CdlBackward:
+    case CdlReadN:
+    case CdlSeekL:
+    case CdlSeekP:
+    case CdlReadS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* The bytes of a command's first response, which LIBCD's handler reads
  * one by one (CD_RESULT_BYTE_CLOCKS each past the status byte). */
 static unsigned cd_result_bytes(u_char com) {
@@ -2281,10 +2636,13 @@ static unsigned cd_result_bytes(u_char com) {
  * interrupt's does (DuckStation: the XA player's GetlocP, 3107 clocks every
  * race frame) [exc] */
 static uint64_t unwaited_ack_ns;
+static int ack_waited;
 static unsigned unwaited_ack_clocks;
 static void unwaited_ack(void) {
     Psyz_KernelLockInterrupts();
-    unsigned clocks = unwaited_ack_clocks;
+    // (one CD_cw waits for: its BIOS part by the kernel's state, measured
+    // for those only)
+    unsigned clocks = unwaited_ack_clocks + (unwaited_ack_clocks && ack_waited ? Psyz_KernelCdChainCycles() : 0);
     unwaited_ack_clocks = 0;
     if (clocks)
         drive_irq(unwaited_ack_ns, clocks, clocks);
@@ -2299,18 +2657,46 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelLockInterrupts();
     uint64_t previous_done = drive.done_ns;
     Psyz_KernelUnlockInterrupts();
-    drive_wait_done(previous_done);
+    // (in a ready callback, an exception, it spins on the controller)
+    int loops = loop_model() && !sector_callback_ns;
+    unsigned params = cd_param_bytes(com);
+    if (loops) {
+        // (a command with parameters checks for them)
+        drive_cpu(CD_CW_TO_SYNC_CLOCKS + (params ? CD_CW_PARAM_CHECK_CLOCKS : 0));
+        sync_loop(previous_done);
+    } else {
+        drive_wait_done(previous_done);
+    }
     Psyz_CdServiceDrive();
     done_charge = 0;
+    if (cb_read_at_ns) {
+        // CdRead's callback issuing the read's ending Pause: its CD_sync(0)'s
+        // two VSync(-1) calls, then the write
+        cb_read_repeats += vsync_query_at(clocks_after(cb_read_at_ns, CB_READ_SYNC_VSYNC_CLOCKS + cb_read_repeats), 0x8008ccbc);
+        cb_read_repeats += vsync_query_at(clocks_after(cb_read_at_ns, CB_READ_SYNC_VSYNC_CLOCKS + VSYNC_SYNC_FIRST_TO_LOOP_CLOCKS + cb_read_repeats), 0x8008cd08);
+        sector_callback_ns = clocks_after(cb_read_at_ns, CB_READ_PAUSE_WRITE_CLOCKS + cb_read_repeats);
+    }
     // in a ready callback (the CPU's position there is sector_callback_ns):
     // the wait ends at the previous command's completion
     if (sector_callback_ns && previous_done > sector_callback_ns) {
         sector_callback_ns = previous_done + (Psyz_CdDoneIrqCycles() * 1000000000ull + 33868799) / 33868800;
     }
-    drive_cpu(CD_CW_ISSUE_CYCLES + (param ? cd_param_bytes(com) : 0) *
-                                       CD_CW_PARAM_CYCLES);
+    if (loops) {
+        /* from the look to the command register write (a clock into its
+         * instruction): the parameters' loop, Setloc's position and
+         * Setmode's mode kept */
+        drive_cpu(CD_CW_LOOK_TO_WRITE_CLOCKS +
+                  (params ? CD_CW_PARAM_LOOP_CLOCKS + params * CD_CW_PARAM_BYTE_CLOCKS : 0) +
+                  (com == CdlSetloc ? CD_CW_SETLOC_POS_CLOCKS : com == CdlSetmode ? CD_CW_SETMODE_CLOCKS : 0) +
+                  (cd_readies(com) ? CD_CW_READY_CLEAR_CLOCKS : 0));
+    } else {
+        drive_cpu(CD_CW_ISSUE_CYCLES + (param ? params : 0) * CD_CW_PARAM_CYCLES);
+    }
     Psyz_KernelLockInterrupts();
     CD_com = com; // CdLastCom
+    if (cd_readies(com)) {
+        ready_flag = 0;
+    }
     // The command register write comes where the CPU's work has got to: in
     // a handler (a read's ready callback) after the handler time before it.
     command_ack_ns = drive_now();
@@ -2338,6 +2724,10 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
         error_ready_due = 1;
         error_ready_ns = command_ack_ns;
     }
+    if (vsync_trace()) {
+        fprintf(stderr, "vsw %" PRIu64 " %s\n", Psyz_NsToClocks(command_write_ns + 15),
+                com < LEN(CD_comstr) ? CD_comstr[com] : "?");
+    }
     if (drive_trace()) {
         // the command register write, command, Setloc position, its
         // acknowledge (DuckStation's CDCMD), completion, read timing; in
@@ -2353,17 +2743,47 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelRaise(HwCdRom, EvSpTRAP);
     drive_schedule();
     uint64_t ack = command_ack_ns;
+    // (CdControlF: from the write to CD_cw's return)
+    unsigned unwaited_return = arg3 && loops ? CD_CW_UNWAITED_RETURN_CYCLES : 0;
     unsigned result_clocks = (cd_result_bytes(com) - 1) * CD_RESULT_BYTE_CLOCKS;
-    if (arg3 && !drive_is_instant()) {
+    if ((arg3 && !drive_is_instant()) || (!arg3 && loops)) {
         unwaited_ack_ns = ack;
-        unwaited_ack_clocks = CD_UNWAITED_ACK_CLOCKS + result_clocks +
-                              (com == CdlReadN || com == CdlReadS ? CD_UNWAITED_READ_ACK_CLOCKS : 0);
-        Psyz_KernelPostAtNs(ack, unwaited_ack);
+        ack_waited = !arg3;
+        unwaited_ack_clocks =
+            !arg3 ? CD_ACK_EXCEPTION_CLOCKS + result_clocks -
+                        (com == CdlReset ? CD_RESET_ACK_SAVED_CLOCKS : 0) +
+                        (com == CdlSetloc && !Psyz_CardChainInstalled() ? CD_SETLOC_ACK_EXCEPTION_CLOCKS : 0)
+                  : CD_UNWAITED_ACK_CLOCKS + result_clocks +
+                        (com == CdlReadN || com == CdlReadS ? CD_UNWAITED_READ_ACK_CLOCKS : 0);
+        // (DRIVE_EARLY_NS early, as the drive's timers)
+        Psyz_KernelPostAtNs(ack - (loop_model() ? DRIVE_EARLY_NS : 0), unwaited_ack);
     } else {
         drive_irq(ack, CD_ACK_IRQ_CLOCKS + result_clocks, 0); // CD_CW_ACK_CYCLES has its time
     }
     Psyz_KernelUnlockInterrupts();
-    if (!arg3) {
+    if (unwaited_return) {
+        drive_cpu(unwaited_return);
+    }
+    if (!arg3 && loops) {
+        /* the wait: VSync(-1), then its loop's turns looking at the flag
+         * the acknowledge's exception sets; from the look that sees it
+         * the return */
+        drive_cpu(CD_CW_WRITE_TO_VSYNC_CLOCKS);
+        vsync_query(0x8008d38c);
+        SPEND(-7, 7, -15, 7, -1, 7, -4);
+        for (;;) {
+            vsync_query(0x8008d3e4);
+            SPEND(-1, 7, -3, 0, -1, 7, -8, 0, -2, 0, -1, 0, -1, 7, -1, 0, -1, 0);
+            if (Psyz_KernelNowNs() >= ack) {
+                break; // the look (lbu) sees the acknowledge
+            }
+            SPEND(7, -2, 0, -1, 0, -1, 7, -1, 7, -4);
+        }
+        drive_cpu(CD_CW_LOOK_RETURN_CYCLES + (result ? CD_CW_RESULT_COPY_CLOCKS : 0));
+        if (cw_count != issued) {
+            ret = cw_error ? -1 : 0;
+        }
+    } else if (!arg3) {
         // the interrupts during the spin run within it, as on DuckStation
         // (a root counter's between CdRead2's Setmode and its acknowledge)
         long debt = Psyz_KernelDebtClocks();

@@ -658,7 +658,11 @@ static int merged_into = -1;
 static uint64_t exception_end_ns, exception_start_ns;
 static int exception_end_device, exception_root_counter;
 
+static unsigned long exceptions_noted;
+unsigned long Psyz_KernelExceptionCount(void) { return exceptions_noted; }
+
 static void NoteException(uint64_t at_ns, unsigned cycles, int device) {
+    exceptions_noted++;
     uint64_t end = at_ns + (uint64_t)cycles * 1000000000u / SYSTEM_CLOCK_HZ;
     if (end >= exception_end_ns) {
         exception_end_ns = end;
@@ -910,6 +914,29 @@ static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CY
  * interrupt's 1357, 1367, 1374): the vblank's exception takes 2387, 2407
  * and 2436 unmarked (the boot's CdReadSync and CD_sync loops, SoundSystemInit's
  * bzero). KERNEL_IRQ_CYCLES is with both. [exc] */
+/* A CD interrupt's exception's BIOS part by the same state: 10 clocks more
+ * once an event is enabled (SpuInit's DMA event), 7 more with a root
+ * counter's interrupt (SsStart): on DuckStation the boot's Reset
+ * acknowledges' exceptions 2457 and 2467 clocks (DUCKSTATION_PC_TRACE,
+ * IRQX) [trace] */
+unsigned Psyz_KernelCdChainCycles(void) {
+    if (!UsesAudioClock()) {
+        return 0;
+    }
+    unsigned cycles = 0;
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        long st = AtomicLoad(&events[i].status);
+        if (st == EvStACTIVE || st == EvStALREADY) {
+            cycles += KERNEL_CD_IRQ_EVENT_CYCLES;
+            break;
+        }
+    }
+    if (irq_mask & ((1u << IRQ_RCNT0) | (1u << IRQ_RCNT1) | (1u << IRQ_RCNT2))) {
+        cycles += KERNEL_CD_IRQ_RCNT_CYCLES;
+    }
+    return cycles;
+}
+
 static unsigned BiosChainCycles(void) {
     unsigned cycles = KERNEL_IRQ_BIOS_EVENT_CYCLES + KERNEL_IRQ_BIOS_RCNT_CYCLES;
     for (int i = 0; i < EVENT_COUNT; i++) {
@@ -1627,6 +1654,14 @@ static void CounterStep(RootCounter* c) {
 }
 
 // The count restarts from 0 at now_ns plus frac / clock_hz ns.
+/* When root counter i's count last restarted from 0 (0: not set). */
+uint64_t Psyz_KernelCounterStartNs(int i) {
+    if (i < 0 || i > 2 || !counters[i].period_ns) {
+        return 0;
+    }
+    return counters[i].last_ns;
+}
+
 static void CounterRestart(RootCounter* c, uint64_t now_ns, uint32_t frac) {
     c->last_ns = now_ns;
     c->last_frac = frac;
@@ -1903,6 +1938,17 @@ void Psyz_KernelAdvanceToNs(uint64_t at_ns) {
  * timer fires; UINT64_MAX when there is none. It services the kernel's
  * queues first, which also drops a stale earlier deadline (a counter set
  * again later). */
+/* The next time Psyz_KernelAdvanceToNs stops at (a timer, a blank), without
+ * serving anything: UINT64_MAX when the main thread holds the kernel. */
+uint64_t Psyz_KernelNextEventNs(void) {
+    if (!UsesAudioClock() || OwnsKernel()) {
+        return UINT64_MAX;
+    }
+    uint64_t next = AtomicLoad(&irq_thread_state) ? AtomicTimeLoad(&poll_deadline_ns) : UINT64_MAX;
+    uint64_t blank = Psyz_AudioNextBlankNs();
+    return next < blank ? next : blank;
+}
+
 uint64_t Psyz_KernelNextDeadlineNs(void) {
     if (!UsesAudioClock() || !AtomicLoad(&irq_thread_state) || OwnsKernel()) {
         return UINT64_MAX;
@@ -1939,6 +1985,15 @@ long SetRCnt(long spec, unsigned short target, long mode) {
     uint64_t start_ns = KernelNowNs();
     if (UsesAudioClock()) {
         start_ns += OwedNs();
+    }
+    static int rcnt_trace = -1;
+    if (rcnt_trace < 0) {
+        rcnt_trace = getenv("PSYZ_VSYNC_TRACE") != NULL;
+    }
+    if (rcnt_trace) {
+        // (DUCKSTATION_CD_TRACE's RCNT2: the mode's last write starts it)
+        fprintf(stderr, "rcw %llu counter %d\n",
+                (unsigned long long)Psyz_NsToClocks(start_ns + 15), i);
     }
     CounterRestart(c, start_ns, 0);
     KernelUnlock();

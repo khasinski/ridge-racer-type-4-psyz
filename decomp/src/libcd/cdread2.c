@@ -18,7 +18,8 @@ int CdRead2(long mode) {
      * return: it can be less than CdControl's own return charge) */
     _Static_assert((int)CD_CONTROL_RETURN_CYCLES + (int)CD_READ2_CYCLES >= 0,
                    "CD_READ2_CYCLES below CdControl's return charge");
-    Psyz_CdControlThen(CdlSetmode, &param, NULL, CD_READ2_CYCLES);
+    Psyz_CdControlThen(CdlSetmode, &param, NULL,
+                       Psyz_CdLoopModel() ? CD_READ2_LOOP_CYCLES : CD_READ2_CYCLES);
 #else
     CdControl(CdlSetmode, &param, NULL);
 #endif

@@ -101,6 +101,30 @@ static unsigned PacketCycles(int p) {
     return halfwords < 2 ? 0 : (unsigned)(halfwords - 1) * LIBPAD_HALFWORD_CYCLES;
 }
 
+/* libpad's SIO wait before port 2's exchange, setRC2wait(0x91) then
+ * chkRC2wait every 50 clocks until root counter 2 (system clock / 8) has
+ * counted 145: DuckStation reads the counter 11064 clocks after the blank
+ * (its exception begins at the blank's tick) and 1159 later at the 16th
+ * turn, 144 or 145 counts by the counter's phase; at 144 the wait takes a
+ * 17th turn (DUCKSTATION_IOREAD_TRACE: 70 of 674 two-pad exchanges of
+ * vs-two-cards, vblank exceptions 24681 against 24631). Modelled where the
+ * exchange is the measured one (digital pads in both ports, the blank in
+ * no other exception, not in the 480-line menus, whose alternate fields
+ * read 10 sooner); LIBPAD_VBLANK_PORT2_CYCLES is its mean otherwise. */
+static int Port2WaitTurns(uint64_t blank_ns) {
+    uint64_t start_ns = Psyz_KernelCounterStartNs(2);
+    if (!start_ns || !Psyz_KernelOfflineClock() || Psyz_GpuCrtcInterlaced480()) {
+        return -1;
+    }
+    uint64_t blank = Psyz_NsToClocks(blank_ns + 15), t0 = Psyz_NsToClocks(start_ns + 15);
+    uint64_t s = blank + LIBPAD_PORT2_WAIT_READ_CLOCKS;
+    if (s < t0) {
+        return -1;
+    }
+    uint64_t counted = (s + LIBPAD_PORT2_WAIT_LAST_CLOCKS - t0) / 8 - (s - t0) / 8;
+    return counted < LIBPAD_PORT2_WAIT_COUNTS ? 17 : 16;
+}
+
 static int PadTrace(void) {
     static int trace = -1;
     if (trace < 0) {
@@ -178,6 +202,7 @@ void Psyz_VSyncBlank(void) {
     uint64_t blank_ns = Psyz_KernelNowNs();
     long debt = Psyz_KernelDebtClocks();
     last_blank_ns = blank_ns;
+    Psyz_VSyncBlankTaken();
     Psyz_CardBlankBegin();
     Psyz_GpuCrtcBlank();
     int pad_exchange =
@@ -195,6 +220,20 @@ void Psyz_VSyncBlank(void) {
         pad_exchange = 0;
     }
     ReadPadsOnVsync(pad_exchange || !Psyz_PadDriverRunning());
+    int port2_wait = 0;
+    if (pad_exchange && Psyz_LibpadExchanged(0, NULL) && Psyz_LibpadExchanged(1, NULL) && !PacketCycles(0) &&
+        !PacketCycles(1) && !Psyz_LibpadGateCycles(0) && !Psyz_LibpadGateCycles(1) && !Psyz_LibpadRefused(0) &&
+        !Psyz_LibpadRefused(1)) {
+        unsigned since = 0, cycles = 0;
+        int open = Psyz_KernelLastDispatch(blank_ns, &since, &cycles) && since < cycles;
+        int turns = open ? -1 : Port2WaitTurns(blank_ns);
+        if (turns > 0) {
+            port2_wait = (turns - 16) * LIBPAD_RC2_TURN_CYCLES - LIBPAD_PORT2_WAIT_MEAN_CYCLES;
+        }
+        if (PadTrace() && turns > 0) {
+            fprintf(stderr, "pad: port 2 wait %d turns\n", turns);
+        }
+    }
     Psyz_KernelInterruptCycles(
         VBLANK_HANDLER_CYCLES +
         (raw_end ? CARD_RAW_END_CYCLES
@@ -205,7 +244,8 @@ void Psyz_VSyncBlank(void) {
                    (!Psyz_LibpadExchanged(0, NULL) ? LIBPAD_EMPTY_PORT1_SAVED_CYCLES : 0) -
                    (Psyz_LibpadRefused(0) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0) +
                    (Psyz_LibpadExchanged(1, NULL)
-                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) + Psyz_LibpadGateCycles(1) -
+                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) + Psyz_LibpadGateCycles(1) +
+                              port2_wait -
                               (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_PORT2_SAVED_CYCLES
                                                      : 0)
                         : 0)
@@ -336,6 +376,17 @@ int VSync(int mode) {
         ServiceWallBlanks();
     }
     if (mode == 1) {
+        static int trace = -1;
+        if (trace < 0) {
+            trace = getenv("PSYZ_VSYNC_TRACE") != NULL;
+        }
+        if (trace) {
+            // (as DUCKSTATION_IOREAD_TRACE's GPUSTAT read, 21 clocks into
+            // the call; the game's frame loop's return address)
+            uint64_t ns = Psyz_KernelNowNs();
+            fprintf(stderr, "vsr %llu 8001e7d8\n",
+                    (unsigned long long)(Psyz_NsToClocks(ns + 15) + 21));
+        }
         Psyz_KernelTakeInterruptCycles(); // a polling loop absorbs handlers
         unsigned short lines = (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);
         Psyz_SpendCycles(LIBETC_VSYNC_QUERY_CYCLES);

@@ -284,6 +284,16 @@ int cd_read(int n_sectors, int sector_no, unsigned char* ptr) {
 
     CdIntToPos(sector_no, &pos);
     CdControl(CdlSetloc, (u_char*)&pos, 0);
+#ifdef __psyz
+    if (Psyz_CdLoopModel()) {
+        Psyz_CdCpu(CD_SEARCH_READ_CALL_CLOCKS);
+    }
+#endif
     CdRead(n_sectors, (u_long*)ptr, CdlModeSpeed);
+#ifdef __psyz
+    if (Psyz_CdLoopModel()) {
+        Psyz_CdCpu(CD_SEARCH_SYNC_CALL_CLOCKS);
+    }
+#endif
     return CdReadSync(0, 0) == 0;
 }

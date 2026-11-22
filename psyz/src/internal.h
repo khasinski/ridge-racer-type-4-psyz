@@ -52,6 +52,12 @@ int Psyz_KernelOfflineClock(void);
 void Psyz_KernelAdvanceToNs(uint64_t at_ns);
 // The next kernel deadline on the offline clock (UINT64_MAX: none).
 uint64_t Psyz_KernelNextDeadlineNs(void);
+uint64_t Psyz_KernelNextEventNs(void);
+unsigned long Psyz_KernelExceptionCount(void);
+uint64_t Psyz_VSyncBlankNs(uint64_t grid_ns);
+uint64_t Psyz_KernelCounterStartNs(int i);
+void Psyz_VSyncBlankTaken(void);
+unsigned Psyz_KernelCdChainCycles(void);
 void Psyz_KernelPauseHostClock(int paused);
 void Psyz_KernelSetHostClockSpeed(unsigned speed);
 
@@ -98,7 +104,8 @@ void Psyz_DmaComplete(unsigned channel);
 // A DMA transfer's completion that raises its interrupt (the channels
 // whose interrupt the game enables run their callback in its exception):
 // host 0 a new exception, 1 raised during a root counter's or the vblank's
-// exception and 2 during a device's, which libetc's dispatcher then takes.
+// exception and 2 during a device's, which libetc's dispatcher then takes,
+// 3 during a stream sector's before its dispatcher's last look (libpress.c).
 void Psyz_DmaIrqComplete(unsigned channel, int host);
 // An MDEC output interrupt's exception that began at entry_ns: the stream
 // sector whose interrupt libetc's dispatcher sees there first (libcd.c).
@@ -111,6 +118,11 @@ void Psyz_KernelNoteDmaSlice(uint64_t at, unsigned clocks);
 unsigned Psyz_KernelDmaClocksIn(uint64_t from_ns, uint64_t to_ns);
 // Whether the MDEC's output DMA is under way (its CHCR busy bit).
 int Psyz_MdecOutBusy(void);
+// ... still under way at at_ns (libpress.c)
+int Psyz_MdecOutBusyAt(uint64_t at_ns);
+// The stream sector exception that began at start_ns: 2 when StCdInterrupt
+// left its sector for the MDEC callback, 1 when it copied it, 0 none (libcd.c).
+int Psyz_CdStreamSectorException(uint64_t start_ns);
 // PSYZ_MDEC_TRACE=1: each output transfer and its interrupt, with the
 // clock (stderr).
 int Psyz_MdecTrace(void);
