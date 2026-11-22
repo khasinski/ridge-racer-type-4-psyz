@@ -100,6 +100,10 @@ enum {
      * bzero's span came 680 clocks short of DuckStation's unmarked one
      * (6018935 clocks from SsSetMVol to InitSceneOverlayState). */
     KERNEL_IRQ_CYCLES = 2368,
+    /* ... of which the BIOS's chains' looks at an enabled event and at a
+     * root counter left to the program (kernel.c BiosChainCycles) [exc] */
+    KERNEL_IRQ_BIOS_EVENT_CYCLES = 20,
+    KERNEL_IRQ_BIOS_RCNT_CYCLES = 29,
     /* libetc's DMA dispatcher (DICR) on top of it: a DMA interrupt's
      * exception takes 2804 besides its callback's work on DuckStation
      * (the movie's MDEC output callbacks: 1883 to the callback, 945 from
@@ -509,11 +513,11 @@ enum {
     SPU_CLEAR_DMA_SAVED_PER_64_BYTES = 5,
     /* ... and a vblank's exception during those chunks takes 2387 clocks
      * on DuckStation (fields 88-90: the chunk's DMA interrupts 15027
-     * apart across it against 12640), 49 less than KERNEL_IRQ_CYCLES and
-     * VBLANK_HANDLER_CYCLES (the boot's bzero); one 327 clocks into a
+     * apart across it against 12640), 20 less than BiosChainCycles gives
+     * with libspu's DMA event enabled (its WaitEvent's); one 327 clocks into a
      * chunk's DMA exception adds 606, 229 less than the shared exception's
      * SHARED_EXCEPTION_SAVED_CYCLES gives [trace] */
-    SPU_CLEAR_VBLANK_SAVED_CYCLES = 49,
+    SPU_CLEAR_VBLANK_SAVED_CYCLES = 20,
     SPU_CLEAR_SHARED_VBLANK_SAVED_CYCLES = 229,
     /* ... and from the last chunk's DMA interrupt to the caller's next
      * call (WaitEvent's return, the restores): 4807 clocks on DuckStation
@@ -744,10 +748,8 @@ enum {
     CD_READ_SYNC_END_CYCLES = 396,
     CD_READ_SYNC_POLL_END_CYCLES = 623 - 245,
     CD_READ_SYNC_RETURN_CYCLES = 46,
-    /* ... a vblank's exception in those loops takes 2387 clocks from them
-     * (every one of the boot's), 49 less than KERNEL_IRQ_CYCLES and
-     * VBLANK_HANDLER_CYCLES (measured in SoundSystemInit's bzero) [mark] */
-    CD_READ_SYNC_VBLANK_SAVED_CYCLES = 49,
+    /* (a vblank's exception in those loops takes 2387 clocks from them:
+     * the BIOS's chains before SpuInit, kernel.c BiosChainCycles) */
     /* ... VSync(-1)'s repeat of its hblank counter read (18 clocks): in
      * 1.04% of CdReadSync(0)'s turns with one mark in them, 0.73% with
      * two, 1.85% of CdReadSync(1)'s calls with one: the unmarked loops'

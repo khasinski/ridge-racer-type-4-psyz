@@ -901,6 +901,30 @@ static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CY
 /* A loop whose interrupted code makes a vblank's or a root counter's
  * exception take more or less of the CPU's time than KERNEL_IRQ_CYCLES
  * (LIBCD's CdReadSync polling, CD_READ_SYNC_VBLANK_SAVED_CYCLES) */
+/* The BIOS's interrupt handling before libetc's dispatcher: its chains
+ * look at more once an event is enabled (libspu's DMA event, SpuInit) and
+ * once a root counter's interrupt is left to the program
+ * (ChangeClearRCnt(t, 0): SsStart's timer). On DuckStation a vblank's
+ * exception reaches trapIntr 1792 clocks in at the boot, 1812 after the
+ * first, 1845 after the second (its StartRCnt and ChangeClearRCnt) (DSF_EXC, a mark at trapIntr; a CD
+ * interrupt's 1357, 1367, 1374): the vblank's exception takes 2387, 2407
+ * and 2436 unmarked (the boot's CdReadSync and CD_sync loops, SoundSystemInit's
+ * bzero). KERNEL_IRQ_CYCLES is with both. [exc] */
+static unsigned BiosChainCycles(void) {
+    unsigned cycles = KERNEL_IRQ_BIOS_EVENT_CYCLES + KERNEL_IRQ_BIOS_RCNT_CYCLES;
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        long st = AtomicLoad(&events[i].status);
+        if (st == EvStACTIVE || st == EvStALREADY) {
+            cycles -= KERNEL_IRQ_BIOS_EVENT_CYCLES;
+            break;
+        }
+    }
+    if (irq_mask & ((1u << IRQ_RCNT0) | (1u << IRQ_RCNT1) | (1u << IRQ_RCNT2))) {
+        cycles -= KERNEL_IRQ_BIOS_RCNT_CYCLES; // (SsStart's StartRCnt)
+    }
+    return cycles; // the clocks KERNEL_IRQ_CYCLES has that this state's chains do not
+}
+
 static int exception_context, shared_exception_context;
 void Psyz_KernelExceptionContext(int clocks) { exception_context = clocks; }
 /* ... and a blank served inside another interrupt's exception there */
@@ -933,7 +957,8 @@ static void ServiceLine(int line, uint64_t at_ns) {
      * two-cards vsync 904, where a separate exception after it would end
      * at 5824) [exc] */
     int shared_vblank = line == IRQ_VBLANK && InOpenException(at_ns);
-    entry += shared_vblank ? shared_exception_context : exception_context;
+    // (a blank served in another's exception does not walk the chains again)
+    entry += shared_vblank ? shared_exception_context : exception_context - (int)BiosChainCycles();
     if (shared_vblank) {
         entry -= SHARED_EXCEPTION_SAVED_CYCLES;
         if (Psyz_KernelBlankInDispatch(at_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,

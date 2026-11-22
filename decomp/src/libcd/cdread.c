@@ -311,13 +311,7 @@ int CdRead(int sectors, u_long* buf, int mode) {
 }
 
 #ifdef __psyz
-/* A vblank's exception that comes in CdReadSync's polling takes less of
- * the CPU's time than elsewhere (CD_READ_SYNC_VBLANK_SAVED_CYCLES). */
-static void read_sync_poll(unsigned cycles) {
-    Psyz_KernelExceptionContext(-(int)CD_READ_SYNC_VBLANK_SAVED_CYCLES);
-    Psyz_CdPollCycles(cycles);
-    Psyz_KernelExceptionContext(0);
-}
+static void read_sync_poll(unsigned cycles) { Psyz_CdPollCycles(cycles); }
 
 /* ... and VSync(-1)'s second read of the hblank counter, which it repeats
  * (18 clocks) when an hblank comes between the two: about 1% of
