@@ -8,8 +8,8 @@ Automated tests to ensure no regressions are introduced between changes.
 builds `tests/build/sdl3-gpu-hw` and runs it the way CI does: the SDL GPU
 renderer in a hidden window (`PSYZ_HEADLESS=gpu`, Linux also
 `SDL_VIDEODRIVER=offscreen`), the dummy audio driver, and none of the PsyZ
-timing or card variables of the calling shell (`PSYZ_AUDIO_CLOCK`,
-`PSYZ_*_TIMING`, `PSYZ_CARD_UNPLUG`, `PSYZ_CARD_UNFORMATTED`), from
+clock or card variables of the calling shell (`PSYZ_AUDIO_CLOCK`,
+`PSYZ_CARD_UNPLUG`, `PSYZ_CARD_UNFORMATTED`), from
 `tests/`, the working directory the golden images and card directories are
 relative to. Every test passes or skips there; a red run means a
 regression. Other modes give other results by design: a visible window
@@ -45,23 +45,24 @@ When an image comparison fails, the frame is written to `tests/expected/<name>.<
 
 ## Environment variables
 
-Diagnostics and timing switches, read once at their first use (changing
+Diagnostics and clock switches, read once at their first use (changing
 one later in the process has no effect):
 
 | Variable | Effect |
 | --- | --- |
-| `PSYZ_AUDIO_CLOCK=video` | the offline clock: emulated time advances only as samples are mixed per field (headless runs); `wall` or unset: real time |
-| `PSYZ_SPU_TIMING=instant`, `PSYZ_CD_TIMING=instant`, `PSYZ_CARD_TIMING=instant` | SPU DMA, the CD drive or the memory card complete at once instead of taking their PS1 time (`Psyz_*SetInstantTiming` overrides the last two) |
+| `PSYZ_AUDIO_CLOCK=video` | the offline clock: a deterministic field clock that stands still while the game works and moves only in its waits (VSync, a line-counter poll, a stream's next sector), the audio mixed up to each (headless test runs); `wall` or unset: the host's real-time clock |
 | `PSYZ_CARD_UNPLUG=12`, `PSYZ_CARD_UNFORMATTED=12` | memory card slots that are empty or hold an unformatted card (once per slot, until `Psyz_CardSetSlotState`) |
-| `PSYZ_CD_TRACE`, `PSYZ_CARD_TRACE`, `PSYZ_SPU_KEY_TRACE`, `PSYZ_SPU_REG_TRACE` | log drive commands, the card driver, SPU key-ons or SPU voice register writes to stderr |
+| `PSYZ_CD_TRACE`, `PSYZ_PAD_TRACE`, `PSYZ_SPU_KEY_TRACE`, `PSYZ_SPU_REG_TRACE` | log drive commands and deliveries, libpad's exchanges, SPU key-ons or SPU voice register writes to stderr |
 | `PSYZ_HEADLESS=1` / `gpu`, `PSYZ_HEADLESS_PACED`, `PSYZ_GPU_FETCH=0`, `PSYZ_VIDEO_GLES` | read when the renderer starts: no window (CPU rasterizer, or the SDL GPU renderer in a hidden window), paced presents, blending from copies instead of framebuffer fetch on Metal, GLES on the GL renderer |
 | `PSYZ_FRAME_STATS`, `PSYZ_FRAME_LOG=file`, `PSYZ_PRESENT_PACING=0` | renderer statistics (present intervals, host work), one line per present, presents made in VSync before the blank wait |
 | `PSYZ_GPU=off` | no SDL GPU device, as on a system without a Vulkan or D3D12 driver: the CPU rasterizer draws and an SDL renderer presents (the fallback; `Psyz_VideoGetFeatures` reports no GPU enhancements) |
 | `PSYZ_GPU_COMMAND_DESCRIPTOR_LIMIT=n` | submit the frame's command buffer every n descriptors (4..1024, default 256) |
 | `PSYZ_BATCH_VERTICES=n`, `PSYZ_BATCH_PRIMITIVES=n` | draw GPU batches of at most n vertices or primitives (tests of smaller batches) |
 
-The PS1 time costs PsyZ spends on the offline clock, and the DuckStation runs
-they were fitted from, are in `src/timing_profile.h`.
+There is no PS1 timing: the CD drive, the MDEC, SPU DMA and the memory card
+complete as fast as the host does their work (a CD read in CdlModeRT keeps
+the disc's rate, which its XA audio plays at), and native code takes no
+emulated time.
 
 ### Windows
 

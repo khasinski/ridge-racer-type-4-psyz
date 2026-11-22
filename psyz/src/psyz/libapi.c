@@ -8,7 +8,6 @@
 #include "libgpu.h"
 #include "../draw.h"
 #include "../internal.h"
-#include "../timing_profile.h"
 
 #undef _get_errno // Windows: avoid conflicts
 #undef undelete   // macOS: avoid conflicts
@@ -53,10 +52,9 @@ const char* Psyz_PadsFrame(int port) {
 
 /* The controllers answer with the host input sampled at the blank (or the
  * frames an input callback sets). libpad's handler (libpad.c) exchanges
- * with them at the blanks it serves and keeps its receive buffers itself;
- * without libpad the InitPAD buffers take the frames at once. A blank
- * libpad misses has no exchange (Psyz_VSyncBlank). */
-static void ReadPadsOnVsync(int exchange) {
+ * with them at each blank and keeps its receive buffers itself; without
+ * libpad the InitPAD buffers take the frames at once. */
+static void ReadPadsOnVsync(void) {
     if (!pad_buffers[0] && !pad_buffers[1] && !Psyz_PadDriverRunning()) {
         pads_sampled = 0; // nothing reads them: poll when asked
         return;
@@ -67,9 +65,7 @@ static void ReadPadsOnVsync(int exchange) {
         pads_input_cb();
     }
     if (Psyz_PadDriverRunning()) {
-        if (exchange) {
-            Psyz_LibpadVBlank();
-        }
+        Psyz_LibpadVBlank();
         return;
     }
     for (int p = 0; p < LEN(ports); p++) {
@@ -86,217 +82,26 @@ PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb) {
     return prev;
 }
 
-/* The vblank handler's PS1 time besides the kernel's: libetc's VSync
- * handler and callbacks dispatch, the BIOS card driver's turn, and libpad's
- * controller exchange once PadStartCom ran, more with a pad in port 2 and
- * for longer packets (VBLANK_HANDLER_CYCLES, LIBPAD_*: timing_profile.h). */
+/* The kernel's time when the latest blocking VSync returned, from which
+ * VSync(1) counts lines (the PS1's line counter latch). */
+static uint64_t vsync_return_ns;
 
-static uint64_t last_blank_ns; // emulated time of the latest blank
-
-/* libpad clocks the packet of a controller that sends more than a digital
- * pad's halfword of buttons byte by byte (LIBPAD_HALFWORD_CYCLES). */
-static unsigned PacketCycles(int p) {
-    int halfwords = 0;
-    Psyz_LibpadExchanged(p, &halfwords);
-    return halfwords < 2 ? 0 : (unsigned)(halfwords - 1) * LIBPAD_HALFWORD_CYCLES;
-}
-
-/* libpad's SIO wait before port 2's exchange, setRC2wait(0x91) then
- * chkRC2wait every 50 clocks until root counter 2 (system clock / 8) has
- * counted 145: DuckStation reads the counter 11064 clocks after the blank
- * (its exception begins at the blank's tick) and 1159 later at the 16th
- * turn, 144 or 145 counts by the counter's phase; at 144 the wait takes a
- * 17th turn (DUCKSTATION_IOREAD_TRACE: 70 of 674 two-pad exchanges of
- * vs-two-cards, vblank exceptions 24681 against 24631). Modelled where the
- * exchange is the measured one (digital pads in both ports, the blank in
- * no other exception, not in the 480-line menus, whose alternate fields
- * read 10 sooner); LIBPAD_VBLANK_PORT2_CYCLES is its mean otherwise. */
-static int Port2WaitTurns(uint64_t blank_ns) {
-    uint64_t start_ns = Psyz_KernelCounterStartNs(2);
-    if (!start_ns || !Psyz_KernelOfflineClock() || Psyz_GpuCrtcInterlaced480()) {
-        return -1;
-    }
-    uint64_t blank = Psyz_NsToClocks(blank_ns + 15), t0 = Psyz_NsToClocks(start_ns + 15);
-    uint64_t s = blank + LIBPAD_PORT2_WAIT_READ_CLOCKS;
-    if (s < t0) {
-        return -1;
-    }
-    uint64_t counted = (s + LIBPAD_PORT2_WAIT_LAST_CLOCKS - t0) / 8 - (s - t0) / 8;
-    return counted < LIBPAD_PORT2_WAIT_COUNTS ? 17 : 16;
-}
-
-static int PadTrace(void) {
-    static int trace = -1;
-    if (trace < 0) {
-        const char* v = getenv("PSYZ_PAD_TRACE");
-        trace = v && *v == '1';
-    }
-    return trace;
-}
-
-/* PSYZ_BLANK_FORCE=<vsync>:pad=<0|1>[:card=<0|1>],... (diagnostics): at
- * those blanks libpad's exchange and the card driver's turn are what is
- * named instead of what the dispatch windows decide, to see where a
- * scenario goes when a blank near a window's boundary goes the other way
- * (tools/port/ds_compare.py --force-blanks). */
-enum { BLANK_FORCE_MAX = 64 };
-static struct {
-    unsigned vsync;
-    signed char pad, card;
-} blank_force[BLANK_FORCE_MAX];
-static int blank_force_len = -1;
-
-static void BlankForce(unsigned vsync, int* pad, int* card) {
-    if (blank_force_len < 0) {
-        blank_force_len = 0;
-        const char* v = getenv("PSYZ_BLANK_FORCE");
-        while (v && *v && blank_force_len < BLANK_FORCE_MAX) {
-            char* end;
-            unsigned n = (unsigned)strtoul(v, &end, 10);
-            if (end == v) {
-                break;
-            }
-            blank_force[blank_force_len].vsync = n;
-            blank_force[blank_force_len].pad = -1;
-            blank_force[blank_force_len].card = -1;
-            v = end;
-            while (*v == ':') {
-                v++;
-                if (!strncmp(v, "pad=", 4)) {
-                    blank_force[blank_force_len].pad = (signed char)(v[4] == '1');
-                    v += 5;
-                } else if (!strncmp(v, "card=", 5)) {
-                    blank_force[blank_force_len].card = (signed char)(v[5] == '1');
-                    v += 6;
-                } else {
-                    break;
-                }
-            }
-            blank_force_len++;
-            while (*v && *v != ',') {
-                v++;
-            }
-            if (*v == ',') {
-                v++;
-            }
-        }
-    }
-    for (int i = 0; i < blank_force_len; i++) {
-        if (blank_force[i].vsync == vsync) {
-            if (blank_force[i].pad >= 0) {
-                *pad = blank_force[i].pad;
-            }
-            if (blank_force[i].card >= 0) {
-                *card = blank_force[i].card;
-            }
-        }
-    }
-}
-
-/* A blank that comes while another interrupt is dispatched, after the BIOS
- * chains tested for it, reaches only libetc's dispatcher: libpad has no
- * exchange and the BIOS card driver no turn at that vblank
- * (BIOS_CHAIN_*_TEST_CLOCKS, LIBETC_DISPATCH_EXIT_CLOCKS: timing_profile.h). */
+/* The work of a blank: the controllers, the host's hook, the vblank
+ * interrupt (the game's VSync callbacks and events). */
 void Psyz_VSyncBlank(void) {
-    // on the offline clock the blank's exact time: it runs there
-    uint64_t blank_ns = Psyz_KernelNowNs();
-    long debt = Psyz_KernelDebtClocks();
-    last_blank_ns = blank_ns;
-    Psyz_VSyncBlankTaken();
     Psyz_CardBlankBegin();
-    Psyz_GpuCrtcBlank();
-    int pad_exchange =
-        Psyz_PadDriverRunning() &&
-        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
-                                    LIBETC_DISPATCH_EXIT_CLOCKS);
-    int card_turn =
-        !Psyz_KernelBlankInDispatch(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
-                                    LIBETC_DISPATCH_EXIT_CLOCKS);
-    if (Psyz_PadDriverRunning()) {
-        BlankForce((unsigned)Psyz_VideoVSync(-1), &pad_exchange, &card_turn);
-    }
-    int raw_end = Psyz_CardRawEndsAt(card_turn) || Psyz_CardTimeoutAt(card_turn);
-    if (raw_end) {
-        pad_exchange = 0;
-    }
-    ReadPadsOnVsync(pad_exchange || !Psyz_PadDriverRunning());
-    int port2_wait = 0;
-    if (pad_exchange && Psyz_LibpadExchanged(0, NULL) && Psyz_LibpadExchanged(1, NULL) && !PacketCycles(0) &&
-        !PacketCycles(1) && !Psyz_LibpadGateCycles(0) && !Psyz_LibpadGateCycles(1) && !Psyz_LibpadRefused(0) &&
-        !Psyz_LibpadRefused(1)) {
-        unsigned since = 0, cycles = 0;
-        int open = Psyz_KernelLastDispatch(blank_ns, &since, &cycles) && since < cycles;
-        int turns = open ? -1 : Port2WaitTurns(blank_ns);
-        if (turns > 0) {
-            port2_wait = (turns - 16) * LIBPAD_RC2_TURN_CYCLES - LIBPAD_PORT2_WAIT_MEAN_CYCLES;
-        }
-        if (PadTrace() && turns > 0) {
-            fprintf(stderr, "pad: port 2 wait %d turns\n", turns);
-        }
-    }
-    Psyz_KernelInterruptCycles(
-        VBLANK_HANDLER_CYCLES +
-        (raw_end ? CARD_RAW_END_CYCLES
-                 : Psyz_CardDriverRunning() && card_turn ? CARD_VBLANK_TURN_CYCLES
-                                                         : 0) +
-        (pad_exchange
-             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) + Psyz_LibpadGateCycles(0) -
-                   (!Psyz_LibpadExchanged(0, NULL) ? LIBPAD_EMPTY_PORT1_SAVED_CYCLES : 0) -
-                   (Psyz_LibpadRefused(0) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0) +
-                   (Psyz_LibpadExchanged(1, NULL)
-                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) + Psyz_LibpadGateCycles(1) +
-                              port2_wait -
-                              (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_PORT2_SAVED_CYCLES
-                                                     : 0)
-                        : 0)
-             : 0));
-    if (PadTrace()) {
-        unsigned since = 0, cycles = 0;
-        int seen = Psyz_KernelLastDispatch(blank_ns, &since, &cycles);
-        fprintf(stderr,
-                "pad: blank %u exchange %d card %d dispatch %d +%u/%u at %" PRIu64
-                " margin %d %d\n",
-                (unsigned)Psyz_VideoVSync(-1), pad_exchange, card_turn, seen,
-                since, cycles, blank_ns,
-                Psyz_KernelBlankMargin(blank_ns, BIOS_CHAIN_PAD_TEST_CLOCKS,
-                                       LIBETC_DISPATCH_EXIT_CLOCKS),
-                Psyz_KernelBlankMargin(blank_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
-                                       LIBETC_DISPATCH_EXIT_CLOCKS));
-    }
-    Psyz_CardVBlank(card_turn);
+    ReadPadsOnVsync();
     if (g_PsyzVsyncCb)
         g_PsyzVsyncCb();
     Psyz_KernelVBlank();
-    // its exception, for the DMA interrupts that come meanwhile
-    long cycles = Psyz_KernelDebtClocks() - debt;
-    Psyz_KernelNoteException(blank_ns, cycles > 0 ? (unsigned)cycles : 0);
-    Psyz_KernelEventTrace((unsigned)Psyz_VideoVSync(-1));
 }
 
 /* SDK VSync(n) waits for the interval since the previous blocking call,
  * then at least the next blank. Queries do not reset that interval. */
 static unsigned int last_vsync_count;
 
-/* In 480-line interlace libetc's VSync also waits, after the blank, until
- * GPUSTAT bit 31 differs from its value before the blank wait: at once when
- * the field read was odd, else at the start of the display range (about 48
- * lines into the next field for a PAL 256-line screen), so every other
- * VSync(0) returns late (DuckStation's frames alternate 266 and 362 lines);
- * a read in the blank of an overrun frame can wait a further field. VSync(1)
- * counts lines from that return, as the PS1's Hcount latch does (the
- * platform counts from the blank of its last VSync(0)). */
-static unsigned int vsync_return_lines;
-
 static unsigned LineNs(void) {
     return Psyz_GpuCrtcFieldLines() == 314 ? 64017 : 63563;
-}
-
-static unsigned LinesSinceBlank(void) {
-    uint64_t now_ns = Psyz_KernelNowNs();
-    if (now_ns <= last_blank_ns) {
-        return 0;
-    }
-    return (unsigned)((now_ns - last_blank_ns) / LineNs());
 }
 
 /* On a real-time clock the blanks come from the wall clock, also while the
@@ -333,39 +138,12 @@ static unsigned int WaitBlank(unsigned int now) {
         return ServiceWallBlanks();
     }
     wall_serviced_valid = 0;
-    if (Psyz_KernelOfflineClock()) {
-        /* The handlers that ran during the wait were the polling loop's
-         * time: only one still running at the blank delays what follows. */
-        Psyz_KernelTakeInterruptCycles();
-        uint64_t at_ns = Psyz_KernelNowNs();
-        unsigned since = 0, cycles = 0;
-        if (Psyz_KernelLastDispatch(at_ns, &since, &cycles) && cycles > since) {
-            Psyz_KernelInterruptCycles(cycles - since);
-        }
-    }
     now = (unsigned int)Psyz_VideoVSync(-1);
     unsigned int advanced = now - before;
     while (advanced--) {
         Psyz_VSyncBlank();
     }
     return now;
-}
-
-/* The lines after the blank until GPUSTAT bit 31 differs from `odd_read`;
- * whole fields it stays the same are waited here. */
-static unsigned InterlaceWait(int odd_read, unsigned int* now) {
-    for (int fields = 0; fields < 3; fields++) {
-        if (Psyz_GpuCrtcOddLine(0) != odd_read) {
-            return 0; // flipped at the blank
-        }
-        unsigned blank = Psyz_GpuCrtcBlankLines();
-        if (Psyz_GpuCrtcOddLine(blank) != odd_read) {
-            return blank;
-        }
-        Psyz_KernelTakeInterruptCycles(); // the poll loop runs meanwhile
-        *now = WaitBlank(*now);
-    }
-    return 0;
 }
 
 int VSync(int mode) {
@@ -377,76 +155,29 @@ int VSync(int mode) {
         ServiceWallBlanks();
     }
     if (mode == 1) {
-        static int trace = -1;
-        if (trace < 0) {
-            trace = getenv("PSYZ_VSYNC_TRACE") != NULL;
+        /* The lines since the latest VSync(0) returned. A game polls this
+         * in a loop (until a frame has taken so many lines): on the offline
+         * clock, where its work takes no time, each look moves the clock a
+         * line on, so such a loop crosses the blanks a frame of that length
+         * would. */
+        if (Psyz_KernelOfflineClock()) {
+            Psyz_KernelWaitUntilNs(Psyz_KernelNowNs() + LineNs());
+            return (unsigned short)((Psyz_KernelNowNs() - vsync_return_ns) / LineNs());
         }
-        if (trace) {
-            // (as DUCKSTATION_IOREAD_TRACE's GPUSTAT read, 21 clocks into
-            // the call; the game's frame loop's return address)
-            uint64_t ns = Psyz_KernelNowNs();
-            fprintf(stderr, "vsr %llu 8001e7d8\n",
-                    (unsigned long long)(Psyz_NsToClocks(ns + 15) + 21));
-        }
-        Psyz_KernelTakeInterruptCycles(); // a polling loop absorbs handlers
-        unsigned short lines = (unsigned short)(Psyz_VideoVSync(1) - vsync_return_lines);
-        Psyz_SpendCycles(LIBETC_VSYNC_QUERY_CYCLES);
-        return lines;
+        return (unsigned short)Psyz_VideoVSync(1);
     }
 
-    int raw = Psyz_VideoVSync(1);
-    int elapsed = (unsigned short)(raw - vsync_return_lines);
+    int elapsed = (unsigned short)Psyz_VideoVSync(1);
     unsigned int now = (unsigned int)Psyz_VideoVSync(-1);
     unsigned int target =
         mode > 1 ? last_vsync_count + (unsigned int)mode : now + 1;
     if ((int32_t)(target - now) < 1)
         target = now + 1;
-    // GPUSTAT as libetc reads it: now, or at the blank before the target
-    // offline clock only: real-time presentation paces the fields itself
-    int interlace = Psyz_GpuCrtcInterlaced480() && Psyz_KernelOfflineClock();
-    int odd_read = 0;
-    if (interlace) {
-        odd_read = Psyz_GpuCrtcOddLine(
-            (int32_t)(target - 1 - now) > 0 ? 0 : LinesSinceBlank());
-    }
-    Psyz_KernelTakeInterruptCycles(); // the wait loop absorbs earlier handlers
     do {
         now = WaitBlank(now);
     } while ((int32_t)(now - target) < 0);
-    unsigned wait_lines = interlace ? InterlaceWait(odd_read, &now) : 0;
-    /* The loop sees the blank once the vblank handler is done: VSync returns
-     * after it, or at the interlace field change if that is later. */
-    uint64_t handler_ns = (uint64_t)Psyz_KernelTakeInterruptCycles() *
-                          1000000000u / 33868800u;
-    uint64_t wait_ns = (uint64_t)wait_lines * LineNs();
-    if (PadTrace())
-        fprintf(stderr, "pad: vsync return handler %llu ns wait %u lines\n",
-                (unsigned long long)handler_ns, wait_lines);
-    int waited_field = !(handler_ns > wait_ns);
-    if (handler_ns > wait_ns) {
-        /* the vblank's exception: an interrupt that comes before it ends
-         * is served in it and lengthens it, where a poll of GPUSTAT takes
-         * it within its spin (DuckStation: a stream sector 4.6k clocks
-         * after the blank, Versus movie vsync 935, makes the exception
-         * 28485 clocks, 24654 without) */
-        vsync_return_lines = (unsigned)((handler_ns + LineNs() / 2) / LineNs());
-        Psyz_SpendCycles((unsigned)(handler_ns * 33868800u / 1000000000u));
-    } else {
-        if (wait_ns) {
-            Psyz_SpendTime((unsigned)wait_ns);
-        }
-        vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
-    }
-    if (Psyz_KernelOfflineClock()) {
-        /* interlaced: the loop on GPUSTAT's field bit after the count's; it
-         * sees the change it waited for sooner than the exception's return,
-         * or it reads the bit once more after the exception */
-        Psyz_SpendCycles(!interlace      ? VSYNC_RETURN_CYCLES
-                         : waited_field ? VSYNC_FIELD_WAIT_RETURN_CYCLES
-                                        : VSYNC_RETURN_CYCLES +
-                                              VSYNC_FIELD_CHECK_CYCLES);
-    }
     Psyz_CdServiceDrive();
+    vsync_return_ns = Psyz_KernelNowNs();
     /* Keep periodic waits on their scheduled blank. Native presentation can
      * return just after it; using that late return as the next origin adds a
      * blank repeatedly and lets FMV pictures drift behind device audio.
@@ -550,39 +281,20 @@ void SystemError(char c, long n) {
     ERRORF("SystemError('%c', 0x%X)", c, n);
 }
 
-/* The BIOS card directory search after firstfile's sector 0 check, more
- * when it returns an entry, and a nextfile (BIOS_CARD_*, timing_profile.h). */
-static int card_search; // the last firstfile searched a card
-
 struct DIRENTRY* my_firstfile(char* dirPath, struct DIRENTRY* firstEntry);
 struct DIRENTRY* firstfile(char* dirPath, struct DIRENTRY* firstEntry) {
-    // The BIOS checks the card ("buPS:") by reading its sector 0 first.
-    card_search = dirPath && dirPath[0] == 'b' && dirPath[1] == 'u' &&
-                  dirPath[2] >= '0' && dirPath[2] <= '1' &&
-                  dirPath[3] >= '0' && dirPath[3] <= '3';
-    if (card_search) {
-        Psyz_CardSyncTransfer(((dirPath[2] - '0') << 4) | (dirPath[3] - '0'));
-        // no card there (taken out: its host directory remains): no entry
-        if (dirPath[3] != '0' || Psyz_CardSlotState(dirPath[2] - '0') == PSYZ_CARD_NONE) {
-            card_search = 0;
-            return NULL;
-        }
+    // A card taken out (its host directory remains) has no entry.
+    if (dirPath && dirPath[0] == 'b' && dirPath[1] == 'u' &&
+        dirPath[2] >= '0' && dirPath[2] <= '1' && dirPath[3] >= '0' &&
+        dirPath[3] <= '3' &&
+        (dirPath[3] != '0' || Psyz_CardSlotState(dirPath[2] - '0') == PSYZ_CARD_NONE)) {
+        return NULL;
     }
-    struct DIRENTRY* entry = my_firstfile(dirPath, firstEntry);
-    if (card_search) {
-        Psyz_SpendCycles(BIOS_CARD_FIRSTFILE_CYCLES +
-                         (entry ? BIOS_CARD_ENTRY_CYCLES : 0));
-    }
-    return entry;
+    return my_firstfile(dirPath, firstEntry);
 }
 
 struct DIRENTRY* my_nextfile(struct DIRENTRY* outEntry);
-struct DIRENTRY* nextfile(struct DIRENTRY* outEntry) {
-    if (card_search) {
-        Psyz_SpendCycles(BIOS_CARD_NEXTFILE_CYCLES);
-    }
-    return my_nextfile(outEntry);
-}
+struct DIRENTRY* nextfile(struct DIRENTRY* outEntry) { return my_nextfile(outEntry); }
 
 long my_erase(char* path);
 long erase(char* path) { return my_erase(path); }
@@ -600,36 +312,18 @@ int psyz_get_errno(void) {
     return 0;
 }
 
-/* BIOS A(28h)/A(2Ah)/A(2Bh), with the time of the ROM byte loops (system.h,
- * BIOS_FILL_* and BIOS_COPY_* in timing_profile.h). */
-
-static void BiosByteLoopTime(unsigned base, unsigned per_byte, int len) {
-    uint64_t cycles = base + (len > 0 ? (uint64_t)len * per_byte : 0);
-    Psyz_KernelRomCode(1);
-    while (cycles > UINT32_MAX) {
-        Psyz_SpendCycles(UINT32_MAX);
-        cycles -= UINT32_MAX;
-    }
-    Psyz_SpendCycles((unsigned)cycles);
-    Psyz_KernelRomCode(0);
-}
+/* BIOS A(28h)/A(2Ah)/A(2Bh) (system.h). */
 
 void Psyz_BiosBzero(void* dst, int len) {
     if (dst && len > 0) {
         memset(dst, 0, (size_t)len);
     }
-    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, dst ? len : 0);
-}
-
-void Psyz_BiosBzeroTime(int len) {
-    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, len);
 }
 
 void* Psyz_BiosMemset(void* dst, int c, int len) {
     if (dst && len > 0) {
         memset(dst, c & 0xFF, (size_t)len);
     }
-    BiosByteLoopTime(BIOS_FILL_CYCLES, BIOS_FILL_BYTE_CYCLES, dst ? len : 0);
     return dst;
 }
 
@@ -642,7 +336,5 @@ void* Psyz_BiosMemcpy(void* dst, const void* src, int len) {
             d[i] = s[i];
         }
     }
-    BiosByteLoopTime(BIOS_COPY_CYCLES, BIOS_COPY_BYTE_CYCLES,
-                     dst && src ? len : 0);
     return dst;
 }

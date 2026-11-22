@@ -13,16 +13,7 @@ static inline void StCdInterrupt2(u_char intr, u_char* result) {
 
 int CdRead2(long mode) {
     u8 param = mode;
-#ifdef __psyz
-    /* CdRead2's own code up to its ReadS (charged with the Setmode's
-     * return: it can be less than CdControl's own return charge) */
-    _Static_assert((int)CD_CONTROL_RETURN_CYCLES + (int)CD_READ2_CYCLES >= 0,
-                   "CD_READ2_CYCLES below CdControl's return charge");
-    Psyz_CdControlThen(CdlSetmode, &param, NULL,
-                       Psyz_CdLoopModel() ? CD_READ2_LOOP_CYCLES : CD_READ2_CYCLES);
-#else
     CdControl(CdlSetmode, &param, NULL);
-#endif
     CD_LOCK();
     if (mode & CdlModeStream) {
         if (mode & CdlModeSize1) {

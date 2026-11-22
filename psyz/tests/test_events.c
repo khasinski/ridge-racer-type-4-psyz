@@ -22,10 +22,6 @@ int Psyz_OsThreadStart(void (*fn)(void), const char* name) {
     (void)name;
     return -1;
 }
-int Psyz_AudioWaitUs(uint64_t us) {
-    (void)us;
-    return 0;
-}
 int Psyz_AudioWaitNs(uint64_t ns) {
     (void)ns;
     return 0;
@@ -42,7 +38,6 @@ void psyz_log(unsigned level, const char* file, unsigned line, const char* func,
     (void)fmt;
 }
 long GetVideoMode(void) { return 0; }
-int Psyz_CardChainInstalled(void) { return 0; }
 static unsigned calls;
 static long tick(void) {
     calls++;
@@ -52,13 +47,13 @@ static unsigned timed_a, timed_b;
 static void timed_tick_a(void) { timed_a++; }
 static void timed_tick_b(void) { timed_b = timed_a + 1; } // records order
 
-/* Timed device completions (Psyz_KernelPostAt): one deadline per callback,
+/* Timed device completions (Psyz_KernelPostAtNs): one deadline per callback,
  * so a repost moves it (a stale deadline never ends a later transfer), a
  * cancel drops it, and different callbacks keep their own. */
 static int timed_queue_cases(void) {
     clock_us = UINT64_C(5000000);
-    Psyz_KernelPostAt(clock_us + 100, timed_tick_a);
-    Psyz_KernelPostAt(clock_us + 300, timed_tick_a); // moves it
+    Psyz_KernelPostAtNs((clock_us + 100) * 1000, timed_tick_a);
+    Psyz_KernelPostAtNs((clock_us + 300) * 1000, timed_tick_a); // moves it
     clock_us += 150;
     Psyz_KernelPoll();
     if (timed_a != 0)
@@ -71,14 +66,14 @@ static int timed_queue_cases(void) {
     Psyz_KernelPoll();
     if (timed_a != 1)
         return 22;
-    Psyz_KernelPostAt(clock_us + 10, timed_tick_a);
+    Psyz_KernelPostAtNs((clock_us + 10) * 1000, timed_tick_a);
     Psyz_KernelCancel(timed_tick_a);
     clock_us += 100;
     Psyz_KernelPoll();
     if (timed_a != 1)
         return 23;
-    Psyz_KernelPostAt(clock_us + 50, timed_tick_b);
-    Psyz_KernelPostAt(clock_us + 20, timed_tick_a);
+    Psyz_KernelPostAtNs((clock_us + 50) * 1000, timed_tick_b);
+    Psyz_KernelPostAtNs((clock_us + 20) * 1000, timed_tick_a);
     clock_us += 100;
     Psyz_KernelPoll();
     if (timed_a != 2 || timed_b != 3) // a first, then b
@@ -1186,49 +1181,23 @@ ZTEST(events, inserted_card_is_new_until_written) {
     card_poll(card_hw, 0);
 }
 
-static int card_vblanks_until_event(const long* events) {
-    for (int n = 0; n <= 8; n++) {
-        for (int i = 0; i < CARD_SPECS; i++) {
-            if (TestEvent(events[i])) {
-                return n;
-            }
-        }
-        VSync(0);
-    }
-    return -1;
-}
-
-// The BIOS card driver serves each port on alternate vblanks: a request
-// finishes at that port's next turn (one or two vblanks later), an empty
-// port times out a vblank after its turn.
-ZTEST(events, card_info_takes_the_drivers_turn_of_the_port) {
+// The card's requests complete at once: their event is there when the call
+// returns.
+ZTEST(events, card_info_completes_at_once) {
     card_start();
     zassert_s32_eq(1, _card_info(CARD_SLOT_1));
-    int n = card_vblanks_until_event(card_sw);
-    zexpect_s32_ge(1, n);
-    zexpect_s32_le(3, n);
+    zexpect_s32_ne(-1, card_poll(card_sw, 0));
 }
 
-// A memory card file's frames take the driver's turns of the port: a 1-block
-// FASYNC read raises SwCARD (only) about 2 x 64 vblanks later, a write one
-// turn later still.
-ZTEST(events, card_file_read_takes_a_turn_per_frame) {
+// The end of an FASYNC memory card file transfer raises SwCARD's IOE (only).
+ZTEST(events, card_file_io_done_raises_sw_card_ioe) {
     card_start();
     if (card_info(CARD_SLOT_1) != CARD_IOE) {
         zskip("slot 1 has no card ready for reading");
     }
     card_poll(card_hw, 0);
-    // count blanks, not loop turns: a stalled host can take several
-    // blanks in one VSync(0)
-    int start = VSync(-1);
-    Psyz_CardFileTransfer(CARD_SLOT_1, 0x2000, 1, 0);
-    int n = 0;
-    while (!TestEvent(card_sw[CARD_IOE]) && n <= 140) {
-        VSync(0);
-        n = VSync(-1) - start;
-    }
-    zexpect_s32_ge(126, n);
-    zexpect_s32_le(130, n);
+    Psyz_CardFileIoDone();
+    zexpect_s32_eq(1, TestEvent(card_sw[CARD_IOE]));
     zexpect_s32_eq(-1, card_poll(card_hw, 0));
 }
 

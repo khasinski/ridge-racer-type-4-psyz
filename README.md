@@ -238,11 +238,11 @@ Audio/SPU APIs. Detach with a NULL callback before releasing its userdata.
 bypass the observer. This captures emulator output; it is not a hardware
 accuracy oracle.
 
-With `PSYZ_AUDIO_CLOCK=video` set at process startup, emulated root counters
-also use the sample clock, with no host timer thread. Mixing splits at timer
-edges so handlers can update voices within a video frame. Host delays and
-clock queries do not advance this time. Native synchronous waits that depend
-on a timer can call `Psyz_AudioWaitForTimer`: it generates a bounded block up
-to the next timer edge without advancing VBlank; real-time/paused backends
-return zero and continue using their normal polling/waiting path. Configure
-the clock before initializing the kernel; changing it during a run is unsupported.
+With `PSYZ_AUDIO_CLOCK=video` set at process startup the kernel runs on a
+deterministic field clock instead of the host's: it stands still while the
+game works and moves only in the game's waits (VSync, a poll of the line
+counter, a wait for a stream's next sector), with no host timer thread. The
+root counters fire at their times on the way and mixing splits at their
+edges, so handlers can update voices within a video frame. Host delays and
+clock queries do not advance this time. Configure the clock before
+initializing the kernel; changing it during a run is unsupported.

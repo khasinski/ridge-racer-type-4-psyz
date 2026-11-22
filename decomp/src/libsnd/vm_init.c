@@ -93,15 +93,6 @@ void _SsVmInit(char numVoices) {
     _svm_auto_kof_mode = 0;
     _svm_stereo_mono = 0;
     kMaxPrograms = 128;
-#ifdef __psyz
-    {
-        extern int _ss_flush_uncharged; // SS_INIT_CYCLES has it
-        _ss_flush_uncharged = 1;
-        _SsVmFlush();
-        _ss_flush_uncharged = 0;
-    }
-#else
     _SsVmFlush();
-#endif
 }
 #endif

@@ -37,7 +37,8 @@ static unsigned seen_start, seen_end;
 static unsigned char got[64];
 static int got_len;
 
-static void Spend(unsigned us) { Psyz_SpendTime(us * 1000); }
+/* Lets that much host time pass (the link's bytes arrive by the clock). */
+static void Spend(unsigned us) { usleep(us); }
 
 static int PeerSend(int type, const void* payload, int len) {
     unsigned char frame[2 + 255];

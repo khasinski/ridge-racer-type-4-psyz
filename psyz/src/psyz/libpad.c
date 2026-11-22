@@ -36,7 +36,6 @@
 #include <string.h>
 
 #include "../internal.h"
-#include "../timing_profile.h"
 
 
 /* The tables a channel loads (modes, actuators, combinations) live in a
@@ -93,14 +92,6 @@ static u8* scan_ptr;   // PadPatchScanPtr
 static u8 rx_latch;
 static int ack_latch;
 static int bus_port;
-
-/* What the handler did at the latest vblank, for its time. */
-static struct {
-    int answered; // the controller ACKed the address byte
-    int halfwords; // of the packet received to its end, else 0
-    int refused;   // the controller did not ACK the command byte
-    int gates;     // the actuator gates _padAllocGates opened (bit per byte)
-} exchanged[2];
 
 static void Send(u8 byte) {
     ack_latch = Psyz_PadsTransfer(bus_port, Psyz_PadsFrame(bus_port), byte,
@@ -682,13 +673,11 @@ static int Exchange(Channel* c, int port) {
     r = SioRW2(c, c->command37 ? c->command37 : 0x42);
     if (r < 0)
         return r;
-    exchanged[port].answered = 1;
     // stage 2: the ID; the Multi Tap byte
     r = SioRW2(c, 0);
     if (r < 0) {
         // a command the controller does not know (a digital pad's 0x43
         // while libpad probes for analog modes) is not acknowledged
-        exchanged[port].refused = r == -2;
         return r;
     }
     bytes_left = (r & 0xF) * 2;
@@ -702,12 +691,6 @@ static int Exchange(Channel* c, int port) {
         return -4;
     // _padTransferPacket
     AllocGates(c);
-    // the gates of a DualShock's actuators, which libpad matched to its
-    // PadSetAct buffer (not a digital pad's, all open)
-    if (c->pending && c->data28) {
-        for (int j = 0; j < 6; j++)
-            exchanged[port].gates |= GATES(c)[j] ? 1 << j : 0;
-    }
     while (bytes_left >= 2) {
         if (slot_index[port ^ 1] < 0)
             break;
@@ -728,7 +711,6 @@ static int Exchange(Channel* c, int port) {
     }
     if (c->b44 < sizeof(c->packet))
         c->packet[c->b44++] = rx_latch;
-    exchanged[port].halfwords = c->packet[0] & 0xF ? c->packet[0] & 0xF : 16;
     return 0;
 }
 
@@ -758,7 +740,7 @@ static void IntPad(void) {
         InitSioMode(c, port);
         bus_port = port;
         r = Exchange(c, port);
-        if (Trace() && exchanged[port].answered) {
+        if (Trace()) {
             fprintf(stderr,
                     "libpad: port %d command %02x result %d packet %02x %02x "
                     "phase %02x state %d\n",
@@ -766,7 +748,6 @@ static void IntPad(void) {
                     c->packet[0], c->packet[1], c->phase, c->state49);
         }
         if (r < 0) {
-            exchanged[port].halfwords = 0;
             FailAuto(c);
             SaveCommand(c);
         } else {
@@ -777,38 +758,11 @@ static void IntPad(void) {
 }
 
 void Psyz_LibpadVBlank(void) {
-    memset(exchanged, 0, sizeof(exchanged));
     if (com_started)
         IntPad();
 }
 
 int Psyz_PadDriverRunning(void) { return com_started; }
-
-int Psyz_LibpadRefused(int port) {
-    return port >= 0 && port <= 1 && exchanged[port].refused;
-}
-
-/* The time an exchange's open actuator gates add to libpad's handler: on
- * DuckStation a DualShock's vblank exception is 47 clocks longer with its
- * small motor's gate open, 90 with the large motor's, 146 with both (the
- * Time Attack race's rumble: VSync's return to PutDispEnv against the
- * port's in 760 race fields, by the gates the port opened in the same
- * fields, ta-course4; DSF_MARKS PutDispEnv, DSF_EXC=0) [mark] */
-unsigned Psyz_LibpadGateCycles(int port) {
-    if (port < 0 || port > 1)
-        return 0;
-    int g = exchanged[port].gates;
-    return (g & 1 ? LIBPAD_GATE_SMALL_CYCLES : 0) + (g & 2 ? LIBPAD_GATE_LARGE_CYCLES : 0) +
-           ((g & 3) == 3 ? LIBPAD_GATES_BOTH_CYCLES : 0);
-}
-
-int Psyz_LibpadExchanged(int port, int* halfwords) {
-    if (port < 0 || port > 1)
-        return 0;
-    if (halfwords)
-        *halfwords = exchanged[port].halfwords;
-    return exchanged[port].answered;
-}
 
 /* ---- the library's entry points ---- */
 
@@ -817,7 +771,6 @@ static Channel* PortToChannel(int selector) {
 }
 
 void PadInitDirect(u_char* pad1, u_char* pad2) {
-    Psyz_SpendCycles(PAD_INIT_DIRECT_CYCLES);
     PadInit(0); // the host's controllers
     com_active = 0;
     memset(channels, 0, sizeof(channels));
@@ -834,7 +787,6 @@ void PadInitDirect(u_char* pad1, u_char* pad2) {
 }
 
 void PadStartCom(void) {
-    Psyz_SpendCycles(PAD_START_COM_CYCLES);
     com_started = 1;
     ResetChannel(&channels[0]);
     ResetChannel(&channels[1]);

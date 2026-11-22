@@ -21,23 +21,16 @@ extern "C" {
 #endif
 
 /* BIOS random generator, separate from the host C library. The state getter
- * plus Psyz_Srand allow deterministic save/restore without consuming a value.
- * Psyz_Rand and Psyz_Srand take the PS1 time of the ROM routines. */
+ * plus Psyz_Srand allow deterministic save/restore without consuming a value. */
 int Psyz_Rand(void);
 void Psyz_Srand(unsigned int seed);
 unsigned int Psyz_RandState(void);
 
 /* BIOS A(28h) bzero, A(2Ah) memcpy and A(2Bh) memset, the routines a PSY-Q
- * game reaches through LIBC's A0 stubs. They run from the uncached 8-bit BIOS
- * ROM, so they are slow: bzero/memset take 328 + 132 clocks per byte and
- * memcpy 258 + 204 (DuckStation, SCPH-1001 BIOS: bzero(0x620) = 207300,
- * memcpy(0x5C) = 19019, memset(8) = 1384 system clocks). The work is done at
- * once and the time is spent with Psyz_SpendCycles. A length below one does
- * nothing (but the call); memcpy and memset return dst, as the BIOS does. */
+ * game reaches through LIBC's A0 stubs. A length below one does nothing;
+ * memcpy copies forwards byte by byte, overlapping or not; memcpy and
+ * memset return dst, as the BIOS does. */
 void Psyz_BiosBzero(void* dst, int len);
-/* The time of bzero(len) only, for a host structure cleared with memset
- * whose PS1 size is len. */
-void Psyz_BiosBzeroTime(int len);
 void* Psyz_BiosMemcpy(void* dst, const void* src, int len);
 void* Psyz_BiosMemset(void* dst, int c, int len);
 
@@ -134,7 +127,7 @@ int Psyz_QuitRequested(void);
 char* Psyz_JoinPath(char* left, const char* right, int maxlen);
 
 /**
- * @brief Callback fired once per emulated vsync.
+ * @brief Callback fired once per vertical blank.
  */
 typedef void (*PsyzVSyncCb)(void);
 
@@ -155,120 +148,21 @@ typedef void (*PsyzVSyncCb)(void);
 PsyzVSyncCb Psyz_SetVSyncCb(PsyzVSyncCb cb);
 
 /**
- * @brief Spend emulated time as the PS1 CPU would on native work
+ * @brief The end of a memory card ("bu") file transfer
  *
- * Native code runs in no emulated time. Where a game's timing depends on
- * how long the PS1 took for a computation or a busy loop (a frame decoded
- * in software, a poll loop with a retry count), it can account for that
- * time here: on the offline clock (PSYZ_AUDIO_CLOCK=video) the time is
- * mixed, with the blanks it crosses happening meanwhile (VSync callbacks,
- * the VSync count); on a real-time clock the host waits until that much
- * time has passed since the previous call's deadline, so a run of short
- * calls adds up exactly.
- *
- * @param ns Nanoseconds of PS1 time
+ * For a host-side BIOS file layer: the host file I/O is done inside the
+ * call, and an FASYNC transfer raises SwCARD/EvSpIOE here, its end.
  */
-void Psyz_SpendTime(unsigned ns);
+void Psyz_CardFileIoDone(void);
 
 /**
- * @brief Spend PS1 CPU time given in system clocks (33.8688 MHz)
+ * @brief A BIOS open of a card file on `chan` (port << 4 | slot): whether a
+ * card answers
  *
- * Psyz_SpendTime for a cost measured in clocks, e.g. a routine timed on an
- * emulator; the fraction of a nanosecond is carried to the next call.
- *
- * @param cycles PS1 system clocks
+ * With no card in the port (or a multi-tap slot) the BIOS's open fails
+ * (returns 0); the card's host directory stays where it is.
  */
-void Psyz_SpendCycles(unsigned cycles);
-
-/**
- * @brief The emulated clock in system clocks (33.8688 MHz) since the start
- *
- * Offline clock (PSYZ_AUDIO_CLOCK=video) only, 0 otherwise: the position of
- * the main thread's work on the PS1 timeline, with the time spent but not
- * yet mixed and the interrupt handlers' time not yet taken. For timing
- * diagnostics (where a routine starts against the vblanks).
- */
-unsigned long long Psyz_EmulatedClocks(void);
-
-/**
- * @brief Complete MDEC output transfers at once
- *
- * By default the MDEC takes its PS1 time per macroblock and an output
- * transfer raises its DMA callback once its data is decoded, on the
- * emulated clock.
- *
- * @param instant Non-zero for instant transfers
- */
-void Psyz_MdecSetInstantTiming(int instant);
-
-/**
- * @brief Account for a memory card ("bu") file transfer of `bytes` on `chan`
- *
- * For a host-side BIOS file layer. The frames go through the card driver's
- * turns of the port (chan: port << 4 | slot). An asynchronous (FASYNC)
- * transfer raises SwCARD/EvSpIOE once the PS1 would have finished it, on
- * the emulated clock; a synchronous one waits for that before returning.
- * A read takes one transfer per 128-byte frame, a write (@p write non-zero)
- * one more.
- */
-void Psyz_CardFileTransfer(long chan, long bytes, int async, int write);
-
-/**
- * @brief The BIOS creating a card file on `chan`: its driver turns (the
- * directory's frames) or, without the driver, their time
- */
-void Psyz_CardFileCreate(long chan);
-
-/** Psyz_CardFileOpen / Psyz_CardFileClose modes (the BIOS open's FREAD,
- * FWRITE and FCREAT bits) */
-enum { PSYZ_CARD_FILE_READ = 1, PSYZ_CARD_FILE_WRITE = 2, PSYZ_CARD_FILE_CREATE = 0x200 };
-
-/**
- * @brief A BIOS open of a card file on `chan` in `mode`: whether a card
- * answers
- *
- * With no card in the port the BIOS's access to it goes out on the port's
- * next turn and times out at the vblank after; the open then fails
- * (returns 0). With a card it returns 1 after the BIOS's time to open an
- * existing file (a create's time is Psyz_CardFileCreate's).
- */
-int Psyz_CardFileOpen(long chan, int mode);
-
-/**
- * @brief The BIOS's time to close a card file opened on `chan` in `mode`
- */
-void Psyz_CardFileClose(long chan, int mode);
-
-/**
- * @brief Complete memory card requests and file I/O at once
- *
- * By default the BIOS card driver serves the two ports on alternate
- * vblanks, a sector transfer per turn, and an empty port times out a vblank
- * later (_card_info, _card_load, _card_read/_card_write, _bu_init).
- * PSYZ_CARD_TIMING=instant does the same.
- *
- * @param instant Non-zero for instant transfers
- */
-void Psyz_CardSetInstantTiming(int instant);
-
-/**
- * @brief Start a raw command on memory card channel `chan`
- *
- * For a host-side library that talks to the card port itself from its own
- * vblank handler (libmcx): the command goes out at the next vblank,
- * whichever port the BIOS card driver serves there, and is answered (timed
- * out by a plain memory card) at the vblank after. Returns 0 while a
- * command is in progress.
- */
-int Psyz_CardRawBegin(long chan);
-
-/**
- * @brief Poll (wait = 0) or wait for the raw command
- *
- * @return 1 once answered (the command is then finished), 0 while it runs,
- *         -1 when none was started
- */
-int Psyz_CardRawSync(int wait);
+int Psyz_CardFileOpen(long chan);
 
 /** Memory card slot states (Psyz_CardSlotState). */
 enum { PSYZ_CARD_NONE, PSYZ_CARD_FORMATTED, PSYZ_CARD_UNFORMATTED };
@@ -287,10 +181,9 @@ int Psyz_CardSlotState(int port);
 void Psyz_CardSetSlotState(int port, int state);
 
 /**
- * @brief The same at the next vblank, before the card driver's work there
+ * @brief The same at the next vblank
  *
- * As a card taken out or put in between two fields of the console: the
- * driver's transfer at that vblank already sees the new state.
+ * As a card taken out or put in between two fields of the console.
  */
 void Psyz_CardSetSlotStateAtBlank(int port, int state);
 

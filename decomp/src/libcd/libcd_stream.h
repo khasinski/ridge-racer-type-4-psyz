@@ -18,29 +18,11 @@ void StCdInterrupt(void);
 int DsDataCallback(void (*callback)(void));
 int DsReadyCallback(void (*callback)(u_char, u_char*));
 #ifdef __psyz
-/* Delivers the sectors the emulated drive has read since the last call to
- * the ready callback (StCdInterrupt while streaming). */
+/* Delivers what the drive has read for the ready callback (StCdInterrupt
+ * while streaming) and the command completions (libcd.c). */
 void Psyz_CdServiceDrive(void);
-/* The same from a StGetNext busy wait, which spends the PS1 time of a poll
- * of the ring. */
-void Psyz_CdPollDrive(void);
-/* A drive query in a busy loop (CdReadSync): spends its PS1 time and
- * delivers what the drive has read meanwhile. */
-void Psyz_CdPollQuery(void);
-void Psyz_CdPollCycles(unsigned cycles);
-/* PS1 CPU time of LIBCD's own code (timing_profile.h); none with
- * PSYZ_CD_TIMING=instant. */
-void Psyz_CdCpu(unsigned cycles);
-/* CdControl, then `then_cycles` of the caller's own code (negative: less
- * than CdControl's own return charge, never below nothing) */
-int Psyz_CdControlThen(u_char com, u_char* param, u_char* result, int then_cycles);
-unsigned Psyz_CdDoneIrqCycles(void);
-void Psyz_CdChargeDone(unsigned clocks);
-void Psyz_CdVSyncQuery(unsigned ra);
-int Psyz_CdLoopModel(void);
-int Psyz_CdTakeReadyFlag(void);
-void Psyz_CdSpendChunks(const signed char* c, unsigned n);
-void Psyz_KernelExceptionContext(int clocks);
-#include "../../../psyz/src/timing_profile.h"
+/* Waits for a paced read's next sector (a stream's), then services the
+ * drive. */
+void Psyz_CdWaitSector(void);
 #endif
 #endif

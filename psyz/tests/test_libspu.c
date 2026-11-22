@@ -2247,46 +2247,6 @@ ZTEST(audio_clock, root_counter_changes_pcm_inside_video_frame) {
 #endif
 }
 
-ZTEST(audio_clock, synchronous_wait_services_timer_without_vblank) {
-    zskip_targets("ps1;psp");
-#if defined(__psyz) && !defined(__PSP__)
-    const char* clock = getenv("PSYZ_AUDIO_CLOCK");
-    if (!clock || strcmp(clock, "video"))
-        zskip("requires PSYZ_AUDIO_CLOCK=video at process startup");
-    Psyz_AudioDestroy();
-    zassert_s32_eq(0, Psyz_AudioInit());
-    capture_test_voice();
-    static AudioCaptureProof proof;
-    memset(&proof, 0, sizeof(proof));
-    offline_timer_ticks = 0;
-    zassert_s32_eq(1, SetRCnt(RCntCNT2, 0x44E8, RCntMdINTR));
-    long event = audio_clock_event =
-        OpenEvent(RCntCNT2, EvSpINT, EvMdINTR, offline_timer_tick);
-    zassert_s32_eq(1, event != -1);
-    EnableEvent(event);
-    StartRCnt(RCntCNT2);
-    Psyz_AudioSetCaptureCallback(capture_playback_pcm, &proof);
-    int vblank = VSync(-1);
-    for (unsigned i = 1; i <= 4; ++i) {
-        zassert_s32_eq(1, Psyz_AudioWaitForTimer());
-        zassert_u32_eq(i, offline_timer_ticks);
-    }
-    zassert_s32_eq(vblank, VSync(-1));
-    zassert_u32_eq(735, proof.frames);
-    // one batch a tick, and one more where the field's blank comes between
-    // two ticks (the clock stops there too)
-    unsigned calls = proof.calls;
-    zassert_s32_eq(1, calls >= 4 && calls <= 5);
-    zassert_s32_eq(0, proof.overflow);
-    Psyz_AudioPause();
-    zassert_s32_eq(0, Psyz_AudioWaitForTimer());
-    zassert_u32_eq(calls, proof.calls);
-    Psyz_AudioSetCaptureCallback(NULL, NULL);
-    Psyz_AudioUnpause();
-    audio_clock_stop_timer();
-#endif
-}
-
 #if defined(__psyz) && !defined(__PSP__)
 int Psyz_SpuDmaBusy(void);
 void Psyz_SpuDmaWait(void);
@@ -2294,36 +2254,31 @@ static SDL_AtomicInt spu_dma_ends;
 static void count_spu_dma_end(void) { SDL_AddAtomicInt(&spu_dma_ends, 1); }
 #endif
 
-/* A transfer started while another runs ends that one at once; the old
- * transfer's posted end must not end the new, longer one early. */
-ZTEST(spu_dma, new_transfer_outlives_the_previous_transfers_deadline) {
+/* The data lands in SPU RAM at once and the transfer's end comes as an
+ * interrupt right after it; a wait for it ends it at once. */
+ZTEST(spu_dma, transfer_ends_at_once) {
     zskip_targets("ps1;psp");
 #if defined(__psyz) && !defined(__PSP__)
-    const char* timing = getenv("PSYZ_SPU_TIMING");
     const char* clock = getenv("PSYZ_AUDIO_CLOCK");
-    if (timing && !strcmp(timing, "instant"))
-        zskip("PSYZ_SPU_TIMING=instant ends transfers at once");
     if (clock && !strcmp(clock, "video"))
-        zskip("needs the real-time clock, which runs during SDL_Delay");
+        zskip("needs the interrupt thread of the real-time clock");
     static u_char data[0x40000];
     SpuInit();
     SpuSetTransferMode(SPU_TRANSFER_BY_DMA);
     SpuSetTransferCallback(count_spu_dma_end);
     SDL_SetAtomicInt(&spu_dma_ends, 0);
     SpuSetTransferStartAddr(0x1010);
-    SpuWrite(data, 0x400); // 0.24 ms of DMA
-    SpuSetTransferStartAddr(0x1010);
-    SpuWrite(data, sizeof(data)); // 62 ms; the first one ends now
-    int ended = SDL_GetAtomicInt(&spu_dma_ends);
-    SDL_Delay(5); // past the first transfer's deadline
+    SpuWrite(data, sizeof(data));
+    SDL_Delay(5); // the interrupt thread runs the end
     int busy = Psyz_SpuDmaBusy();
-    int ended_after = SDL_GetAtomicInt(&spu_dma_ends);
+    int ended = SDL_GetAtomicInt(&spu_dma_ends);
+    SpuSetTransferStartAddr(0x1010);
+    SpuWrite(data, 0x400);
     Psyz_SpuDmaWait();
     int ended_last = SDL_GetAtomicInt(&spu_dma_ends);
     SpuSetTransferCallback(NULL);
+    zexpect_s32_eq(0, busy);
     zexpect_s32_eq(1, ended);
-    zexpect_s32_eq(1, busy);
-    zexpect_s32_eq(1, ended_after);
     zexpect_s32_eq(2, ended_last);
 #endif
 }

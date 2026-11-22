@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsUtAllKeyOff SsUtAllKeyOff_Unlocked
 #endif
 
@@ -31,13 +31,9 @@ void SsUtAllKeyOff(short mode) {
 
 #ifdef __psyz
 #undef SsUtAllKeyOff
-void Psyz_SpendCycles(unsigned cycles);
-// PS1 time: SS_UT_ALL_KEY_OFF_VOICE_CYCLES a voice, a SpuSetVoiceAttr each
-#include "../../../psyz/src/timing_profile.h"
 void SsUtAllKeyOff(short mode) {
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsUtAllKeyOff_Unlocked(mode);
-    Psyz_KernelUnlockApi();
-    Psyz_SpendCycles((unsigned)(SS_UT_ALL_KEY_OFF_VOICE_CYCLES * _SsVmMaxVoice));
+    Psyz_KernelUnlockInterrupts();
 }
 #endif

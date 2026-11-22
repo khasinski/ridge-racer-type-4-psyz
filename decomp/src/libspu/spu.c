@@ -31,7 +31,7 @@ static int spu_madr = 0;
 static int spu_bcr = 0;
 
 #ifdef __psyz
-static void spu_dma_reset(void);
+static void spu_dma_end(void);
 #endif
 
 int _spu_init(int bHot) {
@@ -39,7 +39,7 @@ int _spu_init(int bHot) {
     int i;
 
 #ifdef __psyz
-    spu_dma_reset(); // a transfer still running ends now
+    spu_dma_end(); // a transfer still running ends now
 #endif
 
     *dma_dpcr |= DMA_DPCR_SPU_PRIORITY_HIGH | DMA_DPCR_MASK_DMA4_ENABLE;
@@ -189,17 +189,8 @@ void _spu_FiDMA(void) {
 INCLUDE_ASM("asm/nonmatchings/libspu/spu", _spu_Fr_);
 
 #ifdef __psyz
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 void Psyz_KernelRaise(unsigned int desc, unsigned int spec);
-uint64_t Psyz_KernelNowUs(void);
-uint64_t Psyz_KernelNowNs(void);
-void Psyz_KernelPostAtNs(uint64_t at_ns, void (*fn)(void));
-void Psyz_KernelWaitUntilNs(uint64_t at_ns);
-void Psyz_KernelCancel(void (*fn)(void));
-int Psyz_KernelOfflineClock(void);
-void Psyz_SpendTime(unsigned ns);
+void Psyz_KernelPost(void (*fn)(void));
 void _spu_DmaDone(void) {
     if (_spu_transferCallback) {
         _spu_transferCallback();
@@ -208,26 +199,10 @@ void _spu_DmaDone(void) {
     }
 }
 
-/* SPU RAM DMA takes its PS1 time: the SPU moves a halfword per 16 system
- * clocks (SPU_DMA_CLOCKS_PER_BYTE, timing_profile.h), so a 276 KiB sound
- * bank takes over three fields (Ridge Racer Type 4's VAB uploads of 54256
- * and 282848 bytes wait 262 and 1096 lines on DuckStation, about 60 of them
- * the frame's own work before the upload). The data lands in SPU RAM at
- * once; the end of the transfer (callback, HwSPU/EvSpCOMP,
- * SpuIsTransferCompleted) comes when the DMA would have finished, on the
- * emulated clock. PSYZ_SPU_TIMING=instant ends transfers at once. */
-#include "../../../psyz/src/timing_profile.h"
+/* SPU RAM DMA: the data lands in SPU RAM at once; the end of the transfer
+ * (callback, HwSPU/EvSpCOMP, SpuIsTransferCompleted) comes as an interrupt
+ * right after, or when the program waits for it. */
 static volatile int spu_dma_busy;
-static uint64_t spu_dma_end_ns; // the running transfer's end
-
-static int spu_dma_instant(void) {
-    static int instant = -1;
-    if (instant < 0) {
-        const char* timing = getenv("PSYZ_SPU_TIMING");
-        instant = timing && !strcmp(timing, "instant");
-    }
-    return instant;
-}
 
 static void spu_dma_end(void) {
     if (!spu_dma_busy) {
@@ -237,48 +212,16 @@ static void spu_dma_end(void) {
     _spu_DmaDone();
 }
 
-// Ends a running transfer now and drops its posted end, which would
-// otherwise end the next transfer early.
-static void spu_dma_reset(void) {
-    Psyz_KernelCancel(spu_dma_end);
-    spu_dma_end();
-}
-
-static void spu_dma_start(unsigned size) {
-    spu_dma_reset(); // a new transfer starts after the previous one
-    if (spu_dma_instant()) {
-        _spu_DmaDone();
-        return;
-    }
+static void spu_dma_start(void) {
+    spu_dma_end(); // a new transfer starts after the previous one
     spu_dma_busy = 1;
-    // on the CPU's clock, rounded up: done by then
-    uint64_t clocks = (uint64_t)size * SPU_DMA_CLOCKS_PER_BYTE;
-    spu_dma_end_ns = Psyz_KernelNowNs() + (clocks * 1000000000 + 33868799) / 33868800;
-    Psyz_KernelPostAtNs(spu_dma_end_ns, spu_dma_end);
+    Psyz_KernelPost(spu_dma_end);
 }
 
 int Psyz_SpuDmaBusy(void) { return spu_dma_busy; }
 
-/* SpuIsTransferCompleted(SPU_TRANSFER_WAIT): spins on the emulated clock
- * until the transfer ends; on the CPU's clock to its end, as the PS1's
- * loop on the DMA's status does (it overran it by up to a 64 us step).
- * Where no time can pass (the offline clock with audio paused, or inside
- * an interrupt handler) the transfer ends at once, as MDEC_out_sync does,
- * instead of spinning forever. */
-void Psyz_SpuDmaWait(void) {
-    while (spu_dma_busy) {
-        uint64_t before = Psyz_KernelNowNs();
-        if (Psyz_KernelOfflineClock()) {
-            Psyz_KernelWaitUntilNs(spu_dma_end_ns);
-        } else {
-            Psyz_SpendTime(SPU_DMA_WAIT_STEP_NS);
-        }
-        if (spu_dma_busy && Psyz_KernelNowNs() == before &&
-            Psyz_KernelOfflineClock()) {
-            spu_dma_reset();
-        }
-    }
-}
+// SpuIsTransferCompleted(SPU_TRANSFER_WAIT): the transfer ends now.
+void Psyz_SpuDmaWait(void) { spu_dma_end(); }
 #endif
 
 #ifndef __psyz
@@ -369,7 +312,7 @@ unsigned _spu_Fw(unsigned char* addr, unsigned size) {
 #ifdef __psyz
     SPUW(trans_addr, _spu_tsa);
     Psyz_SpuMemWrite(_spu_tsa << _spu_mem_mode_plus, addr, size);
-    spu_dma_start(size);
+    spu_dma_start();
 #else
     _spu_t(2, _spu_tsa << _spu_mem_mode_plus);
     _spu_t(1);
@@ -382,7 +325,7 @@ unsigned _spu_Fr(unsigned char* addr, unsigned size) {
 #ifdef __psyz
     SPUW(trans_addr, _spu_tsa);
     Psyz_SpuMemRead(_spu_tsa << _spu_mem_mode_plus, addr, size);
-    spu_dma_start(size);
+    spu_dma_start();
 #else
     _spu_t(2, _spu_tsa << _spu_mem_mode_plus);
     _spu_t(0);

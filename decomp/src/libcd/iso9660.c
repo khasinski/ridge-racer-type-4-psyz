@@ -1,12 +1,5 @@
 #include <common.h>
 #include <libcd.h>
-#ifdef __psyz
-#include "libcd_stream.h"
-#define SEARCH_TIME(cycles) Psyz_CdCpu(cycles)
-#else
-#define SEARCH_TIME(cycles)
-#endif
-
 typedef union {
     int addr;
     CdlLOC i;
@@ -113,12 +106,10 @@ out:
         if (file_[i].name[0] == '\0') {
             break;
         }
-        SEARCH_TIME(CD_SEARCH_CMP_CYCLES);
         if (_cmp(file_[i].name, buf)) {
             if (CD_debug >= 2) {
                 printf("%s:  found\n", buf);
             }
-            SEARCH_TIME(CD_SEARCH_FOUND_CYCLES);
             *fp = file_[i];
             return &file_[i];
         }
@@ -138,7 +129,6 @@ s32 CD_newmedia(void) {
     unsigned char* pathTablePtr;
     int i;
 
-    SEARCH_TIME(CD_SEARCH_NEWMEDIA_CYCLES);
     if (cd_read(1, 0x10, load_buf_) != 1) {
         if (CD_debug > 0) {
             printf("CD_newmedia: Read error in cd_read(PVD)\n");
@@ -151,7 +141,6 @@ s32 CD_newmedia(void) {
         }
         return 0;
     }
-    SEARCH_TIME(CD_SEARCH_PVD_CYCLES);
     (&pathTableLBA)->i = ((IsoPVD*)load_buf_)->pathTableLBA.i;
     if (cd_read(1, pathTableLBA.addr, load_buf_) != 1) {
         if (CD_debug > 0) {
@@ -189,7 +178,6 @@ s32 CD_newmedia(void) {
     } while (0);
 
     cached_dir_num_ = 0;
-    SEARCH_TIME(CD_SEARCH_PATH_TABLE_CYCLES);
     if (CD_debug > 1) {
         printf("CD_newmedia: %d dir entries found\n", i);
     }
@@ -220,9 +208,6 @@ s32 CD_cachefile(s32 dirNum) {
     short* namePtr;
 
     if (dirNum == cached_dir_num_) {
-        // a search of the directory already cached: its path and
-        // directory lookups, which the read's costs cover otherwise
-        SEARCH_TIME(CD_SEARCH_CACHED_CYCLES);
         return 1;
     }
 
@@ -269,7 +254,6 @@ s32 CD_cachefile(s32 dirNum) {
         }
     }
     cached_dir_num_ = dirNum;
-    SEARCH_TIME(CD_SEARCH_DIR_CYCLES);
     if (i < CdlMAXFILE) {
         file_[i].name[0] = '\0';
     }
@@ -284,16 +268,6 @@ int cd_read(int n_sectors, int sector_no, unsigned char* ptr) {
 
     CdIntToPos(sector_no, &pos);
     CdControl(CdlSetloc, (u_char*)&pos, 0);
-#ifdef __psyz
-    if (Psyz_CdLoopModel()) {
-        Psyz_CdCpu(CD_SEARCH_READ_CALL_CLOCKS);
-    }
-#endif
     CdRead(n_sectors, (u_long*)ptr, CdlModeSpeed);
-#ifdef __psyz
-    if (Psyz_CdLoopModel()) {
-        Psyz_CdCpu(CD_SEARCH_SYNC_CALL_CLOCKS);
-    }
-#endif
     return CdReadSync(0, 0) == 0;
 }

@@ -8,7 +8,6 @@
 #include "../draw.h"
 #include "../internal.h"
 #include "gpudump.h"
-#include "gpu_timing.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -419,18 +418,12 @@ static int is_packed_command_stream(const u32* words, int count) {
     return 0;
 }
 
-extern u_long Psyz_LibgpuTermMove[];
-
 static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
-    Psyz_GpuTimingBegin();
     if (sizeof(u_long) == 4) {
         // fast path for 32-bit systems
         while (1) {
-            if (!Psyz_GpuTimingHostPacket(env))
-                Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
-            // the table's terminating copy of two pixels onto themselves
-            if (env->len > 0 && (u_long*)env != Psyz_LibgpuTermMove) {
+            if (env->len > 0) {
                 DispatchPackets((u_long*)env->code, (int)env->len);
             }
             if (isendprim(env)) {
@@ -441,16 +434,9 @@ static void GPU_Enqueue(u_long* packets) {
 #ifdef __EMSCRIPTEN__
         Draw_FlushBuffer();
 #endif
-        Psyz_GpuTimingEnd();
         return;
     }
     while (1) {
-        if ((u_long*)env == Psyz_LibgpuTermMove) {
-            // timed, not drawn: two pixels copied onto themselves
-            Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
-            env = (DR_ENV*)nextPrim(env);
-            continue;
-        }
         if (queue_len + env->len > LEN(queue_buf)) {
             if (env->len > 0x100) {
                 ERRORF("packet 0x%X long, likely corrupted", env->len);
@@ -478,15 +464,12 @@ static void GPU_Enqueue(u_long* packets) {
                        env->len * sizeof(u_long));
             }
         }
-        if (!Psyz_GpuTimingHostPacket(env))
-            Psyz_GpuTimingNode(&queue_buf[queue_len], (int)env->len);
         queue_len += (int)env->len;
         if (isendprim(env)) {
             break;
         }
         env = (DR_ENV*)nextPrim(env);
     }
-    Psyz_GpuTimingEnd();
 }
 
 // Weird fix due to addque2 calling the callback with two u_long params
@@ -578,48 +561,15 @@ static int psyz_clr(RECT* rect, u32 color) {
     return 0;
 }
 
-/* The CRTC's vertical display range, which places the vblank interrupt
- * (Psyz_AudioDisplayRangeChanged). A GPU reset sets lines 16..255. */
-enum { CRTC_RESET_Y1 = 0x10, CRTC_RESET_Y2 = 0xFF };
-static unsigned crtc_y1 = CRTC_RESET_Y1, crtc_y2 = CRTC_RESET_Y2;
-
-static void CrtcVerticalRange(unsigned y1, unsigned y2) {
-    if (y1 == crtc_y1 && y2 == crtc_y2) {
-        return;
-    }
-    Psyz_AudioDisplayRangeChanged(crtc_y1, crtc_y2, y1, y2);
-    crtc_y1 = y1;
-    crtc_y2 = y2;
-}
-
-/* GPUSTAT bit 31, which libetc's VSync waits on in interlace: in 480-line
- * interlace (GP1(08h) bits 2 and 5) it is the displayed field's line parity,
- * (display y + display field) & 1, during the display range and y & 1 in
- * the blank; in other modes it flips every line. As in DuckStation's CRTC
- * the field flips at the start of each field (line 0, the end of the blank
- * lines after the display range) while vertical interlace (bit 5) is on and
- * is 0 otherwise, and the displayed field is latched at each vblank start:
- * the field after the flip in 480-line interlace, else 0. A mode set in the
- * blank, as a PutDispEnv right after VSync, counts for that flip but not
- * for the latched field, so the first two interlaced fields show the same
- * parity, unless a moved display range starts another vblank before line 0
- * (Psyz_AudioDisplayRangeChanged). */
-static unsigned crtc_display_y, crtc_mode, crtc_field, crtc_display_field;
-static int crtc_flip_pending; // the next field start after the last vblank
-static uint64_t crtc_flip_ns; // its time
-
-static void CrtcFieldStart(void) {
-    crtc_flip_pending = 0;
-    crtc_field = crtc_mode & 0x20 ? crtc_field ^ 1 : 0;
-}
-
-int Psyz_GpuCrtcInterlaced480(void) { return (crtc_mode & 0x24) == 0x24; }
+/* The display mode (GP1(08h)): its PAL bit sets the field length. */
+static unsigned crtc_mode;
 
 unsigned Psyz_GpuCrtcFieldLines(void) { return crtc_mode & 8 ? 314 : 263; }
 
-static int ntsc_pal_picture;
-void Psyz_GpuSetNtscPalPicture(int enabled) { ntsc_pal_picture = enabled != 0; }
-int Psyz_GpuGetNtscPalPicture(void) { return ntsc_pal_picture; }
+/* The vertical display range (GP1(07h)); a GPU reset sets lines 16..255.
+ * The lines of a field outside it are the blank's. */
+enum { CRTC_RESET_Y1 = 0x10, CRTC_RESET_Y2 = 0xFF };
+static unsigned crtc_y1 = CRTC_RESET_Y1, crtc_y2 = CRTC_RESET_Y2;
 
 unsigned Psyz_GpuCrtcBlankLines(void) {
     unsigned total = Psyz_GpuCrtcFieldLines();
@@ -628,33 +578,14 @@ unsigned Psyz_GpuCrtcBlankLines(void) {
     return y2 > y1 ? total - y2 + y1 : 0;
 }
 
-int Psyz_GpuCrtcOddLine(unsigned line) {
-    if (!Psyz_GpuCrtcInterlaced480()) {
-        return (int)((crtc_display_y + line) & 1);
-    }
-    if (line < Psyz_GpuCrtcBlankLines()) {
-        return (int)(crtc_display_y & 1);
-    }
-    return (int)((crtc_display_y + crtc_display_field) & 1);
-}
-
-void Psyz_GpuCrtcBlank(void) {
-    uint64_t now = Psyz_KernelNowNs();
-    if (crtc_flip_pending && now >= crtc_flip_ns) {
-        CrtcFieldStart();
-    }
-    crtc_display_field = Psyz_GpuCrtcInterlaced480() ? crtc_field ^ 1 : 0;
-    unsigned total = Psyz_GpuCrtcFieldLines();
-    unsigned lines = crtc_y2 < total ? total - crtc_y2 : 0;
-    uint64_t line_ns = total == 314 ? 64017 : 63563;
-    crtc_flip_pending = 1;
-    crtc_flip_ns = now + lines * line_ns;
-}
+static int ntsc_pal_picture;
+void Psyz_GpuSetNtscPalPicture(int enabled) { ntsc_pal_picture = enabled != 0; }
+int Psyz_GpuGetNtscPalPicture(void) { return ntsc_pal_picture; }
 
 /* A GPU reset leaves the display mode of the console's region: a PAL
- * console's CRTC runs 50 Hz fields from the start (DuckStation's GPUSTAT
- * reset). PSY-Q games name it with SetVideoMode (Psyz_GpuConsoleVideoMode),
- * which also sets the fields before the game's first display mode. */
+ * console runs 50 Hz fields from the start. PSY-Q games name it with
+ * SetVideoMode (Psyz_GpuConsoleVideoMode), which also sets the fields
+ * before the game's first display mode. */
 static int console_pal, display_mode_set;
 
 static void CrtcResetMode(void) {
@@ -672,11 +603,8 @@ void Psyz_GpuConsoleVideoMode(int pal) {
 }
 
 void Psyz_GpuCrtcReset(void) {
-    CrtcVerticalRange(CRTC_RESET_Y1, CRTC_RESET_Y2);
-    crtc_display_y = 0;
-    crtc_field = 0;
-    crtc_display_field = 0;
-    crtc_flip_pending = 0;
+    crtc_y1 = CRTC_RESET_Y1;
+    crtc_y2 = CRTC_RESET_Y2;
     CrtcResetMode();
 }
 
@@ -701,21 +629,18 @@ void Psyz_GpuDisplayCommand(unsigned int cmd) {
         LOG_ONCE("DMA direction not implemented");
         break;
     case 5:
-        crtc_display_y = (cmd >> 10) & 0x3FF;
         Draw_DisplayArea(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 6:
         Draw_DisplayHorizontalRange(cmd & 0xFFF, (cmd >> 12) & 0xFFF);
         break;
     case 7:
-        CrtcVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
+        crtc_y1 = cmd & 0x3FF;
+        crtc_y2 = (cmd >> 10) & 0x3FF;
         Draw_DisplayVerticalRange(cmd & 0x3FF, (cmd >> 10) & 0x3FF);
         break;
     case 8:
         cmd &= 0xFFFFFF;
-        if (crtc_flip_pending && Psyz_KernelNowNs() >= crtc_flip_ns) {
-            CrtcFieldStart(); // the field started in the old mode
-        }
         crtc_mode = cmd & 0xFF;
         display_mode_set = 1;
         Psyz_AudioVideoModeChanged((cmd & 8) != 0);

@@ -4,7 +4,6 @@
 #include <psyz/log.h>
 #include "../../decomp/src/libspu/libspu_private.h"
 #include "../../decomp/src/libsnd/libsnd_private.h"
-#include "../timing_profile.h"
 #include <psyz/system.h>
 
 #define LEN(x) ((s32)(sizeof(x) / sizeof(*(x))))
@@ -57,7 +56,6 @@ void _SsInit(void) {
     VBLANK_MINUS = 60;
     _snd_openflag = 0;
     _snd_ev_flag = 0;
-    Psyz_SpendCycles(SS_INIT_CYCLES);
 }
 
 void SsSeqSetDecrescendo(short seq_access_num, short vol, long v_time) {

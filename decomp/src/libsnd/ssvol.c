@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsSeqSetVol SsSeqSetVol_Unlocked
 #define SsSepSetVol SsSepSetVol_Unlocked
 #define SsSeqGetVol SsSeqGetVol_Unlocked
@@ -59,22 +59,22 @@ void SsSeqGetVol(short access_num, short seq_num, short* voll, short* volr) {
 #ifdef __psyz
 #undef SsSeqSetVol
 void SsSeqSetVol(short seq_access_num, short voll, short volr) {
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsSeqSetVol_Unlocked(seq_access_num, voll, volr);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
 }
 
 #undef SsSepSetVol
 void SsSepSetVol(short sep_access_num, short seq_num, short voll, short volr) {
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsSepSetVol_Unlocked(sep_access_num, seq_num, voll, volr);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
 }
 
 #undef SsSeqGetVol
 void SsSeqGetVol(short access_num, short seq_num, short* voll, short* volr) {
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsSeqGetVol_Unlocked(access_num, seq_num, voll, volr);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
 }
 #endif

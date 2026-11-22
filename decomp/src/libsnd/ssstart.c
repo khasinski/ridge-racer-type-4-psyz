@@ -1,11 +1,4 @@
 #include "libapi.h"
-#ifdef __psyz
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
-#define SS_CPU(c) Psyz_SpendCycles(c)
-#else
-#define SS_CPU(c)
-#endif
 #include "libsnd_private.h"
 #include <kernel.h>
 #include <libapi.h>
@@ -31,7 +24,6 @@ void _SsStart(int use_vsync) {
     do {
         wait--;
     } while (wait >= 0);
-    SS_CPU(SS_START_CYCLES); // the wait loop, up to SetRCnt
     _snd_seq_tick_env.vsync_tick = 0;
     _snd_seq_tick_env.alarm_tick = 6;
     _snd_seq_tick_env.unk11 = 0;
@@ -91,7 +83,6 @@ void _SsStart(int use_vsync) {
         InterruptCallback(alarm_tick, cb);
     }
     ExitCriticalSection();
-    SS_CPU(SS_START_RETURN_CYCLES);
 }
 
 void SsStart(void) { _SsStart(1); }

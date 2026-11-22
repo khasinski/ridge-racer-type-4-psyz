@@ -4,7 +4,6 @@
 
 #include "libapi.h"
 #include "../internal.h"
-#include "../timing_profile.h"
 
 #include <psyz/log.h>
 
@@ -14,16 +13,12 @@
  * 0x24040001 with the SCPH-1001 BIOS (as on DuckStation), so a game that
  * never seeds draws the same numbers as there. */
 static uint32_t biosRandomState = UINT32_C(0x24040001);
-/* The ROM routines with the A0 stub take BIOS_RAND_CYCLES and
- * BIOS_SRAND_CYCLES (timing_profile.h). */
 int Psyz_Rand(void) {
     biosRandomState = biosRandomState * UINT32_C(0x41c64e6d) + UINT32_C(0x3039);
-    Psyz_SpendCycles(BIOS_RAND_CYCLES);
     return (int)((biosRandomState >> 16) & 0x7fff);
 }
 void Psyz_Srand(unsigned int seed) {
     biosRandomState = (uint32_t)seed;
-    Psyz_SpendCycles(BIOS_SRAND_CYCLES);
 }
 unsigned int Psyz_RandState(void) { return biosRandomState; }
 
@@ -93,52 +88,7 @@ void* DMACallback(int dma, void (*func)()) {
 }
 
 /* Transfers finish synchronously on PC. A callback may start another one;
- * dispatch its completion after the current callback returns, as DMA would.
- * The MDEC output's channel is the one whose interrupt the game enables
- * (DICR on DuckStation: it and the SPU's): its callback runs in that
- * interrupt's exception (Psyz_DmaIrqComplete); the others' at once. */
-static int dma_irq_host = -1; // Psyz_DmaIrqComplete: its exception's host
-
-/* The MDEC output exception's handlers: a stream sector whose interrupt
- * libetc's dispatcher sees first, then the callback (libcd.c) */
-static void (*mdec_callback)(void);
-static uint64_t mdec_entry_ns;
-static int mdec_own_exception;
-static void MdecExceptionHandlers(void) {
-    void (*callback)(void) = mdec_callback;
-    if (mdec_own_exception) {
-        Psyz_CdServeInDmaException(mdec_entry_ns);
-    }
-    callback();
-    Psyz_CdAfterDmaCallback();
-}
-
-static void DispatchDma(unsigned channel, void (*callback)(void)) {
-    if (channel != 1 || dma_irq_host < 0) {
-        callback();
-        return;
-    }
-    unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
-    unsigned total = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain;
-    unsigned before = DEVICE_IRQ_TO_HANDLER_CYCLES;
-    unsigned after = total - before;
-    if (dma_irq_host) { // raised during another exception: libetc's reread
-        before = dma_irq_host == 2 ? DMA_AFTER_DEVICE_TO_HANDLER_CYCLES
-                 : dma_irq_host == 3 ? 0 // in a stream sector's, at its end (libpress.c)
-                                     : DMA_AFTER_LINE_TO_HANDLER_CYCLES;
-        after = DMA_NESTED_RETURN_CYCLES;
-    }
-    if (Psyz_MdecTrace()) {
-        fprintf(stderr, "mdec irq host %d at %llu clocks\n", dma_irq_host,
-                (unsigned long long)Psyz_KernelCpuClocks());
-    }
-    mdec_own_exception = !dma_irq_host; // from now
-    mdec_callback = callback;
-    mdec_entry_ns = Psyz_KernelNowNs();
-    callback = MdecExceptionHandlers;
-    Psyz_KernelDeviceIrq(callback, before, after, DMA_DISPATCH_EXIT_CLOCKS);
-}
-
+ * dispatch its completion after the current callback returns, as DMA would. */
 void Psyz_DmaComplete(unsigned channel) {
     if (channel >= 7)
         return;
@@ -156,18 +106,9 @@ void Psyz_DmaComplete(unsigned channel) {
         dma_pending &= ~(1u << next);
         void (*callback)(void) = dma_callbacks[next];
         if (callback)
-            DispatchDma(next, callback);
+            callback();
     }
     dma_dispatching = 0;
-    Psyz_KernelUnlockInterrupts();
-}
-
-void Psyz_DmaIrqComplete(unsigned channel, int host) {
-    Psyz_KernelLockInterrupts();
-    int outer = dma_irq_host;
-    dma_irq_host = host;
-    Psyz_DmaComplete(channel);
-    dma_irq_host = outer;
     Psyz_KernelUnlockInterrupts();
 }
 

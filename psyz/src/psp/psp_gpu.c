@@ -911,6 +911,9 @@ static void ShowPendingFrame(void) {
     }
 }
 
+/* No field clock to align to (internal.h). */
+uint64_t Psyz_VideoNsUntilBlank(void) { return UINT64_MAX; }
+
 int Psyz_VideoVSync(int mode) {
     if (!is_init && !InitPlatform()) {
         return 0;

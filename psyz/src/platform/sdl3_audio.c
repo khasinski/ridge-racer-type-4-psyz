@@ -65,13 +65,32 @@ static void Capture(const short* samples, int frames) {
 
 // Audio callback: SDL pulls audio from the SPU via this callback.
 // The audio driver synchronizes the SPU based on the pulled samples.
+/* Underruns: the device pulls a buffer when it has played the one before,
+ * so a pull that comes later than that buffer lasted (with 5 ms of slack for
+ * the device's thread) means the output ran dry meanwhile. Each is logged,
+ * with the count, at most once a second. */
+static unsigned audio_underruns;
+static Uint64 audio_last_pull_ns, audio_last_len_ns, audio_logged_ns;
+
 static void SDLCALL audio_callback(void* userdata, SDL_AudioStream* stream,
                                    int additional_amount, int total_amount) {
     (void)userdata;
     (void)total_amount;
     if (additional_amount <= 0)
         return;
-
+    Uint64 now = SDL_GetTicksNS();
+    if (audio_last_pull_ns && !video_paused &&
+        now - audio_last_pull_ns > audio_last_len_ns * 3 / 2 + 5000000u) {
+        audio_underruns++;
+        if (now - audio_logged_ns >= 1000000000u) {
+            audio_logged_ns = now;
+            WARNF("audio underrun: %u so far (a pull %.1f ms after the last)",
+                  audio_underruns, (now - audio_last_pull_ns) / 1e6);
+        }
+    }
+    audio_last_pull_ns = now;
+    audio_last_len_ns = (Uint64)additional_amount * 1000000000u /
+                        (N_CHANNELS * SAMPLE_SIZE * PSYZ_SPU_SAMPLE_RATE * audio_speed);
     int num_frames = additional_amount / (N_CHANNELS * SAMPLE_SIZE);
     short buf[4096] = {0};
     while (num_frames > 0) {
@@ -170,6 +189,7 @@ void Psyz_AudioUnlock() {
 }
 
 void Psyz_AudioPause(void) {
+    audio_last_pull_ns = 0; // no underrun across a pause
     video_paused = true;
     if (sdl_stream) {
         SDL_PauseAudioStreamDevice(sdl_stream);
@@ -177,6 +197,7 @@ void Psyz_AudioPause(void) {
 }
 
 void Psyz_AudioUnpause(void) {
+    audio_last_pull_ns = 0; // no underrun across a pause
     video_paused = false;
     if (sdl_stream) {
         SDL_ResumeAudioStreamDevice(sdl_stream);
@@ -189,14 +210,15 @@ int Psyz_AudioIsPaused(void) {
     return !sdl_stream || SDL_AudioStreamDevicePaused(sdl_stream);
 }
 
-/* SDL backend clock for offline runs. Queries and wall time never consume
- * samples. A field lasts 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks,
+/* SDL backend clock for offline runs (the kernel's offline clock, a
+ * deterministic field clock): queries and wall time never consume samples.
+ * A field lasts 3406 x 314 (PAL) or 3413 x 263 (NTSC) GPU clocks,
  * 451584/709379 or 451584/715909 system clocks each: 1069484e9 / 53203425
  * or 897619e9 / 53693175 ns (75 system clocks are 451584 / 33868800 s),
  * about 886.49 or 737.24 samples of 44100 Hz.
  *
- * The time is the kernel's: the CPU's position (Psyz_KernelAdvanceToNs),
- * which stops at each blank (Psyz_AudioNextBlankNs, Psyz_AudioBlankDue)
+ * The time is the kernel's (Psyz_KernelAdvanceToNs), which stops at each
+ * blank (Psyz_AudioNextBlankNs, Psyz_AudioBlankDue)
  * and mixes the samples due by then (Psyz_AudioMixTo). The blanks come at
  * their exact times, ns + rem / FIELD_DIVISOR ns, not on samples. With the
  * kernel on a real-time clock (a test that selects PSYZ_AUDIO_CLOCK=video
@@ -308,14 +330,12 @@ uint64_t Psyz_AudioNextBlankNs(void) {
         return UINT64_MAX;
     if (!field_open)
         OpenField();
-    // on the offline clock as DuckStation's CRTC takes it (libcd.c)
-    return Psyz_KernelOfflineClock() ? Psyz_VSyncBlankNs(next_blank.ns) : next_blank.ns;
+    return next_blank.ns;
 }
 
-/* A native busy wait spends emulated time as a PS1 spinning on a device
- * would: blanks it crosses happen during the wait (Psyz_VideoWaitBlank:
- * counter, VSync interrupt), so the field count stays on the same clock as
- * the root counters, the CD drive and the mixed audio. */
+/* Blanks a wait crosses happen during it (Psyz_VideoWaitBlank: counter,
+ * VSync interrupt), so the field count stays on the same clock as the root
+ * counters, the CD drive and the mixed audio. */
 void Psyz_AudioBlankDue(void) {
     last_blank = next_blank;
     OpenField();
@@ -337,74 +357,11 @@ int Psyz_AudioWaitNs(uint64_t ns) {
     return 1;
 }
 
-int Psyz_AudioWaitUs(uint64_t us) { return Psyz_AudioWaitNs(us * 1000); }
 
-/* Runs the clock until the next timer interrupt, at most a field's samples
- * on (an idle program waiting for its sequencer). */
-int Psyz_AudioWaitForTimer(void) {
-    if (!ClockRunning())
-        return 0;
-    uint64_t now = ClockNowNs();
-    uint64_t at = now + (uint64_t)FIELD_FRAMES_MAX * 1000000000u / PSYZ_SPU_SAMPLE_RATE;
-    uint64_t next = Psyz_KernelNextDeadlineNs();
-    ClockAdvanceTo(next > now && next < at ? next : at);
-    return 1;
-}
 
-/* The CRTC's vertical display range changed (GP1(07h), a GPU reset). The
- * vblank interrupt comes when the beam leaves the display range, at its end
- * line, so the current field is cut or stretched: the next blank comes when
- * the beam reaches the new end line, or at once when the current line was
- * inside the old range and is outside the new one (DuckStation's CRTC). A
- * game's first PutDispEnv after ResetGraph(0) moves the end from the reset
- * value (line 255) to its screen's, e.g. 291 for a 256-line PAL screen at
- * y 16: that field lasts 36 lines. Offline clock only; the real-time clock
- * paces fields from the host. */
-void Psyz_AudioDisplayRangeChanged(
-    unsigned y1, unsigned y2, unsigned new_y1, unsigned new_y2) {
-    StartOfflineClock();
-    if (!ClockRunning())
-        return;
-    /* Exact positions in units of 1 / div ns, a line being line_u of them:
-     * the beam's line now, from the console's latest blank. */
-    const uint64_t total = video_pal ? FIELD_LINES_PAL : FIELD_LINES_NTSC;
-    const uint64_t div = video_pal ? FIELD_DIVISOR_PAL : FIELD_DIVISOR_NTSC;
-    const uint64_t field_u = video_pal ? FIELD_NS_PAL : FIELD_NS_NTSC;
-    const uint64_t line_u = field_u / total;
-    y1 = y1 < total ? y1 : (unsigned)total;
-    y2 = y2 < total ? y2 : (unsigned)total;
-    new_y1 = new_y1 < total ? new_y1 : (unsigned)total;
-    new_y2 = new_y2 < total ? new_y2 : (unsigned)total;
-    uint64_t now = ClockNowNs();
-    ExactTime blank = last_blank;
-    if (blank.div != div)
-        blank = ExactAdd(blank, 0, div);
-    uint64_t since_u = 0;
-    if (now > blank.ns) {
-        since_u = (now - blank.ns) * div;
-        since_u = since_u > blank.rem ? since_u - blank.rem : 0;
-    }
-    since_u %= field_u;
-    uint64_t pos_u = ((uint64_t)y2 * line_u + since_u) % field_u;
-    unsigned current = (unsigned)(pos_u / line_u);
-    int was_blank = current < y1 || current >= y2;
-    int is_blank = current < new_y1 || current >= new_y2;
-    ExactTime from = {now, 0, div};
-    if (!was_blank && is_blank) {
-        last_blank = from; // the beam leaves the new range at once
-        Psyz_VideoWaitBlank();
-        pos_u = (uint64_t)new_y2 * line_u;
-    }
-    uint64_t end_u = (uint64_t)new_y2 * line_u;
-    uint64_t left_u = end_u > pos_u ? end_u - pos_u : end_u + field_u - pos_u;
-    // the fields after it carry the phase of this blank
-    next_blank = ExactAdd(from, left_u, div);
-    field_open = true;
-}
 
 /* The display mode's PAL bit changed (GP1(08h), a GPU reset): fields from
- * the next one on have that length, also those a busy wait crosses before
- * the next VSync(0). Offline clock only. */
+ * the next one on have that length. Offline clock only. */
 void Psyz_AudioVideoModeChanged(int pal) {
     StartOfflineClock();
     if (!is_audio_init || !video_clock)

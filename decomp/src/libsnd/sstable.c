@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsSetTableSize SsSetTableSize_Unlocked
 #endif
 
@@ -50,12 +50,9 @@ void SsSetTableSize(char* table, short s_max, short t_max) {
 
 #ifdef __psyz
 #undef SsSetTableSize
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
 void SsSetTableSize(char* table, short s_max, short t_max) {
-    Psyz_SpendCycles(SS_SET_TABLE_SIZE_CYCLES);
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsSetTableSize_Unlocked(table, s_max, t_max);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
 }
 #endif

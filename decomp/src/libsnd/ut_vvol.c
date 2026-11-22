@@ -1,14 +1,10 @@
 #include "libsnd_private.h"
-#ifdef __psyz
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
-#endif
 
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsUtSetDetVVol SsUtSetDetVVol_Unlocked
 #define SsUtSetVVol SsUtSetVVol_Unlocked
 #endif
@@ -62,9 +58,9 @@ short SsUtSetVVol(short voice, short voll, short volr) {
 short SsUtSetDetVVol(short voice, short voll, short volr) {
     short ret;
 
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     ret = SsUtSetDetVVol_Unlocked(voice, voll, volr);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
     return ret;
 }
 
@@ -72,10 +68,9 @@ short SsUtSetDetVVol(short voice, short voll, short volr) {
 short SsUtSetVVol(short voice, short voll, short volr) {
     short ret;
 
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     ret = SsUtSetVVol_Unlocked(voice, voll, volr);
-    Psyz_SpendCycles(SS_UT_SET_VVOL_CYCLES);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
     return ret;
 }
 #endif

@@ -10,6 +10,7 @@
 
 #include <psyz.h>
 #include <libcd.h>
+#include <libetc.h>
 #include <libspu.h>
 #if defined(__psyz) && !defined(__PSP__)
 #include <SDL3/SDL.h>
@@ -273,8 +274,6 @@ ZTEST_SETUP(libcd) {
     zassert_s32_eq(0, ret);
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
-    // Drive timing has its own tests (libcd_timing).
-    Psyz_CdSetInstantTiming(1);
 }
 
 ZTEST_TEARDOWN(libcd) {
@@ -734,9 +733,11 @@ ZTEST(libcd, readn_in_rt_mode_leaves_the_data_path_idle) {
     CdControlB(CdlSetmode, &mode, NULL);
 }
 
-/* Drive timing (the libcd suite otherwise runs with instant timing). These
- * run on the host clock; a frozen offline clock skips them. */
-static uint64_t timing_now_us(void) {
+/* The drive is the host's file I/O: commands complete at once, a plain
+ * read (CdRead) hands over its sectors as fast as they are read, and only a
+ * read in CdlModeRT, whose XA audio plays as it goes, keeps the disc's rate
+ * on the kernel's clock. */
+static uint64_t now_us(void) {
 #if defined(__psyz) && !defined(__PSP__)
     // SDL's monotonic clock: the MSVC runtime has no clock_gettime.
     return SDL_GetTicksNS() / 1000;
@@ -747,78 +748,9 @@ static uint64_t timing_now_us(void) {
 #endif
 }
 
-// Polls CdReady(1) for the next sector; returns 0 after 3 s without (a
-// stopped motor spins up for 1 s, a speed change takes 0.6 s).
-static int timing_wait_sector(void) {
-    uint64_t start = timing_now_us();
-    while (CdReady(1, NULL) != CdlDataReady) {
-        if (timing_now_us() - start > 3000000) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-ZTEST(libcd, timing_read_delivers_a_sector_per_period) {
-    u_char mode = CdlModeSpeed;
-    u_char payload[2048];
-    load_cue_data(40);
-    Psyz_CdSetInstantTiming(0);
-    CdControlB(CdlSetmode, &mode, NULL);
-    CdlLOC loc;
-    CdIntToPos(30, &loc);
-    CdControlB(CdlSetloc, (u_char*)&loc, NULL);
-    uint64_t start = timing_now_us();
-    CdControl(CdlReadN, NULL, NULL);
-    zprintf("the first sector waits for the seek\n");
-    zexpect_s32_eq(CdlNoIntr, CdReady(1, NULL));
-    if (!timing_wait_sector()) {
-        zskip("the emulated clock does not run here");
-    }
-    uint64_t first = timing_now_us();
-    zprintf("seek and one sector period: at least 6.6 ms\n");
-    zexpect_s32_ne(0, first - start >= 6600);
-    CdGetSector(payload, 3);
-    CdGetSector(payload, sizeof(payload) / 4);
-    zassert_s32_ne(0, timing_wait_sector());
-    CdGetSector(payload, 3);
-    CdGetSector(payload, sizeof(payload) / 4);
-    zassert_s32_ne(0, timing_wait_sector());
-    uint64_t third = timing_now_us();
-    zprintf("double speed: 150 sectors per second\n");
-    zexpect_s32_ne(0, third - first >= 2 * 6600);
-    zexpect_s32_ne(0, third - first < 2 * 6667 + 20000);
-    CdControlB(CdlPause, NULL, NULL);
-    mode = 0;
-    CdControlB(CdlSetmode, &mode, NULL);
-}
-
-ZTEST(libcd, timing_sync_reports_a_pending_pause) {
-    u_char mode = CdlModeSpeed;
-    load_cue_data(40);
-    Psyz_CdSetInstantTiming(0);
-    CdControlB(CdlSetmode, &mode, NULL);
-    start_read_at(10);
-    if (!timing_wait_sector()) {
-        zskip("the emulated clock does not run here");
-    }
-    uint64_t start = timing_now_us();
-    zassert_s32_ne(0, CdControl(CdlPause, NULL, NULL));
-    zprintf("a pause of a read takes at least 29.5 ms\n");
-    zexpect_s32_eq(CdlNoIntr, CdSync(1, NULL));
-    zexpect_s32_eq(CdlComplete, CdSync(0, NULL));
-    zexpect_s32_ne(0, timing_now_us() - start >= 29000);
-    zprintf("an ack-only command completes on its acknowledge\n");
-    zassert_s32_ne(0, CdControl(CdlNop, NULL, NULL));
-    zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
-    mode = 0;
-    CdControlB(CdlSetmode, &mode, NULL);
-}
-
-ZTEST(libcd, timing_instant_completes_at_once) {
+ZTEST(libcd, commands_complete_at_once) {
     u_char mode = CdlModeSpeed;
     load_cue_data(8);
-    Psyz_CdSetInstantTiming(1);
     CdControlB(CdlSetmode, &mode, NULL);
     CdlLOC loc;
     CdIntToPos(4, &loc);
@@ -826,8 +758,76 @@ ZTEST(libcd, timing_instant_completes_at_once) {
     zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
     start_read_at(2);
     zexpect_s32_eq(CdlDataReady, CdReady(1, NULL));
-    CdControlB(CdlPause, NULL, NULL);
+    zassert_s32_ne(0, CdControl(CdlPause, NULL, NULL));
     zexpect_s32_eq(CdlComplete, CdSync(1, NULL));
+    mode = 0;
+    CdControlB(CdlSetmode, &mode, NULL);
+}
+
+static unsigned sync_calls;
+static void count_sync(u_char intr, u_char* result) {
+    (void)intr;
+    (void)result;
+    sync_calls++;
+}
+
+ZTEST(libcd, sync_callback_of_a_waited_command_comes_before_it_returns) {
+    load_cue_data(4);
+    sync_calls = 0;
+    CdlCB old = CdSyncCallback(count_sync);
+    zassert_s32_ne(0, CdControl(CdlNop, NULL, NULL));
+    zexpect_s32_eq(1, sync_calls);
+    zassert_s32_ne(0, CdControlF(CdlNop, NULL));
+    zprintf("one not waited for comes at the drive's next service\n");
+    CdSync(0, NULL);
+    zexpect_s32_eq(2, sync_calls);
+    CdSyncCallback(old);
+}
+
+ZTEST(libcd, plain_read_completes_without_waiting_for_the_disc) {
+    // CdlModeSize1: the whole sector past its sync (0x249 words), unchecked
+    static u32 buf[3 * 0x249];
+    unsigned char expected[SECTOR_SIZE];
+    load_cue_data(40);
+    CdlLOC loc;
+    CdIntToPos(5, &loc);
+    CdControl(CdlSetloc, (u_char*)&loc, NULL);
+    uint64_t start = now_us();
+    zassert_s32_ne(0, CdRead(3, (u_long*)buf, CdlModeSpeed | CdlModeSize1));
+    zassert_s32_eq(0, CdReadSync(0, NULL));
+    zprintf("three sectors at double speed would take 20 ms\n");
+    zexpect_s32_ne(0, now_us() - start < 15000);
+    for (int i = 0; i < 3; i++) {
+        build_data_sector(expected, 5 + i);
+        zexpect_u8array_eq(expected + 12, (u_char*)buf + i * 0x249 * 4, 0x249 * 4);
+    }
+}
+
+static volatile unsigned rt_sectors;
+static void count_ready(u_char intr, u_char* result) {
+    (void)result;
+    if (intr == CdlDataReady) {
+        rt_sectors++;
+    }
+}
+
+ZTEST(libcd, rt_read_keeps_the_disc_rate) {
+    u_char mode = CdlModeSpeed | CdlModeRT;
+    load_cue_data(40);
+    rt_sectors = 0;
+    CdControlB(CdlSetmode, &mode, NULL);
+    CdlCB old = CdReadyCallback(count_ready);
+    uint64_t start = now_us();
+    start_read_at(0);
+    while (rt_sectors < 3 && now_us() - start < 2000000) {
+        VSync(0);
+    }
+    uint64_t taken = now_us() - start;
+    zprintf("three sectors at double speed: 20 ms\n");
+    zexpect_s32_ge(3, (int)rt_sectors);
+    zexpect_s32_ne(0, taken >= 19000);
+    CdControlB(CdlPause, NULL, NULL);
+    CdReadyCallback(old);
     mode = 0;
     CdControlB(CdlSetmode, &mode, NULL);
 }
@@ -940,7 +940,6 @@ ZTEST_SETUP(libcd_playback) {
     }
     Psyz_CdSetDiskPath(NULL);
     Psyz_CdShellOpen(0);
-    Psyz_CdSetInstantTiming(1);
 }
 
 ZTEST_TEARDOWN(libcd_playback) {

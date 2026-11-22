@@ -9,7 +9,6 @@
 #include <psyz/log.h>
 #include <libgpu.h>
 #include "../internal.h"
-#include "../timing_profile.h"
 
 // This GTE implementation should be accurate. Results are covered via the same
 // unit tests that have been confirmed to be green on a real PlayStation 1.
@@ -1211,7 +1210,6 @@ static const short rcossin_tbl[][2] = {
     {0xFFE7, 0x1000}, {0xFFED, 0x1000}, {0xFFF3, 0x1000}, {0xFFFA, 0x1000}};
 
 void InitGeom() {
-    Psyz_SpendCycles(INIT_GEOM_CYCLES);
     extended_projection = 0;
     ZSF3 = 0x155;
     ZSF4 = 0x100;

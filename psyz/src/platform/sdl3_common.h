@@ -754,12 +754,16 @@ static bool SkipPresent(void) {
     return false;
 }
 
-/* Offline clock (PSYZ_AUDIO_CLOCK=video) without pacing: the emulated time
- * of the last blocking VSync, from which VSync(1) counts lines. */
-static uint64_t offline_vsync_us;
-
-static double LineMicroseconds(void) {
-    return is_pal ? 1000000.0 / (VSYNC_PAL * 314) : 1000000.0 / (VSYNC_NTSC * 263);
+/* The host time to the next blank of the frame limiter's field clock (the
+ * blank VSync(0) waits for), UINT64_MAX when fields are not paced by it. */
+uint64_t Psyz_VideoNsUntilBlank(void) {
+    if (vsync_mode == PSYZ_VSYNC_LIMITLESS || host_clock_pause_depth ||
+        (use_driver_vsync && game_speed == 1))
+        return UINT64_MAX;
+    const double field_ns = 1e9 / (target_frame_rate * game_speed);
+    const Uint64 now_ns = SDL_GetTicksNS();
+    const double blank_ns = (floor((double)now_ns / field_ns) + 1.0) * field_ns;
+    return (uint64_t)(blank_ns - (double)now_ns);
 }
 
 void Psyz_VideoWaitBlank(void) {
@@ -786,17 +790,11 @@ int Psyz_VideoVSync(int mode) {
         return (int)(WallVblankCount() + vblank_clock_offset);
     }
     if (vsync_mode == PSYZ_VSYNC_LIMITLESS && !host_clock_pause_depth) {
-        /* On the offline clock a query spends no time here: libetc's
-         * VSync(1) spends its PS1 time (LIBETC_VSYNC_QUERY_CYCLES), and the
-         * blanks it crosses happen in that wait (Psyz_VideoWaitBlank). The
-         * count runs from the last VSync(0). */
-        int offline = Psyz_AudioWaitUs(0);
-        if (offline) {
-            /* The line counter is 16 bits: wrap the whole count (a double
-             * past 65535 converts to unsigned short undefined). */
-            ret = (unsigned short)(uint64_t)(
-                (double)(Psyz_KernelNowUs() - offline_vsync_us) /
-                LineMicroseconds());
+        /* On the offline clock libetc's VSync(1) moves the clock a line a
+         * look and counts the lines itself (libapi.c); the blanks it
+         * crosses happen in that wait (Psyz_VideoWaitBlank). */
+        if (Psyz_KernelOfflineClock()) {
+            ret = 0;
             if (mode == 1)
                 return ret;
         } else {
@@ -839,7 +837,6 @@ int Psyz_VideoVSync(int mode) {
          * (a 2-field frame). */
         while (blanks--)
             Sdl3Audio_VBlank(is_pal);
-        offline_vsync_us = Psyz_KernelNowUs();
         last_vsync_us = wall_blank_valid ? wall_blank_us
                                          : (Uint32)(SDL_GetTicksNS() / 1000);
         wall_blank_valid = false;

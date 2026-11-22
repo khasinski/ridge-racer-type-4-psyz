@@ -1,14 +1,10 @@
 #include "libsnd_private.h"
-#ifdef __psyz
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
-#endif
 
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsUtChangePitch SsUtChangePitch_Unlocked
 #endif
 
@@ -62,11 +58,10 @@ short SsUtChangePitch(short voice, short vabId, short prog, short old_note,
                       short old_fine, short new_note, short new_fine) {
     short ret;
 
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     ret = SsUtChangePitch_Unlocked(
         voice, vabId, prog, old_note, old_fine, new_note, new_fine);
-    Psyz_SpendCycles(ret == 0 ? SS_UT_CHANGE_PITCH_CYCLES : SS_UT_CHANGE_PITCH_MISS_CYCLES);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
     return ret;
 }
 #endif

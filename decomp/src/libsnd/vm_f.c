@@ -1,11 +1,4 @@
 #include "libsnd_private.h"
-#ifdef __psyz
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
-#define SS_CPU(c) Psyz_SpendCycles(c)
-#else
-#define SS_CPU(c)
-#endif
 
 SPU_RXX* _svm_sreg = (SPU_RXX*)0x1F801C00;
 SPU_VOICE_REG _svm_sreg_buf[NUM_VOICES];
@@ -21,7 +14,6 @@ unsigned short _svm_onos2;
 struct SpuVoice _svm_voice[NUM_VOICES];
 unsigned int _svm_envx_ptr;
 static int _dummy;
-int _ss_flush_uncharged; // _SsVmInit's flush: SS_INIT_CYCLES has it
 int _svm_envx_hist[16];
 #ifdef __psyz
 void (*_autovol)(short voice);
@@ -190,11 +182,6 @@ void _SsVmFlush(void) {
         }
         for (i = 0; i < _SsVmMaxVoice; i++) {
             if (mask & (1 << i)) {
-#ifdef __psyz
-                if (!_ss_flush_uncharged) {
-                    SS_CPU(SS_VM_FLUSH_SILENT_VOICE_CYCLES);
-                }
-#endif
                 if (_svm_voice[i].unk1b == 2) {
                     /* As the PS1: the low half of the mask is sign
                      * extended, so voice 15 also releases voices 16-23. */
@@ -219,17 +206,7 @@ void _SsVmFlush(void) {
             _autopan(i);
         }
     }
-    if (!_ss_flush_uncharged) {
-        SS_CPU(SS_VM_FLUSH_CYCLES - SS_VM_FLUSH_TAIL_CYCLES +
-               _SsVmMaxVoice * SS_VM_FLUSH_ENVELOPE_CYCLES);
-    }
     for (i = 0; i < NUM_VOICES; i++) {
-        if (_svm_sreg_dirty[i] && !_ss_flush_uncharged) {
-            unsigned d = _svm_sreg_dirty[i];
-            SS_CPU(SS_VM_FLUSH_VOICE_CYCLES +
-                   SS_VM_FLUSH_WRITE_CYCLES * ((d & 1 ? 2 : 0) + (d & 4 ? 1 : 0) +
-                                               (d & 8 ? 1 : 0) + (d & 0x10 ? 2 : 0)));
-        }
         if (_svm_sreg_dirty[i] & 1) {
             SPUWV(i, volume.left, _svm_sreg_buf[i].volume.left);
             SPUWV(i, volume.right, _svm_sreg_buf[i].volume.right);
@@ -248,11 +225,6 @@ void _SsVmFlush(void) {
     }
     SpuSetKey(SPU_OFF, ((u8)_svm_okof2 << 16) | _svm_okof1);
     SpuSetKey(SPU_ON, ((u8)_svm_okon2 << 16) | _svm_okon1);
-#ifdef __psyz
-    if (!_ss_flush_uncharged) {
-        SS_CPU(SS_VM_FLUSH_TAIL_CYCLES); // the key-on write is behind it
-    }
-#endif
     SpuSetReverbVoice(SPU_BIT, ((u8)_svm_orev2 << 16) | _svm_orev1);
     SpuSetNoiseVoice(SPU_BIT, ((u8)_svm_onos2 << 16) | _svm_onos1);
     _svm_okof1 = 0;

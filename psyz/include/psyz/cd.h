@@ -3,7 +3,7 @@
 
 /**
  * @file cd.h
- * @brief CD-ROM drive emulation endpoints.
+ * @brief The CD-ROM drive: a CUE/BIN image read by the host.
  */
 
 #include <psyz/types.h>
@@ -83,19 +83,6 @@ size_t Psyz_CdPullSamples(short* out, size_t num_frames);
  * @param cb Disk read callback, or NULL to clear
  */
 void Psyz_CdSetReadCB(PsyzCdReadCB cb);
-
-/**
- * @brief Drop the drive's mechanical timing (instant loading)
- *
- * By default the emulated drive takes the PS1's time: command
- * acknowledges, seeks, pauses and 75 or 150 sectors per second. With
- * instant timing, commands complete at once and plain data reads deliver
- * as fast as the game polls them; ADPCM (CdlModeRT) streams keep their
- * rate. The PSYZ_CD_TIMING=instant environment variable sets it as well.
- *
- * @param instant Non-zero for instant timing, zero for the PS1's timing
- */
-void Psyz_CdSetInstantTiming(int instant);
 
 #ifdef __cplusplus
 }

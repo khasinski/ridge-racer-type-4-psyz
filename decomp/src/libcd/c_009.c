@@ -3,12 +3,8 @@
 #include "libcd_stream.h"
 #include "libcd_lock.h"
 
-u_long StGetNext(u_long** addr, u_long** header) {
+static u_long get_next(u_long** addr, u_long** header) {
     volatile StHEADER* ptr;
-#ifdef __psyz
-    // The drive keeps filling the ring while the caller polls for a frame.
-    Psyz_CdPollDrive();
-#endif
     CD_LOCK();
     ptr = &StRingAddr[StRingIdx3];
     if (ptr->id == 1) {
@@ -28,4 +24,18 @@ u_long StGetNext(u_long** addr, u_long** header) {
         CD_UNLOCK();
         return 1;
     }
+}
+
+u_long StGetNext(u_long** addr, u_long** header) {
+#ifdef __psyz
+    /* The drive fills the ring while the caller polls for a frame: without
+     * one, the poll waits for the stream's next sector, which comes at the
+     * disc's rate (a movie's frames at theirs). */
+    Psyz_CdServiceDrive();
+    if (get_next(addr, header) == 0) {
+        return 0;
+    }
+    Psyz_CdWaitSector();
+#endif
+    return get_next(addr, header);
 }

@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsUtGetVagAtr SsUtGetVagAtr_Unlocked
 #endif
 
@@ -41,9 +41,9 @@ short SsUtGetVagAtr(short vabId, short prog, short toneNum, VagAtr* vagatrptr) {
 short SsUtGetVagAtr(short vabId, short prog, short toneNum, VagAtr* vagatrptr) {
     short ret;
 
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     ret = SsUtGetVagAtr_Unlocked(vabId, prog, toneNum, vagatrptr);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
     return ret;
 }
 #endif

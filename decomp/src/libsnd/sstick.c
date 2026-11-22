@@ -1,16 +1,8 @@
 #include "libsnd_private.h"
-#ifdef __psyz
-#include "../../../psyz/src/timing_profile.h"
-void Psyz_SpendCycles(unsigned cycles);
-#define SS_CPU(c) Psyz_SpendCycles(c)
-#else
-#define SS_CPU(c)
-#endif
 #include <libetc.h>
 
 void SsSetTickMode(long tick_mode) {
     int video_mode;
-    SS_CPU(SS_SET_TICK_MODE_CYCLES);
 
     video_mode = GetVideoMode();
     if (tick_mode & SS_NOTICK) {

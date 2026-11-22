@@ -22,8 +22,7 @@ ZTEST_RUN := python3 ../ztest/zrunner.py
 # in a hidden window (Linux offscreen), no audio device, and none of the
 # caller's PsyZ timing or card knobs (a game's PSYZ_AUDIO_CLOCK=video would
 # put the kernel on the offline clock).
-TEST_ENV := env -u PSYZ_AUDIO_CLOCK -u PSYZ_SPU_TIMING -u PSYZ_CD_TIMING \
-	-u PSYZ_CARD_TIMING -u PSYZ_CARD_UNPLUG -u PSYZ_CARD_UNFORMATTED \
+TEST_ENV := env -u PSYZ_AUDIO_CLOCK -u PSYZ_CARD_UNPLUG -u PSYZ_CARD_UNFORMATTED \
 	PSYZ_HEADLESS=gpu SDL_AUDIODRIVER=dummy
 ifeq ($(UNAME_S),Linux)
 TEST_ENV += SDL_VIDEODRIVER=offscreen

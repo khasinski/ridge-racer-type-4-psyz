@@ -9,7 +9,6 @@
 #include "../internal.h"
 #include "os.h"
 #include "link_wire.h"
-#include "../timing_profile.h"
 
 /* The serial port (SIO1) and the link cable driver on it.
  *
@@ -68,10 +67,6 @@ enum {
  * MHz clock over the MUL16 reload factor of its mode 0xCE, then /1 again:
  * the libsio mode's bit rate is 2073600 / reload, i.e. bps). */
 #define SIO_BPS_BASE 2073600u
-
-/* AddSIO's PS1 time is ADD_SIO_DEVICE_CYCLES, a pass of a busy wait
- * SIO_POLL_CYCLES (timing_profile.h). */
-#define SIO_POLL_NS ((unsigned)(SIO_POLL_CYCLES * 1000000000ull / SIO_CLOCK_HZ))
 
 /* libsio's receive packet sizes (RX interrupt mode 0..3) and the mode bits
  * for a size of 1..8 (-1: unsupported). */
@@ -607,7 +602,6 @@ void AddCOMB(void) {
     sio.wait = NULL;
     Changed();
     Unlock();
-    Psyz_SpendCycles(ADD_SIO_DEVICE_CYCLES);
 }
 
 void DelCOMB(void) {
@@ -736,18 +730,31 @@ long _comb_control(u_long cmd, u_long arg, u_long param) {
 
 /* ---- the "sio:" device: _sio_inout ---- */
 
-/* One pass of a busy-wait loop: the wait callback (0 gives up) and the
- * pass's PS1 time. Called with the port locked; runs the callback
- * unlocked, as the game's code. */
+/* One pass of a busy-wait loop: the wait callback (0 gives up). A game
+ * times its link waits by the passes its callback counts (Ridge Racer Type
+ * 4: 25000 in a race, ~24 ms; 99999 in the menus, ~94 ms), so a pass lasts
+ * what it did on the console, about a microsecond, on the host's clock (a
+ * run of passes keeps one deadline). Called with the port locked; runs the
+ * callback unlocked, as the game's code. */
+#define SIO_PASS_NS 945u
 static int WaitPass(int kind, unsigned* polls) {
+    static uint64_t deadline_ns;
     SioWaitCallback wait = sio.wait;
     int go = 1;
     Report();
     Unlock();
     if (wait)
         go = wait(kind, (*polls)++) != 0;
-    if (go)
-        Psyz_SpendTime(SIO_POLL_NS);
+    if (go) {
+        uint64_t now = NowNs();
+        if (deadline_ns + 1000000 < now || deadline_ns > now + 1000000)
+            deadline_ns = now; // a new wait
+        deadline_ns += SIO_PASS_NS;
+        if (Psyz_KernelOfflineClock())
+            Psyz_KernelWaitUntilNs(deadline_ns);
+        while (NowNs() < deadline_ns)
+            Psyz_KernelPoll();
+    }
     Lock();
     return go;
 }

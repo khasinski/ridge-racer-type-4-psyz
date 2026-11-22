@@ -117,25 +117,7 @@ CdlCB CdReadyCallback(CdlCB func) {
     return prev;
 }
 
-#ifdef __psyz
-#include "libcd_stream.h"
-#endif
-
-#ifdef __psyz
-static int control_b; // CdControlB's: its CD_sync after CD_cw
-#endif
-
-static inline int cd_cw_ret(u8 com, u8* param, u_char* result, s32 arg3,
-                            unsigned return_cycles) {
-#ifdef __psyz
-    int loops = Psyz_CdLoopModel();
-    // (as DuckStation's loops: a Nop has no CdStatus check before it)
-    Psyz_CdCpu(loops ? (control_b ? CD_CONTROL_B_LOOP_CYCLES
-                        : arg3    ? CD_CONTROL_F_LOOP_CYCLES
-                                  : CD_CONTROL_LOOP_CYCLES) -
-                           (com == CdlNop ? CD_CONTROL_STATUS_CLOCKS : 0)
-                     : arg3 ? CD_CONTROL_F_CYCLES : CD_CONTROL_CYCLES);
-#endif
+static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
     CdlCB old = CdSyncCallback(NULL);
     int count = 4;
 
@@ -148,14 +130,6 @@ static inline int cd_cw_ret(u8 com, u8* param, u_char* result, s32 arg3,
             !CD_cw(CdlSetloc, param, result, 0)) {
             CdSyncCallback(old);
             if (!CD_cw(com, param, result, arg3)) {
-#ifdef __psyz
-                Psyz_CdCpu(loops ? (control_b ? CD_CONTROL_B_SYNC_CALL_CLOCKS
-                                              : CD_CONTROL_LOOP_RETURN_CYCLES) +
-                                       return_cycles
-                                 : return_cycles);
-#else
-                (void)return_cycles;
-#endif
                 return 0;
             }
         }
@@ -164,28 +138,6 @@ static inline int cd_cw_ret(u8 com, u8* param, u_char* result, s32 arg3,
     CdSyncCallback(old);
     return -1;
 }
-
-static inline int cd_cw(u8 com, u8* param, u_char* result, s32 arg3) {
-#ifdef __psyz
-    // (as DuckStation's loops: the return's own; the caller's code its own)
-    return cd_cw_ret(com, param, result, arg3,
-                     Psyz_CdLoopModel() ? 0
-                     : arg3             ? CD_CONTROL_F_RETURN_CYCLES
-                                        : CD_CONTROL_RETURN_CYCLES);
-#else
-    return cd_cw_ret(com, param, result, arg3, 0);
-#endif
-}
-
-#ifdef __psyz
-/* CdControl whose caller's own code after it is charged with its return
- * (CdRead2's, which can be less than nothing on top of CdControl's own
- * return charge: timing_profile.h CD_READ2_CYCLES) */
-int Psyz_CdControlThen(u_char com, u_char* param, u_char* result, int then_cycles) {
-    int cycles = (Psyz_CdLoopModel() ? 0 : (int)CD_CONTROL_RETURN_CYCLES) + then_cycles;
-    return cd_cw_ret(com, param, result, 0, cycles > 0 ? (unsigned)cycles : 0) == 0;
-}
-#endif
 
 int CdControl(u_char com, u_char* param, u_char* result) {
     return cd_cw(com, param, result, 0) == 0;
@@ -196,29 +148,9 @@ int CdControlF(u_char com, u_char* param) {
 }
 
 int CdControlB(u_char com, u_char* param, u_char* result) {
-#ifdef __psyz
-    if (Psyz_CdLoopModel()) {
-        // its CD_sync(0) as DuckStation's loop (libcd.c), its own code
-        // around it [trace]
-        control_b = 1;
-        int failed = cd_cw(com, param, result, 0);
-        control_b = 0;
-        if (failed) {
-            return 0;
-        }
-        int done = CD_sync(CdlSync, result) == CdlComplete;
-        Psyz_CdCpu(CD_CONTROL_B_RETURN_CYCLES);
-        return done;
-    }
-#endif
     if (cd_cw(com, param, result, 0)) {
         return 0;
     }
-#ifdef __psyz
-    // CD_sync's turn that sees the command done: CdControlB returns
-    // 292-487 clocks after a plain CdControl would on DuckStation [mark]
-    Psyz_CdCpu(CD_SYNC_POLL_CYCLES);
-#endif
     return CD_sync(CdlSync, result) == CdlComplete;
 }
 

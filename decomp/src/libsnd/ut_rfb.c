@@ -3,8 +3,8 @@
 #ifdef __psyz
 /* The public entry points below hold the interrupt lock (sound API vs. the
  * sequencer tick, see libsnd_private.h). */
-void Psyz_KernelLockApi(void);
-void Psyz_KernelUnlockApi(void);
+void Psyz_KernelLockInterrupts(void);
+void Psyz_KernelUnlockInterrupts(void);
 #define SsUtSetReverbFeedback SsUtSetReverbFeedback_Unlocked
 #endif
 
@@ -21,8 +21,8 @@ void SsUtSetReverbFeedback(short feedback) {
 #ifdef __psyz
 #undef SsUtSetReverbFeedback
 void SsUtSetReverbFeedback(short feedback) {
-    Psyz_KernelLockApi();
+    Psyz_KernelLockInterrupts();
     SsUtSetReverbFeedback_Unlocked(feedback);
-    Psyz_KernelUnlockApi();
+    Psyz_KernelUnlockInterrupts();
 }
 #endif

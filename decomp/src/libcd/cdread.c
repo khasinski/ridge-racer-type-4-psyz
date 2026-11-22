@@ -3,9 +3,14 @@
 #include "libcd_lock.h"
 #ifdef __psyz
 #include <libetc.h>
-#include "libcd_stream.h"
 int CdGetSector2(void* madr, int size);
 int CdDataSync(int mode);
+/* Delivers what the drive has for its callbacks (libcd.c): a LIBCD loop
+ * that waits on them services the drive. */
+void Psyz_CdServiceDrive(void);
+/* ... after a millisecond on the kernel's clock, for a loop that found the
+ * read not done. */
+void Psyz_CdWaitDrive(void);
 #endif
 
 typedef struct {
@@ -35,34 +40,16 @@ static volatile CD_READ_ATTR ReadAttr = {0};
  * busy, and CdRead and CdReadBreak wait for it (up to 121 vblanks). */
 static volatile int read_pause_pending;
 
-#ifdef __psyz
-// The Pause's completion interrupt, handled before a poller sees it.
-static volatile int read_pause_irq_owed;
-
-static void read_pause_irq(void) {
-    if (read_pause_irq_owed) {
-        read_pause_irq_owed = 0;
-        Psyz_CdCpu(CD_READ_PAUSE_CALLBACK_CYCLES);
-    }
-}
-#endif
-
 static void cd_read_restore_sync(u_char intr, u_char* result) {
     CdSyncCallback(ReadAttr.sync_callback);
     read_pause_pending = 0;
-#ifdef __psyz
-    read_pause_irq_owed = 1;
-#endif
 }
 
 // The read's ending Pause, after the ready and data callbacks are restored.
 static void cd_read_end(void) {
     CdSyncCallback(cd_read_restore_sync);
+    read_pause_pending = 1; // before the Pause, whose completion may come at once
     CdControlF(CdlPause, NULL);
-#ifdef __psyz
-    Psyz_CdChargeDone(CD_READ_PAUSE_DONE_CLOCKS);
-#endif
-    read_pause_pending = 1;
 }
 
 // Waits for the ending Pause of the previous read; 0 on a timeout, which
@@ -78,12 +65,9 @@ static int cd_read_wait_pause(void) {
             return 0;
         }
 #ifdef __psyz
-        Psyz_CdPollQuery();
+        Psyz_CdWaitDrive();
 #endif
     }
-#ifdef __psyz
-    read_pause_irq();
-#endif
     return 1;
 }
 
@@ -167,20 +151,6 @@ void cb_data(void) {
     }
 }
 
-/* The PS1 takes the interrupts that come while CD_cw works and waits for
- * an acknowledge (DuckStation: the list DMA's queue exception 734 clocks
- * into CdRead, its ReadN written after it; a root counter's in the
- * Setmode's wait): the commands are not issued under the lock, which
- * would hold those interrupts to its end, nor is CdRead's own CPU time
- * spent under it. */
-#ifdef __psyz
-#define CD_UNLOCK_FOR_COMMAND() CD_UNLOCK()
-#define CD_RELOCK_AFTER_COMMAND() CD_LOCK()
-#else
-#define CD_UNLOCK_FOR_COMMAND()
-#define CD_RELOCK_AFTER_COMMAND()
-#endif
-
 static int cd_read_retry_locked(int mode) {
     u_char param;
 
@@ -200,10 +170,8 @@ static int cd_read_retry_locked(int mode) {
     }
     if (mode) {
         puts("CdRead: retry...\n");
-        CD_UNLOCK_FOR_COMMAND();
         CdControl(CdlPause, NULL, NULL);
         int set = CdControl(CdlSetloc, (u_char*)CdLastPos(), NULL);
-        CD_RELOCK_AFTER_COMMAND();
         if (set == 0) {
             ReadAttr.remaining = -1;
             return ReadAttr.remaining;
@@ -212,56 +180,21 @@ static int cd_read_retry_locked(int mode) {
     CdFlush();
     param = ReadAttr.mode;
     if (param != CdMode() || mode) {
-        CD_UNLOCK_FOR_COMMAND();
-#ifdef __psyz
-        if (Psyz_CdLoopModel()) {
-            Psyz_CdCpu(CD_READ_MODE_TO_SETMODE_CLOCKS);
-        }
-#endif
         int set = CdControl(CdlSetmode, &param, NULL);
-#ifdef __psyz
-        if (Psyz_CdLoopModel()) {
-            Psyz_CdCpu(CD_READ_SETMODE_TO_READ_CLOCKS);
-        }
-#endif
-        CD_RELOCK_AFTER_COMMAND();
         if (set == 0) {
             ReadAttr.remaining = -1;
             return ReadAttr.remaining;
         }
     }
-#ifdef __psyz
-    else {
-        CD_UNLOCK_FOR_COMMAND();
-        Psyz_CdCpu(Psyz_CdLoopModel() ? CD_READ_MODE_TO_READ_CLOCKS : CD_READ_KEEP_MODE_CYCLES);
-        CD_RELOCK_AFTER_COMMAND();
-    }
-#endif
     ReadAttr.pos = CdPosToInt(CdLastPos());
     CdReadyCallback(cb_read);
     if (ReadAttr.read_mode & 1) {
         CdDataCallback(cb_data);
     }
     ReadAttr.cur_buf = ReadAttr.buf;
-    CD_UNLOCK_FOR_COMMAND();
     CdControlF(CdlReadN, NULL);
-#ifdef __psyz
-    int loops = Psyz_CdLoopModel();
-    if (loops) {
-        // its VSync(-1) for the start time of the read's sectors [trace]
-        Psyz_CdCpu(CD_READ_TO_SECTOR_VSYNC_CLOCKS);
-        Psyz_CdVSyncQuery(0x8008ed34);
-    }
-#endif
-    CD_RELOCK_AFTER_COMMAND();
     ReadAttr.remaining = ReadAttr.num_sectors;
     ReadAttr.start_time2 = VSync(-1);
-#ifdef __psyz
-    CD_UNLOCK_FOR_COMMAND();
-    // (to CdRead's return [trace])
-    Psyz_CdCpu(loops ? CD_READ_LOOP_RETURN_CYCLES : CD_READ_END_CYCLES);
-    CD_RELOCK_AFTER_COMMAND();
-#endif
     return ReadAttr.remaining;
 }
 
@@ -297,16 +230,6 @@ void CdReadBreak(void) {
 
 int CdRead(int sectors, u_long* buf, int mode) {
     cd_read_wait_pause();
-#ifdef __psyz
-    int loops = Psyz_CdLoopModel();
-    if (loops) {
-        // its VSync(-1) for the read's start time, after its setup [trace]
-        Psyz_CdCpu(CD_READ_TO_VSYNC_CLOCKS);
-        Psyz_CdVSyncQuery(0x8008f040);
-    } else {
-        Psyz_CdCpu(CD_READ_CYCLES);
-    }
-#endif
     CD_LOCK();
     ReadAttr.mode = mode;
     switch (ReadAttr.mode & (CdlModeSize0 | CdlModeSize1)) {
@@ -330,129 +253,25 @@ int CdRead(int sectors, u_long* buf, int mode) {
     }
     ReadAttr.start_time = VSync(-1);
     CD_UNLOCK(); /* no ready callback can mutate this request until retry */
-#ifdef __psyz
-    if (loops) {
-        // to cd_read_retry's look at the drive's mode [trace]
-        Psyz_CdCpu(CD_READ_VSYNC_TO_MODE_CLOCKS);
-    }
-#endif
     if (CdStatus() & (CdlStatPlay | CdlStatSeek | CdlStatRead)) {
         CdControlB(CdlPause, NULL, NULL);
     }
     return cd_read_retry(0) > 0;
 }
 
-#ifdef __psyz
-static void read_sync_poll(unsigned cycles) { Psyz_CdPollCycles(cycles); }
-
-/* ... with two VSync(-1) calls in it, their GPUSTAT reads at these clocks
- * from its start (libcd.c Psyz_CdVSyncQuery: its time, its repeats) */
-static void read_sync_spend(unsigned total, unsigned g1, unsigned ra1, unsigned g2, unsigned ra2) {
-    Psyz_CdCpu(g1);
-    Psyz_CdVSyncQuery(ra1);
-    Psyz_CdCpu(g2 - g1 - VSYNC_QUERY_CYCLES);
-    Psyz_CdVSyncQuery(ra2);
-    read_sync_poll(total - g2 - VSYNC_QUERY_CYCLES);
-}
-#endif
-
-#ifdef __psyz
-/* CdReadSync as DuckStation runs LIBCD's loop (libcd.c Psyz_CdSpendChunks:
- * its instructions' clocks, the interrupts at their starts; its VSync(-1)
- * calls with their repeats): a turn's two VSync(-1) calls, its look at the
- * sectors left, CdReadSync(0)'s at the Pause's flag 9 clocks later; then
- * CdReady's two calls and the return [trace] (DUCKSTATION_PC_TRACE, the
- * boot's CdSearchFile reads) */
-#define READ_SYNC_SPEND(...)                                                       \
-    do {                                                                           \
-        static const signed char chunks_[] = {__VA_ARGS__};                        \
-        Psyz_CdSpendChunks(chunks_, sizeof(chunks_));                              \
-    } while (0)
-
-static int read_sync_loops(int mode, u_char* result) {
-    int ret;
-    READ_SYNC_SPEND(-13, 0, -1, 7, -1, 7, -4); // to its first VSync(-1)
-    for (;;) {
-        Psyz_CdVSyncQuery(0x8008f0c8);
-        READ_SYNC_SPEND(7, -4, 0, 7, -2, 0, -1, 0, -1, 7, -1, 7, -4);
-        Psyz_CdVSyncQuery(0x8008f0f8);
-        READ_SYNC_SPEND(7, -4, 0);
-        Psyz_CdServiceDrive();
-        CD_LOCK();
-        if (VSync(-1) > ReadAttr.start_time + 1200) {
-            ret = -1;
-        } else if (ReadAttr.remaining < 0 || VSync(-1) > ReadAttr.start_time2 + 60) {
-            cd_read_retry(1);
-            ret = ReadAttr.num_sectors;
-        } else {
-            ret = ReadAttr.remaining; // the look at the sectors left
-        }
-        CD_UNLOCK();
-        if (mode) {
-            READ_SYNC_SPEND(7, -1, 0, -1, 0, -3, 0, -14, 0, -1, 7, -1, 7, -4);
-            break;
-        }
-        READ_SYNC_SPEND(7, -1, 0);
-        Psyz_CdServiceDrive();
-        if (!(ret > 0 || (ret == 0 && read_pause_pending))) { // the look at the Pause's
-            READ_SYNC_SPEND(7, -2, 0, -1, 0, -1, 0, -3, 0, -14, 0, -1, 7, -1, 7, -4);
-            break;
-        }
-        READ_SYNC_SPEND(7, -2, 0, -1, 0, -1, 0, -1, 7, -1, 7, -4);
-    }
-    // CdReady(1): its look at LIBCD's data-ready flag, which a sector's
-    // interrupt sets and it clears (with the result's copy)
-    Psyz_CdVSyncQuery(0x8008cf3c);
-    READ_SYNC_SPEND(-18, 0, -1, 7, -1, 7, -4);
-    Psyz_CdVSyncQuery(0x8008cf88);
-    READ_SYNC_SPEND(-1, 7, -3, 0, -1, 7, -8, 0, -2, 0, -1, 0, -1, 7, -1, 0, -1, 0, 7, -3, 0, 7, -3, 0);
-    Psyz_CdServiceDrive();
-    if (Psyz_CdTakeReadyFlag()) {
-        READ_SYNC_SPEND(-5, 0);
-        if (result) {
-            READ_SYNC_SPEND(-1, 7, -2, 0, 7, -2, 0, 7, -2, 0, 7, -2, 0, 7, -2, 0, 7, -2, 0, 7, -2, 0, 7, -2, 0);
-        }
-        READ_SYNC_SPEND(-1, 0);
-    } else {
-        READ_SYNC_SPEND(-1, 0);
-    }
-    READ_SYNC_SPEND(7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -1, 0, 7, -2, 0);
-    CdReady(1, result);
-    // the look at the Pause's flag after CdReady, the return
-    READ_SYNC_SPEND(7, -2, 0);
-    if (read_pause_pending) {
-        if (ret == 0) {
-            READ_SYNC_SPEND(-1, 0, -1);
-        } else {
-            READ_SYNC_SPEND(-1, 0);
-        }
-    }
-    if (ret == 0 && read_pause_pending) {
-        ret = 1;
-    }
-    READ_SYNC_SPEND(7, 7, 7, 7, 7, 7, -1, 0);
-    if (ret == 0) {
-        read_pause_irq();
-    }
-    return ret;
-}
-#endif
-
 int CdReadSync(int mode, u_char* result) {
     int ret;
 
+    for (int turn = 0;; turn++) {
 #ifdef __psyz
-    if (Psyz_CdLoopModel()) {
-        return read_sync_loops(mode, result);
-    }
-#endif
-    do {
-#ifdef __psyz
-        // The drive reads on while the caller polls: a turn up to its look
-        // at the read's state (CdReadSync(0)'s at the Pause's flag), its
-        // two VSync(-1) calls' GPUSTAT reads 30 and 147 clocks in
-        read_sync_spend(CD_READ_SYNC_TURN_CYCLES, CD_READ_SYNC_VSYNC1_CLOCKS, 0x8008f0c8,
-                        CD_READ_SYNC_VSYNC2_CLOCKS, 0x8008f0f8);
+        // the drive delivers while the caller polls
+        if (turn) {
+            Psyz_CdWaitDrive();
+        } else {
+            Psyz_CdServiceDrive();
+        }
+#else
+        (void)turn;
 #endif
         CD_LOCK();
         if (VSync(-1) > ReadAttr.start_time + 1200) {
@@ -466,35 +285,15 @@ int CdReadSync(int mode, u_char* result) {
         }
         CD_UNLOCK();
         // mode 0 also waits for the read's ending Pause
-    } while (mode == 0 && (ret > 0 || (ret == 0 && read_pause_pending)));
+        if (!(mode == 0 && (ret > 0 || (ret == 0 && read_pause_pending)))) {
+            break;
+        }
+    }
 
-#ifdef __psyz
-    // the Pause may complete meanwhile: its look comes after CdReady
-    // (CdReady's two VSync(-1) calls' GPUSTAT reads 37 and 149 clocks
-    // after its call, 49 and 161 after CdReadSync(0)'s look)
-    read_sync_spend(mode ? CD_READ_SYNC_POLL_END_CYCLES : CD_READ_SYNC_END_CYCLES,
-                    mode ? CD_READY_VSYNC1_CLOCKS : CD_READY_VSYNC1_CLOCKS + CD_READ_SYNC_TO_READY_CLOCKS,
-                    0x8008cf3c,
-                    mode ? CD_READY_VSYNC2_CLOCKS : CD_READY_VSYNC2_CLOCKS + CD_READ_SYNC_TO_READY_CLOCKS,
-                    0x8008cf88);
-#endif
     CdReady(1, result);
     if (ret == 0 && read_pause_pending) {
         ret = 1;
     }
-#ifdef __psyz
-    // (a call after the read's last sector, while its Pause is pending,
-    // takes LIBCD's other path back: CD_READ_SYNC_PENDING_CYCLES more)
-    Psyz_CdCpu(CD_READ_SYNC_RETURN_CYCLES + (ret == 1 && mode && ReadAttr.remaining == 0 &&
-                                                     read_pause_pending
-                                                 ? CD_READ_SYNC_PENDING_CYCLES
-                                                 : 0));
-#endif
-#ifdef __psyz
-    if (ret == 0) {
-        read_pause_irq();
-    }
-#endif
     return ret;
 }
 
