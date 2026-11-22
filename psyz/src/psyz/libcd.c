@@ -1549,6 +1549,9 @@ int CD_init(void) {
     if (CdStatus() & CdlStatShellOpen) {
         CD_cw(CdlNop, 0, nop_result, 0);
     }
+    if (init_calls > 1) {
+        drive_cpu(CD_INIT_NOP_TO_RESET_CYCLES);
+    }
     if (CD_cw(CdlReset, 0, 0, 0)) {
         return -1;
     }
@@ -1783,8 +1786,11 @@ static void drive_irq(uint64_t at_ns, unsigned cycles, unsigned charged) {
     }
     if (!drive_is_instant()) {
         unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
+        /* With the card driver's chain the sector's DMA (2700-3250 clocks
+         * into DuckStation's 4175-clock exception) ends inside the dispatch,
+         * whose blanks are hidden to its end: no tail past it [trace] */
         Psyz_KernelDispatchTail(at_ns, cycles + chain, charged ? charged + chain : 0,
-                                cycles == CD_DATA_IRQ_CLOCKS ? CD_DATA_DMA_TAIL_CLOCKS : 0);
+                                cycles == CD_DATA_IRQ_CLOCKS && !chain ? CD_DATA_DMA_TAIL_CLOCKS : 0);
     }
 }
 
@@ -1823,7 +1829,7 @@ static void deliver_data_sector(void) {
     }
     if (!drive_is_instant()) {
         unsigned clocks = CD_DATA_CALLBACK_CW_CLOCKS +
-                          (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0);
+                          (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES + CD_DATA_CALLBACK_CHAIN_CW_CLOCKS : 0);
         sector_callback_ns = irq_ns + (clocks * 1000000000ull + 33868799) / 33868800;
     }
     u_char result[8] = {(u_char)CD_status};
