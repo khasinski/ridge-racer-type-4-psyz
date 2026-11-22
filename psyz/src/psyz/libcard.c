@@ -150,6 +150,7 @@ typedef struct {
     int sector;    // the last transfer moves a frame (CARD_SECTOR_CLOCKS)
     int answering; // that frame is still on the wire
     int kind;      // CARD_KIND_*: an info, a write
+    int frames;    // transfers started
 } CardRequest;
 
 /* A card's FLAG byte has a "new card" bit, set when the card is powered or
@@ -188,9 +189,30 @@ static int card_chan_state(long chan) {
     return (chan & 15) ? PSYZ_CARD_NONE : Psyz_CardSlotState((int)(chan >> 4));
 }
 
+static void card_undeliver_hw(void) {
+    UnDeliverEvent(HwCARD, EvSpIOE);
+    UnDeliverEvent(HwCARD, EvSpERROR);
+    UnDeliverEvent(HwCARD, EvSpTIMOUT);
+    UnDeliverEvent(HwCARD, EvSpNEW);
+}
+
+/* the hardware events a request's end delivered are taken back at the
+ * driver's next turn (DuckStation: HwCARD's IOE delivered at field 292,
+ * active again at 293, SwCARD's left to the game's TestEvent) */
+static int card_hw_undeliver;
+static void card_frame_in(void) {
+    Psyz_KernelRaise(HwCARD, EvSpIOE);
+    card_hw_undeliver = 1;
+}
+
+/* (on the offline clock: in real time several blanks can pass in one of
+ * the program's waits, which would take the event back unseen) */
+static int card_bios_events(void) { return Psyz_KernelOfflineClock(); }
+
 static void card_raise(unsigned spec) {
     Psyz_KernelRaise(SwCARD, spec);
     Psyz_KernelRaise(HwCARD, spec);
+    card_hw_undeliver = card_bios_events();
 }
 
 static unsigned card_result(const CardRequest* r) {
@@ -230,6 +252,7 @@ static void card_sector_done(int port) {
     }
 }
 static void card_sector_done0(void) { card_sector_done(0); }
+
 static void card_sector_done1(void) { card_sector_done(1); }
 
 // The BIOS card handler's work at one vblank; a vblank it misses (turn 0)
@@ -258,6 +281,10 @@ void Psyz_CardVBlank(int turn) {
     card_drv.last_vblank_ns = Psyz_KernelNowNs();
     if (!turn) {
         return;
+    }
+    if (card_hw_undeliver) {
+        card_hw_undeliver = 0;
+        card_undeliver_hw();
     }
     /* A raw command (Psyz_CardRawBegin: libmcx's PocketStation 0x5A) runs
      * on libmcx's own vblank handler, not on the BIOS driver's port turns:
@@ -318,7 +345,21 @@ void Psyz_CardVBlank(int turn) {
         r->parse = 0;
         r->sector = 1;
     }
+    /* each frame of a request is the BIOS's sector call (read_card_sector,
+     * B0 4Fh, every other field on DuckStation): it takes the hardware card
+     * events back as it starts and delivers HwCARD's IOE once its frame is
+     * in, which the driver's next turn takes back: that event
+     * alternates delivered and active by field through a directory's load
+     * (DSF_PEEK of the BIOS's EvCB table, DSF_B0; the timer's exceptions
+     * 2726 and 2746 clocks by it) */
+    if (r->frames++ > 0 && card_bios_events()) {
+        card_undeliver_hw();
+    }
     if (--r->transfers > 0) {
+        if (card_bios_events()) {
+            Psyz_KernelPostAtNs(card_drv.last_vblank_ns + card_clocks_ns(CARD_SECTOR_CLOCKS),
+                                card_frame_in);
+        }
         return;
     }
     if (r->parse) {
@@ -351,6 +392,7 @@ static void card_spin(void) {
     }
 }
 
+
 static long card_request_sectors(long chan, int transfers, int raise, int load,
                                  int parse, int sector) {
     if (!validate_chan(chan)) {
@@ -376,6 +418,7 @@ static long card_request_sectors(long chan, int transfers, int raise, int load,
         return 0; // the port is busy
     }
     r->chan = chan;
+    r->frames = 0;
     r->transfers = transfers;
     r->raise = raise;
     r->load = load;

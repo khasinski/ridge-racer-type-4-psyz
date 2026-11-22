@@ -942,29 +942,78 @@ unsigned Psyz_KernelCdChainCycles(void) {
     return cycles;
 }
 
-/* The card driver's chain on an exception, by the events open: on
- * DuckStation a non-ticking timer's exception takes 2404 clocks before
- * StartCARD, 2472 after it with the SPU's DMA event the only one open, 2726
- * once the game's eight card events are open (cardini.c), 254 more (the
- * chain's DeliverEvent walks them: BIOS_CARD_CHAIN_EVENT_CYCLES each; ticking
- * 8391 against 8645; DUCKSTATION_PC_TRACE, vs-two-cards fields 427-720).
- * BIOS_CARD_CHAIN_CYCLES is the chain with BIOS_CARD_CHAIN_EVENTS open.
- * Measured for the root counters' exceptions only: the vblank's there (4374
- * and 8254 clocks with the card driver's probe turns, the port's 4219)
- * and the devices' are left at BIOS_CARD_CHAIN_CYCLES. */
-unsigned Psyz_CardChainCycles(void) {
+/* The BIOS's DeliverEvent walks every event control block (BIOS RAM
+ * 0x1bb8-0x1c2c: 14 clocks a block, 10 more for one whose status is
+ * EvStACTIVE; an EvMdNOINTR event delivered and not yet tested, EvStALREADY,
+ * takes the short path), twice in a timer's or the vblank's exception
+ * (DUCKSTATION_PC_TRACE: the walks counted per exception kind, a device's
+ * once or twice, an MDEC output's none). A root counter's exception against
+ * the boot's state KERNEL_IRQ_CYCLES has (the SPU's DMA event open and
+ * active): BIOS_RCNT_ACTIVE_EVENT_CYCLES (the two walks) an active event,
+ * BIOS_RCNT_OPEN_EVENT_CYCLES more an open one (the eight card events' 254
+ * clocks less their 160; the rest not traced) and BIOS_RCNT_CARD_CHAIN_CYCLES
+ * from StartCARD (DuckStation's non-ticking timer exceptions 2404, 2472 and
+ * 2726 before StartCARD, after it and with the card events open, ticking
+ * 8092, 8391 and 8645; through the opening movie a card event delivered and
+ * not yet tested every other field, 2726 against 2746: vs-two-cards fields
+ * 427-720). */
+static void EventCounts(int* open, int* active) {
+    *open = *active = 0;
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        long st = AtomicLoad(&events[i].status);
+        *open += st != EvStUNUSED;
+        *active += st == EvStACTIVE;
+    }
+}
+
+static int RcntChainCycles(void) {
+    int open, active;
+    EventCounts(&open, &active);
+    int cycles = (active - 1) * (int)BIOS_RCNT_ACTIVE_EVENT_CYCLES +
+                 (open > 1 ? (open - 1) * (int)BIOS_RCNT_OPEN_EVENT_CYCLES : 0);
+    if (Psyz_CardChainInstalled()) {
+        cycles += (int)BIOS_RCNT_CARD_CHAIN_CYCLES;
+    }
+    if (!(irq_mask & ((1u << IRQ_RCNT0) | (1u << IRQ_RCNT1) | (1u << IRQ_RCNT2)))) {
+        cycles -= (int)KERNEL_IRQ_BIOS_RCNT_CYCLES;
+    }
+    return cycles;
+}
+
+/* ... the vblank's: BIOS_CARD_CHAIN_CYCLES was measured with the events
+ * open all active; an open one not active saves the two walks' 20 (in the
+ * fields 436-585 before the card events open DuckStation's vblank
+ * exception is 4374 clocks, or 8254 with the card driver's probe turns,
+ * the port's 4219: not traced) */
+static unsigned VblankCardChainCycles(void) {
     if (!Psyz_CardChainInstalled()) {
         return 0;
     }
-    unsigned open = 0;
-    for (int i = 0; i < EVENT_COUNT; i++) {
-        if (AtomicLoad(&events[i].status) != EvStUNUSED) {
-            open++;
-        }
-    }
-    int cycles = (int)BIOS_CARD_CHAIN_CYCLES -
-                 ((int)BIOS_CARD_CHAIN_EVENTS - (int)open) * (int)BIOS_CARD_CHAIN_EVENT_CYCLES;
+    int open, active;
+    EventCounts(&open, &active);
+    int cycles = (int)BIOS_CARD_CHAIN_CYCLES - (open - active) * (int)BIOS_RCNT_ACTIVE_EVENT_CYCLES;
     return cycles > 0 ? (unsigned)cycles : 0;
+}
+
+/* PSYZ_EVENT_TRACE=1: the event table's statuses after each blank's
+ * handlers ('.' free, W disabled, A active, R delivered and not yet tested),
+ * against the BIOS's EvCB table (DSF_PEEK=8000e028:616 between fields) */
+void Psyz_KernelEventTrace(unsigned vsync) {
+    static int trace = -1;
+    if (trace < 0) {
+        const char* v = getenv("PSYZ_EVENT_TRACE");
+        trace = v && *v == '1';
+    }
+    if (!trace) {
+        return;
+    }
+    char st[EVENT_COUNT + 1];
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        long v = AtomicLoad(&events[i].status);
+        st[i] = v == EvStUNUSED ? '.' : v == EvStACTIVE ? 'A' : v == EvStALREADY ? 'R' : 'W';
+    }
+    st[EVENT_COUNT] = 0;
+    fprintf(stderr, "events %u %s\n", vsync, st);
 }
 
 static unsigned BiosChainCycles(void) {
@@ -1006,9 +1055,7 @@ static void ServiceLine(int line, uint64_t at_ns) {
     line_depth++;
     line_debt_base = debt;
     irq_latched &= ~(1u << line);
-    unsigned entry = KERNEL_IRQ_CYCLES +
-                     (line == IRQ_VBLANK ? (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0)
-                                         : Psyz_CardChainCycles()) +
+    unsigned entry = KERNEL_IRQ_CYCLES + (line == IRQ_VBLANK ? VblankCardChainCycles() : 0) +
                      RomRefetch();
     /* a blank during another interrupt's exception, before libetc's last
      * look at the status: served in it (DuckStation: VSync(0) returns 4209
@@ -1017,7 +1064,9 @@ static void ServiceLine(int line, uint64_t at_ns) {
      * at 5824) [exc] */
     int shared_vblank = line == IRQ_VBLANK && InOpenException(at_ns);
     // (a blank served in another's exception does not walk the chains again)
-    entry += shared_vblank ? shared_exception_context : exception_context - (int)BiosChainCycles();
+    entry += shared_vblank ? shared_exception_context
+             : line == IRQ_VBLANK ? exception_context - (int)BiosChainCycles()
+                                  : exception_context + RcntChainCycles();
     if (shared_vblank) {
         entry -= SHARED_EXCEPTION_SAVED_CYCLES;
         if (Psyz_KernelBlankInDispatch(at_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,

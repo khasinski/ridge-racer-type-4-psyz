@@ -270,6 +270,7 @@ void Psyz_VSyncBlank(void) {
     // its exception, for the DMA interrupts that come meanwhile
     long cycles = Psyz_KernelDebtClocks() - debt;
     Psyz_KernelNoteException(blank_ns, cycles > 0 ? (unsigned)cycles : 0);
+    Psyz_KernelEventTrace((unsigned)Psyz_VideoVSync(-1));
 }
 
 /* SDK VSync(n) waits for the interval since the previous blocking call,

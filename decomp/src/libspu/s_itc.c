@@ -19,6 +19,10 @@ long SpuIsTransferCompleted(long immediateFlag) {
         Psyz_SpendTime(SPU_TRANSFER_POLL_NS); // the PS1 time of a poll
         return 0;
     }
+    /* the original's TestEvent: it takes the DMA's delivered event back to
+     * EvStACTIVE (the BIOS's event table, which every DeliverEvent walks:
+     * PSYZ_EVENT_TRACE against DuckStation's EvCB table) */
+    TestEvent(_spu_EVdma);
     _spu_inTransfer = 1;
     return 1;
 #endif
