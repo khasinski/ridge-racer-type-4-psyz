@@ -206,6 +206,8 @@ enum {
     /* The card driver's chain (InitCARD) on every exception from then on:
      * a non-ticking RCnt interrupt takes 2748 in the menus [exc] */
     BIOS_CARD_CHAIN_CYCLES = 374,
+    BIOS_CARD_CHAIN_EVENTS = 9,
+    BIOS_CARD_CHAIN_EVENT_CYCLES = 32, // (254 for eight) [trace]
     /* SetRCnt up to its last mode write, which starts the count (kernel.c
      * counts from where the CPU's work has got to, the handlers' time owed
      * included): the sequencer's timer then interrupts at DuckStation's

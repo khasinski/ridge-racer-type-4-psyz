@@ -942,6 +942,31 @@ unsigned Psyz_KernelCdChainCycles(void) {
     return cycles;
 }
 
+/* The card driver's chain on an exception, by the events open: on
+ * DuckStation a non-ticking timer's exception takes 2404 clocks before
+ * StartCARD, 2472 after it with the SPU's DMA event the only one open, 2726
+ * once the game's eight card events are open (cardini.c), 254 more (the
+ * chain's DeliverEvent walks them: BIOS_CARD_CHAIN_EVENT_CYCLES each; ticking
+ * 8391 against 8645; DUCKSTATION_PC_TRACE, vs-two-cards fields 427-720).
+ * BIOS_CARD_CHAIN_CYCLES is the chain with BIOS_CARD_CHAIN_EVENTS open.
+ * Measured for the root counters' exceptions only: the vblank's there (4374
+ * and 8254 clocks with the card driver's probe turns, the port's 4219)
+ * and the devices' are left at BIOS_CARD_CHAIN_CYCLES. */
+unsigned Psyz_CardChainCycles(void) {
+    if (!Psyz_CardChainInstalled()) {
+        return 0;
+    }
+    unsigned open = 0;
+    for (int i = 0; i < EVENT_COUNT; i++) {
+        if (AtomicLoad(&events[i].status) != EvStUNUSED) {
+            open++;
+        }
+    }
+    int cycles = (int)BIOS_CARD_CHAIN_CYCLES -
+                 ((int)BIOS_CARD_CHAIN_EVENTS - (int)open) * (int)BIOS_CARD_CHAIN_EVENT_CYCLES;
+    return cycles > 0 ? (unsigned)cycles : 0;
+}
+
 static unsigned BiosChainCycles(void) {
     unsigned cycles = KERNEL_IRQ_BIOS_EVENT_CYCLES + KERNEL_IRQ_BIOS_RCNT_CYCLES;
     for (int i = 0; i < EVENT_COUNT; i++) {
@@ -981,7 +1006,9 @@ static void ServiceLine(int line, uint64_t at_ns) {
     line_depth++;
     line_debt_base = debt;
     irq_latched &= ~(1u << line);
-    unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0) +
+    unsigned entry = KERNEL_IRQ_CYCLES +
+                     (line == IRQ_VBLANK ? (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0)
+                                         : Psyz_CardChainCycles()) +
                      RomRefetch();
     /* a blank during another interrupt's exception, before libetc's last
      * look at the status: served in it (DuckStation: VSync(0) returns 4209

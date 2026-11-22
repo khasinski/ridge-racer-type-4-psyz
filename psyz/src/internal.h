@@ -56,6 +56,7 @@ uint64_t Psyz_KernelNextEventNs(void);
 unsigned long Psyz_KernelExceptionCount(void);
 uint64_t Psyz_VSyncBlankNs(uint64_t grid_ns);
 uint64_t Psyz_KernelCounterStartNs(int i);
+unsigned Psyz_CardChainCycles(void);
 void Psyz_VSyncBlankTaken(void);
 unsigned Psyz_KernelCdChainCycles(void);
 void Psyz_KernelPauseHostClock(int paused);
