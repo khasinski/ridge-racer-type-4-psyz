@@ -206,8 +206,16 @@ static bool InterpPend(
  * entries collide, and so which ones a full probe sequence drops, differ
  * from run to run. */
 static unsigned InterpHash(const void* p) {
-    uintptr_t n = (uintptr_t)p - (uintptr_t)interp_addresses;
-    return (unsigned)(((n >> 2) ^ (n >> 16) ^ (n >> 30)) & (INTERP_MAP - 1));
+    /* Multiplicative (Fibonacci) mixing of the word offset. The former
+     * (n >> 2) ^ (n >> 16) ^ (n >> 30) kept consecutive words in
+     * consecutive slots, so the 4 MiB packet arenas (16 table widths) and
+     * the queue folded onto each other in long primary clusters: every
+     * miss, i.e. most of the per-word lookups GPU_Enqueue makes, walked
+     * one, and with the extended draw distance that walk was over half the
+     * main thread's time. */
+    uint64_t n = (uint64_t)((uintptr_t)p - (uintptr_t)interp_addresses) >> 2;
+    n *= 0x9E3779B97F4A7C15ull;
+    return (unsigned)(n >> 32) & (INTERP_MAP - 1);
 }
 
 /* Linear probing must continue to an empty slot: four collisions used to
@@ -2146,6 +2154,8 @@ static void InterpAddEdge(
                 const char* tree = SDL_getenv("PSYZ_INTERP_EDGE_TREE");
                 const char* tree_verify = SDL_getenv("PSYZ_INTERP_TREE_VERIFY");
                 interp_edge_cache->tree_enabled = !(tree && *tree == '0');
+                const char* box = SDL_getenv("PSYZ_INTERP_EDGE_BOX");
+                interp_edge_cache->box_enabled = !(box && *box == '0');
                 interp_edge_cache->verify_tree = tree_verify && *tree_verify == '1';
                 const char* reject = SDL_getenv("PSYZ_INTERP_EDGE_REJECT");
                 interp_edge_cache->reject_enabled = !(reject && *reject == '0');
@@ -2245,97 +2255,130 @@ static bool InterpEdgeMayMatch(const float* p, const InterpEdge* g,
     return cross <= reach * m->length[pose] * 1.001f + 0.0001f;
 }
 
+/* One junction search's state: the vertex, the best edge so far and, with
+ * groups, the best of another face group (InterpSelectJunction). */
+typedef struct {
+    const InterpJunctionPrim* q;
+    const float *v0, *v1;
+    unsigned i;
+    float reach, best, other_best;
+    const InterpEdge *on, *second;
+    bool groups, reject;
+} InterpJunctionScan;
+
+/* The original test of one candidate edge, in the scan's order: strict
+ * comparisons keep the first winner on ties. */
+static inline void InterpJunctionConsider(
+    InterpJunctionScan* s, unsigned edge, const InterpEdgeCache* cache) {
+    const InterpJunctionPrim* q = s->q;
+    const float *v0 = s->v0, *v1 = s->v1, reach = s->reach;
+    const unsigned i = s->i;
+    const InterpEdge* g = &interp_edges[edge];
+    const InterpEdgeMeasure* measure = cache ? &cache->measures[edge] : NULL;
+    if ((!s->groups && g->pair == q->pair) || g->ox != q->ox || g->oy != q->oy)
+        return;
+    /* a midpoint-only pose in this frame (nearer than the
+     * projection plane) is no projection to test */
+    const bool both = q->posed && g->posed;
+    /* with one pose to test (geometry passing the view, often a
+     * long edge) the direction of a long edge counts less */
+    const float dx = g->b0[0] - g->a0[0], dy = g->b0[1] - g->a0[1];
+    const float l0 = measure ? measure->length[0] : SDL_sqrtf(dx * dx + dy * dy);
+    if (s->reject &&
+        (!InterpEdgeMayMatch(v0, g, measure, 0,
+                             reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)) ||
+         (both && !InterpEdgeMayMatch(v1, g, measure, 1, reach))))
+        return;
+    float d0, d1 = 0.0f;
+    const float t0 = InterpAlongEdge(v0, g, measure, 0, &d0);
+    if (!(t0 > 0.0f && t0 < 1.0f &&
+          d0 < reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)))
+        return;
+    if (both) {
+        const float t1 = InterpAlongEdge(v1, g, measure, 1, &d1);
+        if (!(t1 > 0.0f && t1 < 1.0f && d1 < reach))
+            return;
+    }
+    /* not one of its ends (a shared vertex is joined already) */
+    if (t0 * l0 < 0.5f || (1.0f - t0) * l0 < 0.5f)
+        return;
+    /* at the edge's depth there (not something in front or behind) */
+    if (q->d0[i] > 0.0f && g->da > 0.0f && g->db > 0.0f) {
+        const float z = 1.0f / ((1.0f - t0) / g->da + t0 / g->db);
+        if (fabsf(z - q->d0[i]) > 0.1f * SDL_max(z, q->d0[i]))
+            return;
+    }
+    const float score = d0 + (both ? d1 : d0);
+    if (score < s->best) {
+        if (s->groups && s->on && g->pair != s->on->pair) {
+            s->second = s->on;
+            s->other_best = s->best;
+        }
+        s->best = score;
+        s->on = g;
+    } else if (s->groups && s->on && g->pair != s->on->pair && score < s->other_best) {
+        s->second = g;
+        s->other_best = score;
+    }
+}
+
+/* Whether the vertex lies outside the edge reference's grown box (it
+ * cannot match: InterpEdgeBox). */
+static inline bool InterpEdgeBoxMisses(const InterpEdgeBox* b, const float* v, float reach) {
+    return v[0] < b->lx - reach || v[0] > b->hx + reach ||
+           v[1] < b->ly - reach || v[1] > b->hy + reach;
+}
+
 /* Two different face groups allow reuse even when the caller must exclude
  * its own edges. Strict comparisons preserve the first winner on ties. */
 static const InterpEdge* InterpSelectJunction(
     const InterpJunctionPrim* q, unsigned i, unsigned c, float reach,
     InterpEdgeCache* cache, bool linear, bool groups, bool hierarchy, const InterpEdge** other) {
-    const float *v0 = q->p0[i], *v1 = q->p1[i];
-    float best = 1e9f, other_best = 1e9f;
-    const InterpEdge* second = NULL;
-    const InterpEdge* on = NULL;
-    unsigned r = linear ? cache->begin[c] : interp_edge_head[c];
-    const unsigned end = linear ? cache->begin[c + 1] : 0;
-    const bool reject = hierarchy && cache && cache->reject_enabled;
-    while (linear ? r < end : r != 0) {
-        if (linear && hierarchy && cache->tree_enabled && end - cache->begin[c] >= 32 &&
-            q->d0[i] > 0.0f && q->d0[i] < 1e9f) {
-            const unsigned offset = r - cache->begin[c];
-            unsigned skip = 0;
-            if (!(offset % 64)) {
-                const InterpDepthBounds b = cache->depth64[cache->start64[c] + offset / 64];
-                if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 64;
+    InterpJunctionScan s = {q, q->p0[i], q->p1[i], i, reach, 1e9f, 1e9f, NULL, NULL,
+                            groups, hierarchy && cache && cache->reject_enabled};
+    const float* v0 = s.v0;
+    {
+        unsigned r = linear ? cache->begin[c] : interp_edge_head[c];
+        const unsigned end = linear ? cache->begin[c + 1] : 0;
+        while (linear ? r < end : r != 0) {
+            if (linear && hierarchy && cache->tree_enabled && end - cache->begin[c] >= 32 &&
+                q->d0[i] > 0.0f && q->d0[i] < 1e9f) {
+                const unsigned offset = r - cache->begin[c];
+                unsigned skip = 0;
+                if (!(offset % 64)) {
+                    const InterpDepthBounds b = cache->depth64[cache->start64[c] + offset / 64];
+                    if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 64;
+                }
+                if (!skip && !(offset % 8)) {
+                    const InterpDepthBounds b = cache->depth8[cache->start8[c] + offset / 8];
+                    if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 8;
+                }
+                if (skip) { r = SDL_min(r + skip, end); continue; }
             }
-            if (!skip && !(offset % 8)) {
-                const InterpDepthBounds b = cache->depth8[cache->start8[c] + offset / 8];
-                if (q->d0[i] < b.lo || q->d0[i] > b.hi) skip = 8;
+            unsigned edge;
+            if (linear) {
+                if (hierarchy && cache->box_enabled &&
+                    InterpEdgeBoxMisses(&cache->boxes[r], v0, reach)) {
+                    ++r;
+                    continue;
+                }
+                edge = cache->edges[r++];
+            } else {
+                const InterpEdgeRef* ref = &interp_edge_refs[r - 1];
+                edge = ref->edge;
+                r = ref->next;
             }
-            if (skip) { r = SDL_min(r + skip, end); continue; }
-        }
-        unsigned edge;
-        if (linear) {
-            edge = cache->edges[r++];
-        } else {
-            const InterpEdgeRef* ref = &interp_edge_refs[r - 1];
-            edge = ref->edge;
-            r = ref->next;
-        }
-        const InterpEdge* g = &interp_edges[edge];
-        const InterpEdgeMeasure* measure = cache ? &cache->measures[edge] : NULL;
-        if ((!groups && g->pair == q->pair) || g->ox != q->ox || g->oy != q->oy)
-            continue;
-        /* a midpoint-only pose in this frame (nearer than the
-         * projection plane) is no projection to test */
-        const bool both = q->posed && g->posed;
-        /* with one pose to test (geometry passing the view, often a
-         * long edge) the direction of a long edge counts less */
-        const float dx = g->b0[0] - g->a0[0], dy = g->b0[1] - g->a0[1];
-        const float l0 = measure ? measure->length[0] : SDL_sqrtf(dx * dx + dy * dy);
-        if (reject &&
-            (!InterpEdgeMayMatch(v0, g, measure, 0,
-                                 reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)) ||
-             (both && !InterpEdgeMayMatch(v1, g, measure, 1, reach))))
-            continue;
-        float d0, d1 = 0.0f;
-        const float t0 = InterpAlongEdge(v0, g, measure, 0, &d0);
-        if (!(t0 > 0.0f && t0 < 1.0f &&
-              d0 < reach + (both ? 0.0f : l0 * INTERP_JUNCTION_SLOPE)))
-            continue;
-        if (both) {
-            const float t1 = InterpAlongEdge(v1, g, measure, 1, &d1);
-            if (!(t1 > 0.0f && t1 < 1.0f && d1 < reach))
-                continue;
-        }
-        /* not one of its ends (a shared vertex is joined already) */
-        if (t0 * l0 < 0.5f || (1.0f - t0) * l0 < 0.5f)
-            continue;
-        /* at the edge's depth there (not something in front or behind)
-         */
-        if (q->d0[i] > 0.0f && g->da > 0.0f && g->db > 0.0f) {
-            const float z = 1.0f / ((1.0f - t0) / g->da + t0 / g->db);
-            if (fabsf(z - q->d0[i]) > 0.1f * SDL_max(z, q->d0[i]))
-                continue;
-        }
-        const float score = d0 + (both ? d1 : d0);
-        if (score < best) {
-            if (groups && on && g->pair != on->pair) {
-                second = on;
-                other_best = best;
-            }
-            best = score;
-            on = g;
-        } else if (groups && on && g->pair != on->pair && score < other_best) {
-            second = g;
-            other_best = score;
+            InterpJunctionConsider(&s, edge, cache);
         }
     }
     if (other)
-        *other = second;
-    return on;
+        *other = s.second;
+    return s.on;
 }
 
 static InterpJunctionQuery* InterpFindJunctionQuery(
-    InterpEdgeCache* cache, const InterpJunctionPrim* q, unsigned i, bool* hit) {
+    InterpEdgeCache* cache, InterpJunctionQuery* queries, unsigned long long* stats,
+    const InterpJunctionPrim* q, unsigned i, bool* hit) {
     const float pose[5] = {q->p0[i][0], q->p0[i][1], q->p1[i][0], q->p1[i][1], q->d0[i]};
     u32 bits[5];
     memcpy(bits, pose, sizeof(bits));
@@ -2345,22 +2388,22 @@ static InterpJunctionQuery* InterpFindJunctionQuery(
     hash ^= q->posed ? 0x85EBCA77u : 0u;
     hash = (hash ^ (hash >> 16)) & (INTERP_QUERY_CACHE - 1);
     InterpJunctionQuery* slot = NULL;
-    ++cache->query_count;
+    ++stats[0];
     for (unsigned probe = 0; probe < 4; ++probe) {
-        InterpJunctionQuery* entry = &cache->queries[(hash + probe) & (INTERP_QUERY_CACHE - 1)];
+        InterpJunctionQuery* entry = &queries[(hash + probe) & (INTERP_QUERY_CACHE - 1)];
         if (entry->generation != cache->generation) {
             if (!slot)
                 slot = entry;
         } else if (entry->ox == q->ox && entry->oy == q->oy && entry->posed == q->posed &&
                    !memcmp(entry->pose, pose, sizeof(pose))) {
             *hit = true;
-            ++cache->query_hits;
+            ++stats[1];
             return entry;
         }
     }
     *hit = false;
     if (!slot)
-        slot = &cache->queries[hash];
+        slot = &queries[hash];
     memcpy(slot->pose, pose, sizeof(pose));
     slot->ox = q->ox;
     slot->oy = q->oy;
@@ -2370,81 +2413,140 @@ static InterpJunctionQuery* InterpFindJunctionQuery(
     return slot;
 }
 
-/* The queued paired vertices lying on another face's edge in both poses
- * move onto that edge's midpoint. */
-static void InterpSnapJunctions(unsigned n) {
-    static int snap = -1;
-    if (snap < 0) {
-        const char* e = SDL_getenv("PSYZ_INTERP_JUNCTIONS");
-        snap = !(e && *e == '0');
+/* Worker threads for the interpolation solver's independent per-vertex
+ * searches (InterpSnapRange). PSYZ_INTERP_THREADS=n sets their number
+ * (0: none, everything on the main thread); by default the logical cores
+ * less two, at most INTERP_WORKERS_MAX. The main thread takes part. */
+#define INTERP_WORKERS_MAX 8
+static InterpJunctionQuery* interp_worker_queries[INTERP_WORKERS_MAX + 1];
+typedef void (*InterpRangeFn)(unsigned begin, unsigned end, unsigned worker);
+static struct {
+    int workers; /* -1: not started yet */
+    SDL_Thread* thread[INTERP_WORKERS_MAX];
+    SDL_Semaphore *go, *done;
+    SDL_AtomicInt next, quit;
+    unsigned total, chunk;
+    InterpRangeFn fn;
+} interp_pool = {-1};
+
+static void InterpPoolChunks(unsigned worker) {
+    for (;;) {
+        const unsigned at = (unsigned)SDL_AddAtomicInt(&interp_pool.next, 1) * interp_pool.chunk;
+        if (at >= interp_pool.total)
+            break;
+        interp_pool.fn(at, SDL_min(at + interp_pool.chunk, interp_pool.total), worker);
     }
-    if (!n || !snap || interp_edges_frame != interp_frame)
-        return;
-    /* Keep each bucket in exactly its linked-list order (including hash
-     * collisions and duplicate references), but scan contiguous indices.
-     * Later CLUT splits can reuse it until another edge was queued. */
-    InterpEdgeCache* cache = interp_edge_cache;
-    const bool current = cache && cache->frame == interp_frame &&
-                         cache->refs == interp_edge_refs_len;
-    /* A small partial batch is cheaper to walk directly than to rebuild
-     * the whole index. An already current index costs nothing to reuse. */
-    const bool linear = cache && (current || n >= 64);
-    if (linear && !current) {
-        unsigned at = 0;
-        for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
-            cache->begin[c] = at;
-            if (interp_edge_stamp[c] != interp_frame)
-                continue;
-            for (unsigned r = interp_edge_head[c]; r;
-                 r = interp_edge_refs[r - 1].next)
-                cache->edges[at++] = interp_edge_refs[r - 1].edge;
+}
+
+typedef struct { unsigned worker; } InterpPoolArg;
+static InterpPoolArg interp_pool_args[INTERP_WORKERS_MAX];
+
+static int SDLCALL InterpPoolMain(void* data) {
+    const unsigned worker = ((InterpPoolArg*)data)->worker;
+    for (;;) {
+        SDL_WaitSemaphore(interp_pool.go);
+        if (SDL_GetAtomicInt(&interp_pool.quit))
+            break;
+        InterpPoolChunks(worker);
+        SDL_SignalSemaphore(interp_pool.done);
+    }
+    return 0;
+}
+
+static void InterpPoolShutdown(void) {
+    if (interp_pool.workers > 0) {
+        SDL_SetAtomicInt(&interp_pool.quit, 1);
+        for (int w = 0; w < interp_pool.workers; ++w)
+            SDL_SignalSemaphore(interp_pool.go);
+        for (int w = 0; w < interp_pool.workers; ++w)
+            SDL_WaitThread(interp_pool.thread[w], NULL);
+    }
+    if (interp_pool.go)
+        SDL_DestroySemaphore(interp_pool.go);
+    if (interp_pool.done)
+        SDL_DestroySemaphore(interp_pool.done);
+    for (unsigned w = 0; w <= INTERP_WORKERS_MAX; ++w) {
+        SDL_free(interp_worker_queries[w]);
+        interp_worker_queries[w] = NULL;
+    }
+    SDL_memset(&interp_pool, 0, sizeof(interp_pool));
+    interp_pool.workers = -1;
+}
+
+/* Whether there are workers (started at the first use), each with a query
+ * cache when the searches use one. */
+static bool InterpPoolReady(bool queries) {
+    if (interp_pool.workers < 0) {
+        int n = SDL_GetNumLogicalCPUCores() - 2;
+        const char* env = SDL_getenv("PSYZ_INTERP_THREADS");
+        if (env && *env)
+            n = SDL_atoi(env);
+        n = SDL_clamp(n, 0, INTERP_WORKERS_MAX);
+        interp_pool.workers = 0;
+        SDL_SetAtomicInt(&interp_pool.quit, 0);
+        if (n > 0) {
+            interp_pool.go = SDL_CreateSemaphore(0);
+            interp_pool.done = SDL_CreateSemaphore(0);
         }
-        cache->begin[INTERP_EDGE_CELLS] = at;
-        if (cache->tree_enabled) {
-            unsigned at8 = 0, at64 = 0;
-            for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
-                cache->start8[c] = at8; cache->start64[c] = at64;
-                const unsigned count = cache->begin[c + 1] - cache->begin[c];
-                if (count < 32) continue;
-                for (unsigned j = 0; j < count; j += 8) {
-                    InterpDepthBounds b = {1e30f, 0.0f};
-                    for (unsigned k = j; k < SDL_min(j + 8, count); ++k) {
-                        const InterpEdge* g = &interp_edges[cache->edges[cache->begin[c] + k]];
-                        if (!(g->da >= 1.0f && g->da <= 1e9f && g->db >= 1.0f && g->db <= 1e9f)) {
-                            b.lo = 0.0f; b.hi = HUGE_VALF; break;
-                        }
-                        b.lo = SDL_min(b.lo, 0.89f * SDL_min(g->da, g->db));
-                        b.hi = SDL_max(b.hi, 1.12f * SDL_max(g->da, g->db));
-                    }
-                    cache->depth8[at8++] = b;
-                }
-                for (unsigned j = cache->start8[c]; j < at8; j += 8) {
-                    InterpDepthBounds b = {1e30f, 0.0f};
-                    for (unsigned k = j; k < SDL_min(j + 8, at8); ++k) {
-                        b.lo = SDL_min(b.lo, cache->depth8[k].lo);
-                        b.hi = SDL_max(b.hi, cache->depth8[k].hi);
-                    }
-                    cache->depth64[at64++] = b;
-                }
+        if (interp_pool.go && interp_pool.done)
+            for (int w = 0; w < n; ++w) {
+                interp_pool_args[w].worker = (unsigned)w + 1;
+                interp_pool.thread[w] =
+                    SDL_CreateThread(InterpPoolMain, "psyz-interp", &interp_pool_args[w]);
+                if (!interp_pool.thread[w])
+                    break;
+                interp_pool.workers = w + 1;
             }
-        }
-        cache->frame = interp_frame;
-        cache->refs = interp_edge_refs_len;
+        if (n > 0)
+            INFOF("interpolation solver: %d worker threads", interp_pool.workers);
     }
-    if (cache && cache->query_enabled && ++cache->generation == 0) {
-        memset(cache->queries, 0, sizeof(cache->queries));
-        cache->generation = 1;
-    }
-    /* how far off the edge a vertex on it lies: the projection's precision
-     * (PGXP, or whole pixels); a vertex farther off belongs to another
-     * surface next to the edge (the faces of a thin beam) */
-    const float reach =
-        (geometry_correction || effect_geometry_correction) && internal_res > 1
-            ? INTERP_JUNCTION_PRECISE
-            : INTERP_JUNCTION_PIXELS;
-    for (unsigned k = 0; k < n; ++k) {
+    if (interp_pool.workers <= 0)
+        return false;
+    if (queries)
+        for (int w = 1; w <= interp_pool.workers; ++w)
+            if (!interp_worker_queries[w] &&
+                !(interp_worker_queries[w] =
+                      SDL_calloc(INTERP_QUERY_CACHE, sizeof(*interp_worker_queries[w]))))
+                return false;
+    return true;
+}
+
+/* fn over 0..total in chunks, on the workers and this (the main) thread;
+ * returns when all are done. */
+static void InterpPoolRun(unsigned total, unsigned chunk, InterpRangeFn fn) {
+    interp_pool.total = total;
+    interp_pool.chunk = chunk;
+    interp_pool.fn = fn;
+    SDL_SetAtomicInt(&interp_pool.next, 0);
+    for (int w = 0; w < interp_pool.workers; ++w)
+        SDL_SignalSemaphore(interp_pool.go);
+    InterpPoolChunks(0);
+    for (int w = 0; w < interp_pool.workers; ++w)
+        SDL_WaitSemaphore(interp_pool.done);
+}
+
+/* InterpSnapJunctions for the queued primitives begin..end: each vertex is
+ * looked up and moved on its own (its midpoint vertex and motion-field
+ * entries are its alone), so ranges run on any thread in any order with the
+ * same result. A worker has its own query cache (InterpJunctionQueries);
+ * the main thread (worker 0) also keeps presenting due output. */
+typedef struct {
+    unsigned n;
+    bool linear;
+    float reach;
+} InterpSnapJob;
+static InterpSnapJob interp_snap_job;
+static unsigned long long interp_worker_stats[INTERP_WORKERS_MAX + 1][3];
+
+static void InterpSnapRange(unsigned begin, unsigned end, unsigned worker) {
+    InterpEdgeCache* cache = interp_edge_cache;
+    const bool linear = interp_snap_job.linear;
+    const float reach = interp_snap_job.reach;
+    InterpJunctionQuery* queries = cache ? (worker ? interp_worker_queries[worker] : cache->queries) : NULL;
+    unsigned long long* stats = interp_worker_stats[worker];
+    for (unsigned k = begin; k < end; ++k) {
         const InterpJunctionPrim* q = &interp_junction_prims[k];
-        if ((k & 63u) == 0) InterpServiceOutput();
+        if (!worker && (k & 63u) == 0) InterpServiceOutput();
         for (unsigned i = 0; i < q->count; ++i) {
             const float *v0 = q->p0[i], *v1 = q->p1[i];
             const int cx = (int)SDL_floorf(v0[0] / INTERP_EDGE_CELL),
@@ -2456,7 +2558,7 @@ static void InterpSnapJunctions(unsigned n) {
             InterpJunctionQuery* query = NULL;
             bool hit = false;
             if (linear && cache->query_enabled && cache->begin[c + 1] - cache->begin[c] >= 32)
-                query = InterpFindJunctionQuery(cache, q, i, &hit);
+                query = InterpFindJunctionQuery(cache, queries, stats, q, i, &hit);
             if (hit) {
                 on = query->first;
             } else {
@@ -2468,7 +2570,7 @@ static void InterpSnapJunctions(unsigned n) {
                 }
             }
             if (query && on && on->pair == q->pair) {
-                ++cache->query_excluded;
+                ++stats[2];
                 on = query->other;
             }
             if (cache && ((query && cache->verify_queries) || cache->verify_tree)) {
@@ -2504,6 +2606,108 @@ static void InterpSnapJunctions(unsigned n) {
     }
 }
 
+
+/* The queued paired vertices lying on another face's edge in both poses
+ * move onto that edge's midpoint. */
+static void InterpSnapJunctions(unsigned n) {
+    static int snap = -1;
+    if (snap < 0) {
+        const char* e = SDL_getenv("PSYZ_INTERP_JUNCTIONS");
+        snap = !(e && *e == '0');
+    }
+    if (!n || !snap || interp_edges_frame != interp_frame)
+        return;
+    /* Keep each bucket in exactly its linked-list order (including hash
+     * collisions and duplicate references), but scan contiguous indices.
+     * Later CLUT splits can reuse it until another edge was queued. */
+    InterpEdgeCache* cache = interp_edge_cache;
+    const bool current = cache && cache->frame == interp_frame &&
+                         cache->refs == interp_edge_refs_len;
+    /* A small partial batch is cheaper to walk directly than to rebuild
+     * the whole index. An already current index costs nothing to reuse. */
+    const bool linear = cache && (current || n >= 64);
+    if (linear && !current) {
+        unsigned at = 0;
+        for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
+            cache->begin[c] = at;
+            if (interp_edge_stamp[c] != interp_frame)
+                continue;
+            for (unsigned r = interp_edge_head[c]; r;
+                 r = interp_edge_refs[r - 1].next) {
+                const unsigned e = interp_edge_refs[r - 1].edge;
+                const InterpEdge* g = &interp_edges[e];
+                const float grow = cache->measures[e].length[0] *
+                                       INTERP_JUNCTION_SLOPE + 0.05f;
+                cache->boxes[at] = (InterpEdgeBox){
+                    SDL_min(g->a0[0], g->b0[0]) - grow,
+                    SDL_min(g->a0[1], g->b0[1]) - grow,
+                    SDL_max(g->a0[0], g->b0[0]) + grow,
+                    SDL_max(g->a0[1], g->b0[1]) + grow};
+                cache->edges[at++] = e;
+            }
+        }
+        cache->begin[INTERP_EDGE_CELLS] = at;
+        if (cache->tree_enabled) {
+            unsigned at8 = 0, at64 = 0;
+            for (unsigned c = 0; c < INTERP_EDGE_CELLS; ++c) {
+                cache->start8[c] = at8; cache->start64[c] = at64;
+                const unsigned count = cache->begin[c + 1] - cache->begin[c];
+                if (count < 32) continue;
+                for (unsigned j = 0; j < count; j += 8) {
+                    InterpDepthBounds b = {1e30f, 0.0f};
+                    for (unsigned k = j; k < SDL_min(j + 8, count); ++k) {
+                        const InterpEdge* g = &interp_edges[cache->edges[cache->begin[c] + k]];
+                        if (!(g->da >= 1.0f && g->da <= 1e9f && g->db >= 1.0f && g->db <= 1e9f)) {
+                            b.lo = 0.0f; b.hi = HUGE_VALF; break;
+                        }
+                        b.lo = SDL_min(b.lo, 0.89f * SDL_min(g->da, g->db));
+                        b.hi = SDL_max(b.hi, 1.12f * SDL_max(g->da, g->db));
+                    }
+                    cache->depth8[at8++] = b;
+                }
+                for (unsigned j = cache->start8[c]; j < at8; j += 8) {
+                    InterpDepthBounds b = {1e30f, 0.0f};
+                    for (unsigned k = j; k < SDL_min(j + 8, at8); ++k) {
+                        b.lo = SDL_min(b.lo, cache->depth8[k].lo);
+                        b.hi = SDL_max(b.hi, cache->depth8[k].hi);
+                    }
+                    cache->depth64[at64++] = b;
+                }
+            }
+        }
+        cache->frame = interp_frame;
+        cache->refs = interp_edge_refs_len;
+    }
+    if (cache && cache->query_enabled && ++cache->generation == 0) {
+        memset(cache->queries, 0, sizeof(cache->queries));
+        for (unsigned w = 1; w <= INTERP_WORKERS_MAX; ++w)
+            if (interp_worker_queries[w])
+                memset(interp_worker_queries[w], 0,
+                       INTERP_QUERY_CACHE * sizeof(*interp_worker_queries[w]));
+        cache->generation = 1;
+    }
+    /* how far off the edge a vertex on it lies: the projection's precision
+     * (PGXP, or whole pixels); a vertex farther off belongs to another
+     * surface next to the edge (the faces of a thin beam) */
+    const float reach =
+        (geometry_correction || effect_geometry_correction) && internal_res > 1
+            ? INTERP_JUNCTION_PRECISE
+            : INTERP_JUNCTION_PIXELS;
+    interp_snap_job = (InterpSnapJob){n, linear, reach};
+    if (n >= 256 && linear && InterpPoolReady(cache && cache->query_enabled)) {
+        InterpPoolRun(n, 64, InterpSnapRange);
+    } else {
+        InterpSnapRange(0, n, 0);
+    }
+    if (cache)
+        for (unsigned w = 0; w <= INTERP_WORKERS_MAX; ++w) {
+            cache->query_count += interp_worker_stats[w][0];
+            cache->query_hits += interp_worker_stats[w][1];
+            cache->query_excluded += interp_worker_stats[w][2];
+            interp_worker_stats[w][0] = interp_worker_stats[w][1] = interp_worker_stats[w][2] = 0;
+        }
+}
+
 /* InterpMidpointSync: the first pending ghosts and new identities move as
  * the primitives next to them did (InterpFieldMotion), in the order queued,
  * so one next to another follows it; vertices with none in reach move as
@@ -2521,6 +2725,7 @@ static void InterpFinishPending(unsigned pending) {
     for (unsigned k = 0; k < pending; ++k) {
         const InterpPending* q = &interp_pending[k];
         const unsigned base = q->base, n = q->count;
+        if ((k & 63u) == 63u) InterpServiceOutput();
         float motion[6][2], shift[2] = {0, 0}, weight = 0;
         unsigned found = 0;
         for (unsigned i = 0; i < n; ++i) {
@@ -2599,8 +2804,11 @@ static void InterpEnqueued(void) {
  * line's own placement (a paired line the midpoint of its poses, a new one this
  * frame's pose). Each segment is a quad (DrawLineQuad), its first two
  * vertices at the segment's first point. */
-static void InterpFinishLines(unsigned n, unsigned vertices) {
-    for (unsigned k = 0; k < n; ++k) {
+static unsigned interp_lines_vertices;
+static void InterpFinishLineRange(unsigned begin, unsigned end, unsigned worker) {
+    (void)worker;
+    const unsigned vertices = interp_lines_vertices;
+    for (unsigned k = begin; k < end; ++k) {
         const InterpLinePending* q = &interp_line_pending[k];
         if (q->end <= q->start || q->end > vertices ||
             q->end - q->start != 4u * (q->count - 1u))
@@ -2643,6 +2851,16 @@ static void InterpFinishLines(unsigned n, unsigned vertices) {
             out->pgxp_pos[2] = 1.0f;
         }
     }
+}
+
+/* Each line reads the motion fields (complete by now) and writes only its
+ * own vertices: the lines run on the solver's workers too. */
+static void InterpFinishLines(unsigned n, unsigned vertices) {
+    interp_lines_vertices = vertices;
+    if (n >= 256 && !interp_field_cache_verify && InterpPoolReady(false))
+        InterpPoolRun(n, 32, InterpFinishLineRange);
+    else
+        InterpFinishLineRange(0, n, 0);
 }
 
 static bool InterpMidpointDeferred(void) { return interp_mid_batches_len != 0; }
@@ -2889,6 +3107,7 @@ static void InterpMidpointSync(unsigned reason) {
     InterpFinishPending(np);
     InterpFinishLines(nl, drawn);
     interp_field_cache_active = 0;
+    InterpServiceOutput();
     if (!InterpMidpointDraw()) {
         interp_pair_ready = false;
         interp_matches = 0;

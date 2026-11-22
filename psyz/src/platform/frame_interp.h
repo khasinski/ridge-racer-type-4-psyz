@@ -97,6 +97,12 @@
  *   PSYZ_INTERP_GHOSTS=0       no ghosts
  *   PSYZ_INTERP_FIELD=0        one-pose geometry keeps its own pose
  *   PSYZ_INTERP_JUNCTIONS=0    no T-junction snapping
+ *   PSYZ_INTERP_THREADS=<n>    worker threads for the junction search and
+ *                              the outlines (default: logical cores - 2,
+ *                              at most 8; 0: the main thread only). The
+ *                              result does not depend on them.
+ *   PSYZ_INTERP_EDGE_BOX=0     no bounding-box rejection in the junction
+ *                              scan (exact either way)
  *   PSYZ_INTERP_SIZE_CULLED=0  triangles the GPU skips for their size this
  *                              frame are not drawn into the midpoint
  *   PSYZ_BATCH_VERTICES=<n>, PSYZ_BATCH_PRIMITIVES=<n>  draw batches of at
@@ -116,8 +122,11 @@
 static bool InterpEnsureTarget(void);
 /* Presentation-only geometry history. Packet pairs belong to the original
  * double buffers; UI packets are deliberately never registered. */
-#define INTERP_PAIRS 16384u
-#define INTERP_MAP 65536u
+/* Sized for 4x with the extended draw distance and widescreen (0.2 ran out
+ * of pairs there: identities dropped, wrong or missing pairings); the maps
+ * stay at most a quarter full of live entries so their probes stay short. */
+#define INTERP_PAIRS 32768u
+#define INTERP_MAP 131072u
 
 typedef struct {
     const void* address;
@@ -447,6 +456,12 @@ typedef struct {
 
 typedef struct { float lo, hi; } InterpDepthBounds;
 
+/* An edge's pose-0 bounding box, grown by the farthest a vertex on it may
+ * lie (INTERP_JUNCTION_SLOPE of its length plus a rounding margin; the
+ * query adds its reach): a vertex outside it cannot match, so the scan
+ * skips the edge without touching its record. */
+typedef struct { float lx, ly, hx, hy; } InterpEdgeBox;
+
 #define INTERP_QUERY_CACHE 16384u
 typedef struct {
     float pose[5];
@@ -459,6 +474,8 @@ typedef struct {
 typedef struct {
     InterpEdgeMeasure measures[INTERP_EDGES];
     unsigned begin[INTERP_EDGE_CELLS + 1], edges[INTERP_EDGE_REFS];
+    InterpEdgeBox boxes[INTERP_EDGE_REFS];
+    bool box_enabled;
     unsigned frame, refs;
     InterpDepthBounds depth8[INTERP_EDGE_REFS / 8 + INTERP_EDGE_CELLS];
     InterpDepthBounds depth64[INTERP_EDGE_REFS / 64 + INTERP_EDGE_CELLS];
@@ -471,6 +488,9 @@ typedef struct {
 } InterpEdgeCache;
 
 static InterpEdgeCache* interp_edge_cache;
+/* the solver's worker threads (frame_interp_impl.h), stopped with the device */
+static void InterpPoolShutdown(void);
+
 static bool interp_edge_measures_tried;
 
 typedef struct {

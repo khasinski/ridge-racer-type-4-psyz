@@ -8,6 +8,8 @@
  * words, End. */
 void Psyz_GpuTimingBegin(void);
 void Psyz_GpuTimingNode(const u_long* words, int n);
+// Whether a list node is one of the host's (Psyz_GpuTimingHostPackets).
+int Psyz_GpuTimingHostPacket(const void* packet);
 void Psyz_GpuTimingEnd(void);
 // A VRAM upload's DMA (LoadImage), after the GPU's work before it.
 void Psyz_GpuTimingImage(unsigned words);

@@ -150,6 +150,13 @@ void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id);
  * one. */
 #define PSYZ_INTERP_NO_POSE 8u
 void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long id,unsigned flags);
+/* Packets the PS1 would not draw (a port's added views, frame
+ * interpolation's midpoint-only geometry): [begin, end) of the packets built
+ * for the next DrawOTag. The offline clock's GPU timing (gpu_timing.c) takes
+ * no time for them, so host-only options leave the emulated time as it is.
+ * Clear starts a frame's list (all ranges forgotten). */
+void Psyz_GpuTimingHostPackets(const void *begin, const void *end);
+void Psyz_GpuTimingClearHostPackets(void);
 /* Like Psyz_GpuPrepareInterpolatedPresent, for a game that waits on VSync(1)
  * over several fields with one VSync(0) per frame: the midpoint is presented
  * at the next blank that passes during that wait (paced presents), and not

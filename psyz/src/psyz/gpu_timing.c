@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <psyz/system.h>
+#include <psyz/gpu.h>
+#include <psyz/log.h>
 #include "../internal.h"
 #include "../timing_profile.h"
 #include "gpu_timing.h"
@@ -605,6 +607,59 @@ static void QueueInterrupt(void) {
 }
 
 static int list_active;
+
+/* Host-only packet ranges of the list being built (Psyz_GpuTimingHostPackets,
+ * psyz/gpu.h), appended as the game's packet cursor advances: sorted and
+ * disjoint unless a range is given out of order, which falls back to a scan. */
+#define HOST_RANGES 4096
+static uintptr_t host_lo[HOST_RANGES], host_hi[HOST_RANGES];
+static unsigned host_ranges;
+static int host_sorted = 1, host_overflow;
+
+void Psyz_GpuTimingHostPackets(const void* begin, const void* end) {
+    uintptr_t lo = (uintptr_t)begin, hi = (uintptr_t)end;
+    if (!begin || hi <= lo)
+        return;
+    if (host_ranges && host_hi[host_ranges - 1] == lo) {
+        host_hi[host_ranges - 1] = hi; /* adjacent: one range */
+        return;
+    }
+    if (host_ranges >= HOST_RANGES) {
+        if (!host_overflow++)
+            WARNF("host packet ranges full (%u): the rest are timed", HOST_RANGES);
+        return;
+    }
+    if (host_ranges && lo < host_hi[host_ranges - 1])
+        host_sorted = 0;
+    host_lo[host_ranges] = lo;
+    host_hi[host_ranges++] = hi;
+}
+
+void Psyz_GpuTimingClearHostPackets(void) {
+    host_ranges = 0;
+    host_sorted = 1;
+}
+
+int Psyz_GpuTimingHostPacket(const void* packet) {
+    const uintptr_t p = (uintptr_t)packet;
+    if (!host_ranges || p < host_lo[0])
+        return 0;
+    if (!host_sorted) {
+        for (unsigned i = 0; i < host_ranges; i++)
+            if (p >= host_lo[i] && p < host_hi[i])
+                return 1;
+        return 0;
+    }
+    unsigned lo = 0, hi = host_ranges; /* the last range starting at or before p */
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (host_lo[mid] <= p)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return p < host_hi[lo];
+}
 
 void Psyz_GpuTimingBegin(void) {
     if (!timing_on()) return;

@@ -376,6 +376,20 @@ static void RecordPresentedCommit(void) {
         return;
     present_commit_pending = false;
     Uint64 now = SDL_GetTicks();
+    /* PSYZ_PRESENT_LOG=file: one line a presented image, "<ms> <generated>"
+     * (the output cadence frame logs at field rate cannot show) */
+    static int present_log_state = -1;
+    static FILE* present_log;
+    if (present_log_state < 0) {
+        const char* path = SDL_getenv("PSYZ_PRESENT_LOG");
+        present_log = path && *path ? fopen(path, "w") : NULL;
+        present_log_state = present_log != NULL;
+    }
+    if (present_log_state)
+        fprintf(present_log, "%.3f %d\n",
+                (double)SDL_GetPerformanceCounter() * 1000.0 /
+                    (double)SDL_GetPerformanceFrequency(),
+                present_commit_mid ? 1 : 0);
     if (!present_window_start) {
         present_window_start = now;
         return;
@@ -2707,6 +2721,7 @@ static void ReleaseGpuDevice(void) {
         interp_store[b] = NULL;
         interp_store_len[b] = interp_store_capacity[b] = interp_order_len[b] = 0;
     }
+    InterpPoolShutdown();
     SDL_free(interp_edge_cache);
     interp_edge_cache = NULL;
     interp_edge_measures_tried = false;

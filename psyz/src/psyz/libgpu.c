@@ -421,13 +421,15 @@ static int is_packed_command_stream(const u32* words, int count) {
 
 extern u_long Psyz_LibgpuTermMove[];
 
+static unsigned enqueue_nodes;
 static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
     Psyz_GpuTimingBegin();
     if (sizeof(u_long) == 4) {
         // fast path for 32-bit systems
         while (1) {
-            Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
+            if (!Psyz_GpuTimingHostPacket(env))
+                Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
             // the table's terminating copy of two pixels onto themselves
             if (env->len > 0 && (u_long*)env != Psyz_LibgpuTermMove) {
                 DispatchPackets((u_long*)env->code, (int)env->len);
@@ -454,7 +456,7 @@ static void GPU_Enqueue(u_long* packets) {
             if (env->len > 0x100) {
                 ERRORF("packet 0x%X long, likely corrupted", env->len);
             }
-            INFOF("GPU queue full, calling exeque");
+            LOG_ONCE("GPU queue full, calling exeque (logged once)");
             Psyz_GpuExeque();
         }
         // a flush empties the queue; the packet that did not fit still goes in
@@ -479,8 +481,13 @@ static void GPU_Enqueue(u_long* packets) {
                 for(u_long i=0;i<env->len;++i)Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]);
             }
         }
-        Psyz_GpuTimingNode(&queue_buf[queue_len], (int)env->len);
+        if (!Psyz_GpuTimingHostPacket(env))
+            Psyz_GpuTimingNode(&queue_buf[queue_len], (int)env->len);
         queue_len += (int)env->len;
+        /* a long list (4x, the extended draw distance) took over 10 ms here
+         * without letting a due 60 FPS output be presented */
+        if ((++enqueue_nodes & 255u) == 0)
+            Psyz_GpuPollPresentation();
         if (isendprim(env)) {
             break;
         }
