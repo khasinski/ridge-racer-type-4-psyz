@@ -903,12 +903,18 @@ static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CY
  * (Psyz_KernelHandlerPositionNs); line_debt_base -1 outside one. */
 static uint64_t line_at_ns;
 static long line_debt_base = -1;
+// ... and where the main code was when that exception took the CPU
+static uint64_t line_taken_ns;
+static int line_depth;
 
 static void ServiceLine(int line, uint64_t at_ns) {
     long debt = AtomicLoad(&interrupt_debt);
     uint64_t outer_at_ns = line_at_ns;
     long outer_base = line_debt_base;
+    uint64_t outer_taken_ns = line_taken_ns;
     line_at_ns = at_ns;
+    line_taken_ns = at_ns;
+    line_depth++;
     line_debt_base = debt;
     irq_latched &= ~(1u << line);
     unsigned entry = KERNEL_IRQ_CYCLES + (Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0) +
@@ -974,6 +980,8 @@ static void ServiceLine(int line, uint64_t at_ns) {
         irq_callbacks[line]();
     }
     line_at_ns = outer_at_ns;
+    line_taken_ns = outer_taken_ns;
+    line_depth--;
     line_debt_base = outer_base;
     if (line != IRQ_VBLANK) {
         unsigned window = DebtSince(debt);
@@ -1029,6 +1037,13 @@ uint64_t Psyz_KernelHandlerPositionNs(void) {
         return 0;
     }
     return at_ns + (uint64_t)(in > 0 ? in : 0) * 1000000000u / SYSTEM_CLOCK_HZ;
+}
+
+uint64_t Psyz_KernelInterruptedNs(void) {
+    if (!UsesAudioClock() || !OwnsKernel() || !in_interrupt || !line_depth) {
+        return 0;
+    }
+    return line_taken_ns;
 }
 
 uint64_t Psyz_KernelCpuClocks(void) {

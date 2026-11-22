@@ -143,6 +143,10 @@ uint64_t Psyz_KernelCpuClocks(void);
 // vblank's): where its code has got to in ns, the exception's time plus
 // the handler time charged since; 0 outside one or on a real-time clock.
 uint64_t Psyz_KernelHandlerPositionNs(void);
+// Inside a root counter's or the vblank's handler: when its exception took
+// the CPU (where the main code it interrupted had got to), in ns; 0
+// elsewhere or on a real-time clock.
+uint64_t Psyz_KernelInterruptedNs(void);
 
 // Raises the vblank interrupt; VSync calls it once per emulated frame.
 void Psyz_KernelVBlank(void);

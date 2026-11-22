@@ -9,12 +9,11 @@
  *   rectangle's rows by texture mode, a line's longer side, a fill's
  *   46 + (w / 8 + 9) * h, a VRAM copy's 2 * w * h, a CLUT reload's 16 or
  *   256, an environment command's 1.
- * - The GPU runs at most 128 GPU ticks ahead: a command waits in the FIFO
- *   until the work before it is down to that, and the list DMA moves on
- *   only once the FIFO has taken the command (so it pushes one command
- *   ahead of the drawing). The DMA stalls the CPU while it moves data: 8
- *   clocks a node header, 5 more and the RAM's 17 per 16 words a packet,
- *   in 1000-clock slices with 100 clocks for the CPU between them.
+ * - The GPU's command event, its FIFO and the list DMA as DuckStation
+ *   schedules them (below, before Psyz_GpuTimingBegin): the DMA stalls
+ *   the CPU while it moves data, 8 clocks a node header, 5 more and the
+ *   RAM's 17 per 16 words a packet, in 1000-clock slices with 100 clocks
+ *   for the CPU between them, and only while the GPU's FIFO is empty.
  * - The next transfer (a DrawOTag queued behind another) starts when the
  *   previous one is done; with none in progress libgpu waits for the GPU
  *   to go idle before it starts one, as DrawSync(0) does.
@@ -40,11 +39,6 @@ enum {
 };
 
 static struct {
-    int active;              // timing a transfer
-    uint64_t dma_ns;         // where the DMA has got to
-    uint64_t gpu_end_ns;     // when the GPU's accepted work is done
-    uint64_t dma_free_ns;    // when the last transfer ended
-    unsigned slice;          // stall clocks in the current DMA slice
     // GPU state the costs depend on
     int area_x0, area_y0, area_x1, area_y1; // clamped drawing area (x1, y1 exclusive)
     int ofs_x, ofs_y;
@@ -55,11 +49,8 @@ static struct {
     int clut_8bit;
     int clut_valid;
     unsigned e3, e4;
-    int masked;            // _addque2 waited: 1 in its first slice, 2 after
-    uint64_t first_end_ns; // where that slice ended
-} g = {0, 0, 0, 0, 0, 0, 0, 1024, 512, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+} g = {.area_x1 = 1024, .area_y1 = 512};
 
-static uint64_t clocks_ns(uint64_t clocks) { return clocks * 1000000000u / 33868800u; }
 
 static void set_area(void) {
     int left = g.e3 & 0x3FF, top = (g.e3 >> 10) & 0x3FF;
@@ -157,9 +148,33 @@ static uint64_t line_ticks(int xa, int ya, int xb, int yb) {
     return w > h ? w : h;
 }
 
-uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
+static void CommandTicksOne(const u_long* w, int n, int* pi, uint64_t* pticks);
+
+/* The ticks of each command in w (each[k], up to max of them, *count). */
+static uint64_t CommandTicks(const u_long* w, int n, uint32_t* each, int* count, int max) {
     uint64_t ticks = 0;
+    int k = 0;
     for (int i = 0; i < n;) {
+        uint64_t before = ticks;
+        int at = i;
+        CommandTicksOne(w, n, &i, &ticks);
+        if (i == at) break; // incomplete
+        if (each && k < max) each[k++] = (uint32_t)(ticks - before);
+    }
+    if (count) *count = k;
+    return ticks;
+}
+
+uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
+    return CommandTicks(w, n, NULL, NULL, 0);
+}
+
+/* One command at w[*pi]: its ticks added to *pticks, *pi past it (left
+ * where it was when the command is incomplete). */
+static void CommandTicksOne(const u_long* w, int n, int* pi, uint64_t* pticks) {
+    int i = *pi;
+    uint64_t ticks = *pticks;
+    {
         unsigned op = (unsigned)w[i];
         unsigned code = op >> 24;
         if (code >= 0x20 && code < 0x40) {
@@ -168,7 +183,7 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
             int per = 1 + textured + shaded, verts = quad ? 4 : 3;
             int total = per * verts + !shaded;
             static const unsigned setup[2][2][2] = {{{46, 226}, {334, 496}}, {{82, 262}, {370, 532}}};
-            if (i + total > n) break;
+            if (i + total > n) goto out;
             ticks += setup[quad][shaded][textured];
             int x[4], y[4];
             for (int v = 0; v < verts; v++) {
@@ -194,7 +209,7 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
             int shaded = (code & 0x10) != 0, poly = (code & 8) != 0;
             if (!poly) {
                 int total = shaded ? 4 : 3;
-                if (i + total > n) break;
+                if (i + total > n) goto out;
                 unsigned a = (unsigned)w[i + 1], b = (unsigned)w[i + (shaded ? 3 : 2)];
                 ticks += line_ticks(g.ofs_x + sext11(a), g.ofs_y + sext11(a >> 16),
                                     g.ofs_x + sext11(b), g.ofs_y + sext11(b >> 16));
@@ -224,7 +239,7 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
             int textured = (code & 4) != 0, semi = (code & 2) != 0;
             int size = (code >> 3) & 3;
             int total = 2 + textured + (size == 0);
-            if (i + total > n) break;
+            if (i + total > n) goto out;
             ticks += 16;
             if (textured) ticks += clut_ticks((unsigned)w[i + 2] >> 16);
             unsigned xy = (unsigned)w[i + 1];
@@ -240,13 +255,13 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
             ticks += rect_ticks(rx, ry, rw, rh, textured, semi);
             i += total;
         } else if (code == 0x02) {
-            if (i + 3 > n) break;
+            if (i + 3 > n) goto out;
             unsigned wh = (unsigned)w[i + 2];
             unsigned fw = ((wh & 0x3FF) + 0xF) & ~0xFu, fh = (wh >> 16) & 0x1FF;
             if (fw && fh) ticks += 46 + ((fw / 8) + 9) * fh;
             i += 3;
         } else if (code >= 0x80 && code < 0xA0) {
-            if (i + 4 > n) break;
+            if (i + 4 > n) goto out;
             unsigned wh = (unsigned)w[i + 3];
             unsigned cw = wh & 0x3FF, ch = (wh >> 16) & 0x1FF;
             if (!cw) cw = 0x400;
@@ -277,21 +292,174 @@ uint64_t Psyz_GpuCommandTicks(const u_long* w, int n) {
             i++; // NOP and what is not drawing
         }
     }
-    return ticks;
+    *pi = i;
+    *pticks = ticks;
+out:;
 }
 
 static uint64_t now_ns(void) {
     return Psyz_ClocksToNs(Psyz_EmulatedClocks());
 }
 
-/* The first slice of a list _addque2 started after its wait ends before
- * the mask's restore: the masked wait spends it (Psyz_GpuTimingEnd). It
- * ends after DMA_SLICE_CLOCKS or where the DMA waits for the GPU. */
-static void end_first_slice(void) {
-    if (g.masked == 1) {
-        g.masked = 2;
-        g.first_end_ns = g.dma_ns;
+static int timing_on(void) { return Psyz_KernelOfflineClock(); }
+
+/* PSYZ_GPU_TRACE=1: each list's start, size and modelled end on stderr;
+ * 2 also each command the GPU starts (GPUC), its going idle (GPUI) and
+ * each DMA slice (DMAS), as DuckStation's DUCKSTATION_GPU_TRACE and
+ * DUCKSTATION_DMA_TRACE, in clocks; 3 also each packet's words.
+ * PSYZ_GPU_TRACE_FROM=<clocks>: from that clock on. */
+static int gpu_trace_level(void) {
+    static int t = -1;
+    static unsigned long long from;
+    if (t < 0) {
+        const char* v = getenv("PSYZ_GPU_TRACE");
+        const char* f = getenv("PSYZ_GPU_TRACE_FROM");
+        t = v && *v >= '1' && *v <= '9' ? *v - '0' : 0;
+        from = f ? strtoull(f, NULL, 10) : 0;
     }
+    if (t && from && Psyz_EmulatedClocks() < from) return 0;
+    return t;
+}
+static int gpu_trace(void) { return gpu_trace_level() >= 1; }
+static unsigned list_nodes, list_words;
+static uint64_t list_ticks;
+
+/* DuckStation's GPU command event and list DMA (gpu.cpp, dma.cpp at the
+ * reference commit), on the CPU's clock in system clocks:
+ *
+ * - pending: the GPU ticks of the commands started that the command event
+ *   has not yet counted off. It is counted off only when the event runs,
+ *   by twice the clocks since its last run; a command starts while
+ *   pending <= RUN_AHEAD_GPU_TICKS, else it waits in the FIFO.
+ * - The event is due when pending is down to 0 (pending / 2 clocks on).
+ *   A FIFO write outside the event (a DMA slice the CPU started or one
+ *   after a halt) reschedules it from the write with the pending not yet
+ *   counted off, so a GPU still drawing is due later than its work; the
+ *   event then counts the whole time since its last run, and the commands
+ *   it starts have that time to their credit.
+ * - The DMA moves nodes while the FIFO is empty (a command waiting there
+ *   stops the transfer, its empty nodes too), in slices of
+ *   DMA_SLICE_CLOCKS (a node is not split) with DMA_HALT_CLOCKS between
+ *   them; stopped, it goes on in the command event that empties the FIFO.
+ *   Within a slice the GPU sees each node at the slice's start plus the
+ *   clocks moved before it.
+ * - A GPUSTAT read (libgpu's waits for the idle GPU: DrawSync, _addque2)
+ *   runs the event once its pending is due by the clock, so a polled GPU
+ *   is idle when its work is done.
+ *
+ * DuckStation: a main menu field (options, DuckStation frame 1702): a
+ * sprite of 20496 ticks every 10249 clocks, the DMA's 17 clocks for the
+ * next one in each event; the next node's write after 5k clocks of empty
+ * nodes puts the event 5.5k clocks past the sprite's end. */
+enum { FIFO_COMMANDS = 1024, NODE_COMMANDS = 256 };
+static struct {
+    int64_t pending;
+    uint64_t last_run, next_run;
+    int active;
+    int idle;
+    uint64_t idle_at;
+    uint32_t fifo[FIFO_COMMANDS];
+    unsigned head, len;
+    // the list DMA
+    uint64_t slice_at;
+    unsigned used;
+    int in_event;
+    int masked;            // _addque2 waited: 1 in its first slice, 2 after
+    uint64_t first_end;    // where that slice ended
+    uint64_t dma_free;     // the last transfer's end
+} d = {0, 0, 0, 0, 1, 0, {0}, 0, 0, 0, 0, 0, 0, 0, 0};
+
+static uint64_t ns_of(uint64_t clocks) { return Psyz_ClocksToNs(clocks); }
+
+static void gpu_execute(uint64_t t) {
+    while (d.pending <= RUN_AHEAD_GPU_TICKS && d.len) {
+        uint32_t ticks = d.fifo[d.head];
+        d.head = (d.head + 1) % FIFO_COMMANDS;
+        d.len--;
+        d.pending += ticks;
+        if (gpu_trace_level() >= 2)
+            fprintf(stderr, "GPUC ticks %u pending %lld tick %llu\n", ticks,
+                    (long long)d.pending, (unsigned long long)t);
+    }
+    int idle = d.pending <= 0 && !d.len;
+    if (idle && !d.idle) {
+        d.idle_at = t;
+        if (gpu_trace_level() >= 2)
+            fprintf(stderr, "GPUI tick %llu\n", (unsigned long long)t);
+    }
+    d.idle = idle;
+}
+
+// UpdateCommandTickEvent at ts
+static void gpu_schedule(uint64_t ts) {
+    if (d.pending <= 0) {
+        d.pending = 0;
+        d.active = 0;
+        return;
+    }
+    if (!d.active) {
+        d.active = 1;
+        d.last_run = ts;
+    }
+    d.next_run = ts + (d.pending <= 1 ? 1 : (uint64_t)((d.pending + 1) >> 1));
+}
+
+// the command event's run at t (the caller schedules it again)
+static void gpu_fire(uint64_t t) {
+    d.pending -= 2 * (int64_t)(t - d.last_run);
+    d.last_run = t;
+    gpu_execute(t);
+}
+
+// the events due by t
+static void gpu_run_until(uint64_t t) {
+    while (d.active && d.next_run <= t) {
+        uint64_t at = d.next_run;
+        gpu_fire(at);
+        gpu_schedule(at);
+    }
+}
+
+// When a polled GPU goes idle (GPUSTAT bit 26); the state is kept.
+static uint64_t gpu_polled_idle(void) {
+    if (d.idle) return d.idle_at;
+    int64_t pending = d.pending;
+    uint64_t last = d.last_run;
+    unsigned head = d.head, len = d.len;
+    for (;;) {
+        uint64_t t = last + (pending > 0 ? (uint64_t)((pending + 1) >> 1) : 0);
+        pending -= 2 * (int64_t)(t - last);
+        last = t;
+        while (pending <= RUN_AHEAD_GPU_TICKS && len) {
+            pending += d.fifo[head];
+            head = (head + 1) % FIFO_COMMANDS;
+            len--;
+        }
+        if (pending <= 0 && !len) return t;
+    }
+}
+
+// libgpu's wait found the GPU idle at t
+static void gpu_set_idle(uint64_t t) {
+    d.pending = 0;
+    d.active = 0;
+    d.len = 0;
+    if (!d.idle || d.idle_at > t) d.idle_at = t;
+    d.idle = 1;
+}
+
+static void gpu_push(const uint32_t* ticks, int n, uint64_t ts) {
+    for (int k = 0; k < n; k++) {
+        if (d.len == FIFO_COMMANDS) { // not on a game's list: fold into the last
+            d.fifo[(d.head + d.len - 1) % FIFO_COMMANDS] += ticks[k];
+            continue;
+        }
+        d.fifo[(d.head + d.len) % FIFO_COMMANDS] = ticks[k];
+        d.len++;
+    }
+    if (n) d.idle = 0;
+    gpu_execute(ts);
+    if (!d.in_event) gpu_schedule(ts);
 }
 
 /* The DMA's recent slices and halts, for the MDEC's output DMA that shares
@@ -329,38 +497,61 @@ int Psyz_GpuDmaAtNs(uint64_t at_ns, uint64_t* until_ns) {
     return 0;
 }
 
-/* The CPU loses `clocks` of DMA at the DMA's position, in slices. */
+/* The CPU loses `clocks` of DMA at the slice's position. */
 static void dma_stall(unsigned clocks) {
-    while (clocks) {
-        unsigned room = DMA_SLICE_CLOCKS - g.slice;
-        unsigned take = clocks < room ? clocks : room;
-        if (g.masked != 1) Psyz_KernelStallAt(g.dma_ns, take);
-        note_span(g.dma_ns, g.dma_ns + clocks_ns(take), 0);
-        g.dma_ns += clocks_ns(take);
-        g.slice += take;
-        clocks -= take;
-        if (g.slice >= DMA_SLICE_CLOCKS) {
-            end_first_slice();
-            g.slice = 0;
-            note_span(g.dma_ns, g.dma_ns + clocks_ns(DMA_HALT_CLOCKS), 1);
-            g.dma_ns += clocks_ns(DMA_HALT_CLOCKS);
+    uint64_t at = d.slice_at + d.used;
+    if (d.masked != 1) Psyz_KernelStallAt(ns_of(at), clocks);
+    note_span(ns_of(at), ns_of(at + clocks), 0);
+    d.used += clocks;
+}
+
+static void dma_start_slice(uint64_t at, int in_event) {
+    d.slice_at = at;
+    d.used = 0;
+    d.in_event = in_event;
+}
+
+/* A slice's end: the event it ran in is scheduled after it. The first
+ * slice of a list _addque2 started after its wait ends before the mask's
+ * restore (Psyz_GpuTimingEnd). */
+static void dma_end_slice(int done) {
+    uint64_t end = d.slice_at + d.used;
+    if (gpu_trace_level() >= 2)
+        fprintf(stderr, "DMAS 2 used %u done %d tick %llu\n", d.used, done,
+                (unsigned long long)d.slice_at);
+    if (d.in_event) {
+        d.in_event = 0;
+        gpu_schedule(end);
+    }
+    if (d.masked == 1) {
+        d.masked = 2;
+        d.first_end = end;
+    }
+}
+
+/* Before a node: the DMA goes on while the FIFO is empty and the slice has
+ * clocks left; else it halts or waits for the command event. */
+static void dma_before_node(void) {
+    if (d.len) {
+        dma_end_slice(0);
+        for (;;) {
+            uint64_t at = d.next_run;
+            gpu_fire(at);
+            if (!d.len) {
+                dma_start_slice(at, 1);
+                return;
+            }
+            gpu_schedule(at);
         }
     }
-}
-
-static int timing_on(void) { return Psyz_KernelOfflineClock(); }
-
-/* PSYZ_GPU_TRACE=1: each list's start, size and modelled end on stderr. */
-static int gpu_trace(void) {
-    static int t = -1;
-    if (t < 0) {
-        const char* v = getenv("PSYZ_GPU_TRACE");
-        t = v && *v == '1';
+    if (d.used >= DMA_SLICE_CLOCKS) {
+        dma_end_slice(0);
+        uint64_t end = d.slice_at + d.used;
+        note_span(ns_of(end), ns_of(end + DMA_HALT_CLOCKS), 1);
+        gpu_run_until(end + DMA_HALT_CLOCKS);
+        dma_start_slice(end + DMA_HALT_CLOCKS, 0);
     }
-    return t;
 }
-static unsigned list_nodes, list_words;
-static uint64_t list_ticks;
 
 uint64_t Psyz_GpuListStartNs(uint64_t now_ns, uint64_t dma_free_ns,
                              uint64_t gpu_end_ns, int* cpu_waits) {
@@ -403,94 +594,131 @@ static void QueueInterrupt(void) {
     // in the exception
     unsigned total = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain +
                      GPU_QUEUE_CALLBACK_CYCLES +
-                     Psyz_KernelTakeStallsBeforeNs(g.dma_free_ns + 1);
+                     Psyz_KernelTakeStallsBeforeNs(ns_of(d.dma_free) + 1);
     Psyz_KernelDeviceIrq(QueueCallback, DEVICE_IRQ_TO_HANDLER_CYCLES,
                          total - DEVICE_IRQ_TO_HANDLER_CYCLES,
                          DMA_DISPATCH_EXIT_CLOCKS);
 }
 
+static int list_active;
+
 void Psyz_GpuTimingBegin(void) {
     if (!timing_on()) return;
-    uint64_t now = now_ns();
-    g.active = 1;
-    int cpu_waits;
+    uint64_t now = Psyz_EmulatedClocks();
+    list_active = 1;
     // queued behind a transfer still in progress: its end's interrupt
-    if (g.dma_free_ns > now)
-        Psyz_KernelPostAtNs(g.dma_free_ns, QueueInterrupt);
-    g.dma_ns = Psyz_GpuListStartNs(now, g.dma_free_ns, g.gpu_end_ns, &cpu_waits);
-    g.slice = 0;
+    if (d.dma_free > now)
+        Psyz_KernelPostAtNs(ns_of(d.dma_free), QueueInterrupt);
+    int cpu_waits;
+    uint64_t idle = gpu_polled_idle();
+    uint64_t start = Psyz_NsToClocks(Psyz_GpuListStartNs(
+        ns_of(now), ns_of(d.dma_free), ns_of(idle), &cpu_waits));
+    // a queued transfer: its DMA starts in the callback of that interrupt
+    if (d.dma_free > now && start < d.dma_free + GPU_QUEUE_DMA_START_CLOCKS)
+        start = d.dma_free + GPU_QUEUE_DMA_START_CLOCKS;
     /* _addque2 polls for the idle GPU with the interrupts masked, then
      * starts the DMA and restores the mask after its first slice: on
      * DuckStation a CD sector's or the timer's interrupt that comes during
      * a movie frame's 43k-clock DrawOTag is taken then (Versus movie, odd
      * fields: at 93126 clocks after the blank, due from 73.6k). */
-    g.masked = 0;
+    d.masked = 0;
     if (cpu_waits) {
-        g.dma_ns += clocks_ns(ADDQUE2_POLL_EXIT_CLOCKS);
-        g.masked = 1;
-        g.first_end_ns = g.dma_ns;
+        start += ADDQUE2_POLL_EXIT_CLOCKS;
+        d.masked = 1;
+        d.first_end = start;
     }
+    gpu_set_idle(idle < start ? idle : start);
+    dma_start_slice(start, 0);
     list_nodes = list_words = 0;
     list_ticks = 0;
     if (gpu_trace())
-        fprintf(stderr, "gpu: list at %llu dma %llu gpu_end %llu\n",
-                (unsigned long long)now, (unsigned long long)g.dma_ns,
-                (unsigned long long)g.gpu_end_ns);
+        fprintf(stderr, "gpu: list at %llu dma %llu idle %llu\n",
+                (unsigned long long)now, (unsigned long long)start,
+                (unsigned long long)idle);
 }
 
 void Psyz_GpuTimingNode(const u_long* words, int n) {
-    if (!g.active) return;
-    dma_stall(DRAW_OTAG_NODE_CYCLES);
-    if (n <= 0) return;
-    // the FIFO takes the packet once the GPU is down to its run-ahead
-    uint64_t accept = g.gpu_end_ns > clocks_ns(RUN_AHEAD_GPU_TICKS / 2)
-                          ? g.gpu_end_ns - clocks_ns(RUN_AHEAD_GPU_TICKS / 2) : 0;
-    if (accept > g.dma_ns) {
-        end_first_slice();
-        g.dma_ns = accept;
-        g.slice = 0;
+    if (!list_active) return;
+    dma_before_node();
+    if (n <= 0) {
+        dma_stall(DRAW_OTAG_NODE_CYCLES);
+        return;
     }
-    dma_stall(DRAW_OTAG_BLOCK_CYCLES + (unsigned)n + ((unsigned)n + 15) / 16);
-    uint64_t ticks = Psyz_GpuCommandTicks(words, n);
+    if (gpu_trace_level() >= 3) {
+        fprintf(stderr, "NODE %d:", n);
+        for (int k = 0; k < n && k < 16; k++)
+            fprintf(stderr, " %08x", (unsigned)words[k]);
+        fprintf(stderr, "\n");
+    }
+    dma_stall(DRAW_OTAG_NODE_CYCLES + DRAW_OTAG_BLOCK_CYCLES);
+    uint32_t each[NODE_COMMANDS];
+    int count = 0;
+    uint64_t ticks = CommandTicks(words, n, each, &count, NODE_COMMANDS);
+    gpu_push(each, count, d.slice_at + d.used);
+    dma_stall((unsigned)n + ((unsigned)n + 15) / 16);
     list_nodes++;
     list_words += (unsigned)n;
     list_ticks += ticks;
-    uint64_t start = g.gpu_end_ns > g.dma_ns ? g.gpu_end_ns : g.dma_ns;
-    g.gpu_end_ns = start + clocks_ns((ticks + 1) / 2);
+}
+
+/* Where the latest ordering table's list DMA ends, and whether it is still
+ * in progress: libgpu's _addque2 then puts the next transfer in its queue
+ * (sys.c DrawOTag). */
+static uint64_t list_free;
+int Psyz_GpuTimingTransferring(void) {
+    return timing_on() && list_free > Psyz_EmulatedClocks();
 }
 
 void Psyz_GpuTimingEnd(void) {
-    if (!g.active) return;
-    g.active = 0;
-    g.dma_free_ns = g.dma_ns;
-    if (g.masked) {
-        end_first_slice();
-        g.masked = 0;
-        Psyz_KernelWaitMaskedUntilNs(g.first_end_ns + clocks_ns(ADDQUE2_RESTORE_CLOCKS));
+    if (!list_active) return;
+    list_active = 0;
+    dma_end_slice(1);
+    d.dma_free = d.slice_at + d.used;
+    list_free = d.dma_free;
+    if (d.masked) {
+        d.masked = 0;
+        Psyz_KernelWaitMaskedUntilNs(ns_of(d.first_end + ADDQUE2_RESTORE_CLOCKS));
     }
     if (gpu_trace())
-        fprintf(stderr, "gpu: end packets %u words %u ticks %llu dma_end %llu gpu_end %llu\n",
+        fprintf(stderr, "gpu: end packets %u words %u ticks %llu dma_end %llu idle %llu\n",
                 list_nodes, list_words, (unsigned long long)list_ticks,
-                (unsigned long long)g.dma_ns, (unsigned long long)g.gpu_end_ns);
+                (unsigned long long)d.dma_free, (unsigned long long)gpu_polled_idle());
 }
 
 void Psyz_GpuTimingImage(unsigned words) {
     if (!timing_on()) return;
-    uint64_t now = now_ns();
-    g.dma_ns = now > g.dma_free_ns ? now : g.dma_free_ns;
-    if (g.gpu_end_ns > g.dma_ns) g.dma_ns = g.gpu_end_ns; // A0h waits for the GPU
-    g.slice = 0;
-    dma_stall(words + (words + 15) / 16);
-    g.dma_free_ns = g.dma_ns;
-    if (g.gpu_end_ns < g.dma_ns) g.gpu_end_ns = g.dma_ns;
+    uint64_t now = Psyz_EmulatedClocks();
+    uint64_t start = now > d.dma_free ? now : d.dma_free;
+    uint64_t idle = gpu_polled_idle();
+    if (idle > start) start = idle; // A0h waits for the GPU
+    gpu_set_idle(idle < start ? idle : start);
+    d.masked = 0;
+    dma_start_slice(start, 0);
+    unsigned clocks = words + (words + 15) / 16;
+    // a block transfer in slices, the halts between them
+    while (clocks) {
+        unsigned take = clocks < DMA_SLICE_CLOCKS ? clocks : DMA_SLICE_CLOCKS;
+        dma_stall(take);
+        clocks -= take;
+        if (clocks) {
+            uint64_t end = d.slice_at + d.used;
+            note_span(ns_of(end), ns_of(end + DMA_HALT_CLOCKS), 1);
+            dma_start_slice(end + DMA_HALT_CLOCKS, 0);
+        }
+    }
+    d.dma_free = d.slice_at + d.used;
+    gpu_set_idle(d.dma_free);
 }
 
 uint64_t Psyz_GpuTimingIdleNs(void) {
-    return g.gpu_end_ns > g.dma_free_ns ? g.gpu_end_ns : g.dma_free_ns;
+    uint64_t idle = gpu_polled_idle();
+    return ns_of(idle > d.dma_free ? idle : d.dma_free);
 }
 
 void Psyz_GpuTimingReset(void) {
-    g.gpu_end_ns = g.dma_free_ns = 0;
+    d.dma_free = list_free = 0;
+    gpu_set_idle(0);
+    d.idle_at = 0;
     g.clut_valid = 0;
 }
 

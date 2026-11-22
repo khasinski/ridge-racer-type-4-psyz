@@ -419,6 +419,8 @@ static int is_packed_command_stream(const u32* words, int count) {
     return 0;
 }
 
+extern u_long Psyz_LibgpuTermMove[];
+
 static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
     Psyz_GpuTimingBegin();
@@ -426,7 +428,8 @@ static void GPU_Enqueue(u_long* packets) {
         // fast path for 32-bit systems
         while (1) {
             Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
-            if (env->len > 0) {
+            // the table's terminating copy of two pixels onto themselves
+            if (env->len > 0 && (u_long*)env != Psyz_LibgpuTermMove) {
                 DispatchPackets((u_long*)env->code, (int)env->len);
             }
             if (isendprim(env)) {
@@ -441,6 +444,12 @@ static void GPU_Enqueue(u_long* packets) {
         return;
     }
     while (1) {
+        if ((u_long*)env == Psyz_LibgpuTermMove) {
+            // timed, not drawn: two pixels copied onto themselves
+            Psyz_GpuTimingNode((u_long*)env->code, (int)env->len);
+            env = (DR_ENV*)nextPrim(env);
+            continue;
+        }
         if (queue_len + env->len > LEN(queue_buf)) {
             if (env->len > 0x100) {
                 ERRORF("packet 0x%X long, likely corrupted", env->len);

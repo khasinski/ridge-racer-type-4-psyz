@@ -188,6 +188,10 @@ enum {
      * a packet, 5642 clocks, gpu_timing.c's stalls), the callback's own
      * code within the DMA's halts [exc] */
     GPU_QUEUE_CALLBACK_CYCLES = 0,
+    /* The queued list's DMA starts this long after that exception's entry
+     * (the callback's _exeque; DUCKSTATION_DMA_TRACE IRQX to DMAT, 3300
+     * queued lists of gp-rules: 2186 in all but 50, 2187 in 46) [trace] */
+    GPU_QUEUE_DMA_START_CLOCKS = 2186,
     /* ... raised during a root counter's exception it is served in it:
      * 494 clocks more (15911 against 15417, the Grand Prix's race loads)
      * [exc] */
@@ -219,6 +223,11 @@ enum {
      * DuckStation (1366 Save and Load menu frames; PutDispEnv 125830 after
      * the blank when it waits 58 lines) [mark] (DSF_EXC, DSF_MARKS
      * PutDispEnv) */
+    /* ... on the unmarked runs PutDrawEnv's packet DMA (below) starts 6
+     * late against DuckStation's DUCKSTATION_DMA_TRACE with this 110, its
+     * entry about 17 late, in the menus' frames [trace]; 14 less puts the
+     * unformatted card's raw reads a vblank off from field 2604 (the card
+     * menu's own costs were fitted with it): kept */
     VSYNC_RETURN_CYCLES = 110,
     /* A VSync(1) query in the game's frame loop (do {} while (VSync(1) <
      * threshold)): 99 clocks from one call to the next, and from the last
@@ -377,27 +386,62 @@ enum {
     SET_GRAPH_DEBUG_CYCLES = 41,
     SET_DISP_MASK_CYCLES = 175,
     INIT_GEOM_CYCLES = 48903,
-    PUT_DRAW_ENV_CYCLES = 790,
+    /* PutDrawEnv's own clocks besides its BIOS memcpy: from its entry to
+     * DrawOTag's in the frame loop 19820 clocks on DuckStation with a
+     * drawing environment that does not clear (the course and car menus),
+     * 19996 with one that does (isbg: the title, the main menu, half the
+     * load screens' frames), 7 of each a mark's stub; the port's 19839 and
+     * 19842 before (entry marks on the frame loop's calls, ta-course4,
+     * gp-rules) [mark]. The difference comes before the packet's DMA (its
+     * fill's rectangle in SetDrawEnv2): the DMA starts 131141 clocks after
+     * the blank in a course or car menu's frame that waited 58 lines,
+     * 131317 in the main menu's (DUCKSTATION_DMA_TRACE, no marks) [trace] */
+    PUT_DRAW_ENV_CYCLES = 790 - 11 - 26,
+    PUT_DRAW_ENV_BG_CYCLES = 173,
     /* The part of PutDrawEnv (and DrawOTag) before _addque2's exec (_cwc)
      * starts the packet's DMA: SetDrawEnv2, then _addque2 up to its
      * SetIntrMask(0) and one look at GPUSTAT (DSF_MARKS PutDrawEnv,
      * _addque2, SetIntrMask, _cwc: 586 + 142 + 87 + 12 for _cwc's stores,
      * every frame of the Versus movie, fields 841-869). Its BIOS memcpy
      * comes after the restore. [mark] */
-    PUT_DRAW_ENV_TO_EXEC_CYCLES = 827,
+    /* ... without a clear: its entry mark to the packet's DMA's start
+     * (DMAT) 669 clocks on DuckStation, 842 with one (DSF_MARKS PutDrawEnv,
+     * DrawOTag, DSF_EXC=0, DUCKSTATION_DMA_TRACE: gp-rules' menus, 3250
+     * calls; 4 of it the stub's after its mark) [trace] */
+    PUT_DRAW_ENV_TO_EXEC_CYCLES = 665,
     /* PutDispEnv sets the display mode only when the display area or the
      * interlace flags change (a double-buffered screen, every call: the
      * Time Attack's 4941); the 480-line menus keep theirs and take 4620
      * [mark] (DSF_MARKS PutDispEnv, PutDrawEnv: Save and Load, 1278 of
      * 1391 frames) */
-    PUT_DISP_ENV_CYCLES = 603 - 321,
+    PUT_DISP_ENV_CYCLES = 603 - 321 - 11, // 4609 the menus' (4620 with the mark's stub)
     PUT_DISP_ENV_MODE_CYCLES = 321,
     GET_ENV_CYCLES = 40,
-    DRAW_OTAG_CYCLES = 468,
-    DRAW_OTAG_TO_EXEC_CYCLES = 40 + 142 + 87 + 12, // as PutDrawEnv's [mark]
-    CLEAR_OTAG_R_CYCLES = 330,
+    /* DrawOTag to an idle GPU: 430-441 clocks on DuckStation's exact
+     * timing (the frame loop's, every menu frame; DSF_MARKS DrawOTag:ret,
+     * 452 with the mark's stub), 468 charged before [mark] */
+    DRAW_OTAG_CYCLES = 430,
+    /* its entry to the list DMA's start: 324 clocks from its mark to the
+     * channel's start (DMAT) on DuckStation in 3267 of 3300 calls (above),
+     * 4 of them the stub's, the rest to its return (the GPU model's 317 +
+     * 113) [trace]. DrawOTag's entry to the first ClearOTagR's (whose DMA
+     * comes 99 after its mark) is 14-26 shorter on DuckStation than with
+     * 430, but 416 puts the unformatted card's reads a vblank off as the
+     * VSync's return does (above): kept */
+    DRAW_OTAG_TO_EXEC_CYCLES = 320,
+    /* A DrawOTag behind a list whose DMA is still in progress, which
+     * _addque2 queues: the frame loop's second DrawOTag (the race's and
+     * the split screen's secondary ordering table) to PadUpdate's entry
+     * takes 527 and 522 clocks on DuckStation (a Grand Prix's results and
+     * race, entry marks on the frame loop's calls, 7 clocks a stub), the
+     * port's 426 and 446 with an idle DrawOTag's charge [mark] */
+    DRAW_OTAG_QUEUED_CYCLES = 90,
+    /* ClearOTagR besides its DMA: 1030 clocks for the frame loop's 704
+     * entries (DSF_MARKS ClearOTagR:ret, 1041 with the mark's stub), 1078
+     * charged before [mark] */
+    CLEAR_OTAG_R_CYCLES = 330 - 48,
     LOAD_IMAGE_CYCLES = 830,
-    DRAW_SYNC_CYCLES = 246, // an idle GPU queue
+    DRAW_SYNC_CYCLES = 246 - 10, // an idle GPU queue (236, 247 with the mark's stub)
     /* The GPU's list DMA (gpu_timing.c), which stalls the CPU while it
      * moves data: DuckStation's linked-list DMA takes 8 clocks to read a
      * node's header and 5 more to set up a packet's block, and the RAM's
@@ -527,6 +571,10 @@ enum {
      * 12.5 a stub taken off), against the port's charges within it, 514
      * and 588 [mark] */
     SS_UT_KEY_ON_CYCLES = 2190,
+    /* A tick that finds _snd_ev_flag set returns at once: 102 clocks from
+     * SsSeqCalledTbyT's entry to its return on DuckStation, 15 of them the
+     * return's stub (the Versus card screen's field 6800) [mark] */
+    SS_TICK_SKIPPED_CYCLES = 102 - 15,
     SS_SND_PLAY_CYCLES = 132,
     SS_GET_SEQ_DATA_CYCLES = 332,
     /* _SsVmKeyOn by its paths, fit to 1739 calls on DuckStation (Save
@@ -664,7 +712,13 @@ enum {
     /* ... and each parameter byte CD_cw writes before the command: on
      * DuckStation a Setloc's acknowledge comes 25622-25640 clocks after
      * CD_cw, a Setmode's 25533, a ReadN's or a Pause's 25479-25513 [mark]
-     * (DSF_MARKS CD_cw, DSF_EXC: the boot's and the menus' reads) */
+     * (DSF_MARKS CD_cw, DSF_EXC: the boot's and the menus' reads). Without
+     * the exception stubs (DSF_EXC=0, one entry mark, its stub's 3 clocks
+     * after it) 25601-25605, 25494 and 25454-25457 (the Time Attack menus'
+     * and the course load's reads, ta-course4): 454 and 47 would give those
+     * within 8, but the boot's CD timing was fitted on these (with them
+     * every scenario differs from the boot on), so they stay until it is
+     * refitted (docs/TECH_DEBT.md F13 in the game's repository) */
     CD_CW_PARAM_CYCLES = 55,
     /* The drive's interrupts as exceptions, from the exception to its
      * return: a data sector's INT1 (LIBCD's handler, CdRead's callback and

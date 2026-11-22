@@ -219,6 +219,13 @@ extern struct SeqStruct* _ss_score[32];
  * the interrupts that come during it are not held back. */
 void Psyz_KernelLockApi(void);
 void Psyz_KernelUnlockApi(void);
+/* SsUtKeyOn and SsUtKeyOff mark the span they hold _snd_ev_flag on the
+ * emulated clock, their PS1 time included: on the PS1 a sequencer tick that
+ * interrupts one finds the flag set and returns at once, and the sequences
+ * fall a tick behind (sscall.c). SsUtKeyOnV and SsUtKeyOffV, which set it
+ * too, do not yet (docs/TECH_DEBT.md F14 in the game's repository). */
+void Psyz_SndEvFlagBegin(void);
+void Psyz_SndEvFlagEnd(void);
 #endif
 
 #ifdef __psyz

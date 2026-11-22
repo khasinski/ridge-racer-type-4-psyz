@@ -95,6 +95,13 @@ int D_800B89BC[] = {512, 1024, 1024, 512, 1024};
 u_long move_image[] = {(4 << 24) | 0xFFFFFF, 0x80000000, 0, 0, 0};
 #if __psyz
 u_long D_800B89E4[] = {0xFFFFFF, 4, 0, 0, 0, 0};
+/* The libgpu Ridge Racer Type 4 links (the decompilation's gpuenv.c,
+ * ClearOTag/ClearOTagR: D_800ABB80 at PS1 0x800ABB80) ends a cleared table
+ * with a 2x1 VRAM copy of (0,0) onto itself, then the zero terminator:
+ * the list DMA moves both (DUCKSTATION_DMA_TRACE, GP0 80000000 00000000
+ * 00000000 00010002 at every list's end) and the GPU spends 4 ticks on the
+ * copy. gpu_timing.c times it; it is not drawn (Psyz_LibgpuTermMove). */
+u_long Psyz_LibgpuTermMove[] = {0xFFFFFF, 4, 0x80000000, 0, 0, 0x00010002};
 #else
 u_long D_800B89E4[] = {(4 << 24) | 0xFFFFFF, 0, 0, 0, 0};
 #endif
@@ -134,6 +141,7 @@ int D_800B8A44 = 0;
 void Psyz_SpendCycles(unsigned cycles);
 #define GPU_TIME(cycles) Psyz_SpendCycles(cycles)
 void Psyz_GpuTimingWait(void);
+int Psyz_GpuTimingTransferring(void);
 void Psyz_GpuTimingImage(unsigned words);
 #define GPU_BIOS_MEMCPY_CYCLES(bytes) \
     (BIOS_COPY_CYCLES + BIOS_COPY_BYTE_CYCLES * (bytes))
@@ -351,7 +359,9 @@ OT_TYPE* ClearOTag(OT_TYPE* ot, int n) {
         ot++;
     }
 #ifdef __psyz
-    setaddr(ot, D_800B89E4);
+    setaddr(Psyz_LibgpuTermMove, D_800B89E4);
+    setlen(Psyz_LibgpuTermMove, 4);
+    setaddr(ot, Psyz_LibgpuTermMove);
     setlen(ot, 0);
 #else
     *ot = (u_long)D_800B89E4 & 0xFFFFFF;
@@ -367,7 +377,9 @@ OT_TYPE* ClearOTagR(OT_TYPE* ot, int n) {
     D_800B8920->otc(ot, n);
     GPU_TIME(CLEAR_OTAG_R_CYCLES + (n > 0 ? GPU_DMA_CYCLES((unsigned)n) : 0));
 #ifdef __psyz
-    setaddr(ot, D_800B89E4);
+    setaddr(Psyz_LibgpuTermMove, D_800B89E4);
+    setlen(Psyz_LibgpuTermMove, 4);
+    setaddr(ot, Psyz_LibgpuTermMove);
     setlen(ot, 0);
 #else
     *ot = (u_long)D_800B89E4 & 0xFFFFFF;
@@ -388,12 +400,15 @@ void DrawOTag(OT_TYPE* p) {
     }
     // up to _addque2's exec, then the rest; its list DMA: gpu_timing.c
     GPU_TIME(DRAW_OTAG_TO_EXEC_CYCLES);
+    // behind a list still in progress _addque2 queues it instead
+    int queued = Psyz_GpuTimingTransferring();
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
     D_800B8920->addque2(
         (int (*)(u_long, u_long))D_800B8920->cwc, (u_long)p, 0, 0);
-    GPU_TIME(DRAW_OTAG_CYCLES - DRAW_OTAG_TO_EXEC_CYCLES);
+    GPU_TIME(DRAW_OTAG_CYCLES - DRAW_OTAG_TO_EXEC_CYCLES +
+             (queued ? DRAW_OTAG_QUEUED_CYCLES : 0));
 #ifdef PE_PS5_GPU_NATIVE
     Psyz_VideoMovieFrameQueued(native_accepted==0);
 #endif
@@ -406,7 +421,8 @@ DRAWENV* PutDrawEnv(DRAWENV* env) {
 
     SetDrawEnv2(&env->dr_env, env);
     termPrim(&env->dr_env);
-    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES); // the packet's DMA starts here
+    // the packet's DMA starts here; a clear's fill takes its rectangle first
+    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES + (env->isbg ? PUT_DRAW_ENV_BG_CYCLES : 0));
     D_800B8920->addque2((int (*)(u_long, u_long))D_800B8920->cwc,
                         (u_long)&env->dr_env, sizeof(DR_ENV), 0);
     __builtin_memcpy(&info.draw, env, sizeof(DRAWENV));
@@ -421,7 +437,7 @@ void DrawOTagEnv(OT_TYPE* p, DRAWENV* env) {
     }
     SetDrawEnv2(&env->dr_env, env);
     setaddr(&env->dr_env, p);
-    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES); // as PutDrawEnv
+    GPU_TIME(PUT_DRAW_ENV_TO_EXEC_CYCLES + (env->isbg ? PUT_DRAW_ENV_BG_CYCLES : 0)); // as PutDrawEnv
     #ifdef PE_PS5_GPU_NATIVE
     int native_accepted =
     #endif
