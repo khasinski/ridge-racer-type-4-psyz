@@ -1652,42 +1652,14 @@ void Draw_FlushBuffer(void) {
     Draw_ResetBuffer();
 }
 
-int Psyz_GpuSetFrameInterpolation(int enabled){(void)enabled;return -1;}
-int Psyz_GpuSetPresentationRate(unsigned fps){(void)fps;return -1;}
-void Psyz_GpuSetPresentationInterval(unsigned fields){(void)fields;}
-void Psyz_GpuPollPresentation(void) {}
 unsigned char* Psyz_VideoAllocHiddenDisplay(int* w,int* h){if(w)*w=0;if(h)*h=0;return NULL;}
-unsigned char* Psyz_VideoAllocInterpolationSample(unsigned s,float* f,int* w,int* h){(void)s;(void)f;if(w)*w=0;if(h)*h=0;return NULL;}
-static void PlatformBackend_PresentationPoll(void) {}
-int Psyz_GpuGetFrameInterpolation(void){return 0;}
-int Psyz_GpuGetFrameInterpolationRequested(void){return 0;}
 float Psyz_GpuGetPresentedFps(void){return 0.0f;}
-unsigned long long Psyz_GpuGetInterpolatedPresentCount(void){return 0;}
-void Psyz_GpuGetInterpolationStats(unsigned *a,unsigned *b,unsigned *c){if(a)*a=0;if(b)*b=0;if(c)*c=0;}
-unsigned char *Psyz_VideoAllocMidpointFrame(int *w,int *h){if(w)*w=0;if(h)*h=0;return NULL;}
-void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b){(void)a;(void)b;}
-void Psyz_GpuCopyInterpolationPacket(const void *a,const void *b){(void)a;(void)b;}
-void Psyz_GpuResetInterpolation(void){}
-void Psyz_GpuBeginInterpolationFrame(void){}
-void Psyz_GpuPrepareInterpolatedPresent(int y){(void)y;}
-void Psyz_GpuPrepareInterpolatedBlank(int y){(void)y;}
-void Psyz_GpuInterpolationBackdrop(int x,int s,int d,int w,int h){(void)x;(void)s;(void)d;(void)w;(void)h;}
-void Psyz_GpuTagInterpolationPacket(const void *p,unsigned long long id){(void)p;(void)id;}
-void Psyz_GpuTagInterpolationPacketFlags(const void *p,unsigned long long id,unsigned f){(void)p;(void)id;(void)f;}
-
-void Psyz_GpuClearInterpolationPackets(void){}
-
-void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b){(void)a;(void)b;}
-void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
-
-void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b){(void)a;(void)b;}
-void Psyz_GpuSetInterpolationCamera(int x,int y){(void)x;(void)y;}
 int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetDynamicLighting(void){return 0;}
 int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}
 
-/* Upscaling only: widescreen, interpolation, antialiasing, filtering and
+/* Upscaling only: widescreen, antialiasing, filtering and
  * geometry correction are stubs here. */
 unsigned Psyz_VideoGetFeatures(void) { return PSYZ_VIDEO_FEATURE_UPSCALE; }
 const char* Psyz_VideoGetRendererName(void) { return "OpenGL"; }

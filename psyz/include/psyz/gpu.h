@@ -88,85 +88,14 @@ int Psyz_GpuSetHorizontalGrid(
 int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename);
 /* Retire queued reads and reuse the bounded atlas storage for a new room. */
 void Psyz_GpuResetSpriteAtlases(void);
-/* Presentation switch; native VRAM remains unchanged. */
-/* Optional display-only midpoint geometry; simulation and native VRAM stay original. */
-int Psyz_GpuSetFrameInterpolation(int enabled);
-/* 0: native presentation; 60/120: geometry samples at an independent rate.
- * Set the native frame duration before BeginInterpolationFrame. */
-int Psyz_GpuSetPresentationRate(unsigned fps);
-void Psyz_GpuSetPresentationInterval(unsigned fields);
-/* Cooperative output service during long CPU geometry passes; never runs
- * game logic, consumes packets or invokes the settings overlay. */
-void Psyz_GpuPollPresentation(void);
-int Psyz_GpuGetFrameInterpolation(void);
-int Psyz_GpuGetFrameInterpolationRequested(void);
+/* Swapchain images presented over the last second. */
 float Psyz_GpuGetPresentedFps(void);
-void Psyz_GpuEnsureInterpolationBackgroundPair(const void *a,const void *b);
-/* Midpoints presented; an unpaced run (headless, limitless) counts those a
- * paced one would present. */
-unsigned long long Psyz_GpuGetInterpolatedPresentCount(void);
-/* The last frame drawn: primitives the midpoint could move, those tagged
- * with an identity (Psyz_GpuTagInterpolationPacket) and those paired with
- * the frame before (drawn at the midpoint). */
-void Psyz_GpuGetInterpolationStats(unsigned *primitives,unsigned *tagged,unsigned *paired);
-/* For tests: the midpoint drawn for the displayed buffer (the in-between
- * of the frame shown and the one before), RGB like
- * Psyz_VideoAllocRenderedFrame; NULL without one. */
-unsigned char *Psyz_VideoAllocMidpointFrame(int *w,int *h);
-/* Diagnostic readback of a generated 60/120 Hz sample and its fraction.
- * NULL for an unavailable index. Uses the last prepared display buffer. */
-unsigned char *Psyz_VideoAllocInterpolationSample(unsigned sample, float *fraction, int *w, int *h);
-void Psyz_GpuRegisterInterpolationPair(const void *a,const void *b);
-void Psyz_GpuRegisterInterpolationBackgroundPair(const void *a,const void *b);
-void Psyz_GpuSetInterpolationCamera(int x,int y);
-void Psyz_GpuEnsureInterpolationPair(const void *a,const void *b);
-void Psyz_GpuCopyInterpolationPacket(const void *from,const void *to);
-void Psyz_GpuResetInterpolation(void);
-void Psyz_GpuClearInterpolationPackets(void);
-void Psyz_GpuBeginInterpolationFrame(void);
-void Psyz_GpuPrepareInterpolatedPresent(int next_y);
-/* For a renderer whose packets are not at fixed addresses: tags a packet of
- * the frame being built with a stable identity (e.g. model, instance and
- * face), which pairs it with the packet of the same identity in the previous
- * frame. Call between the frame's Psyz_GpuBeginInterpolationFrame calls,
- * before the frame's own; untagged packets (HUD) keep their pose. */
-void Psyz_GpuTagInterpolationPacket(const void *packet,unsigned long long id);
-/* With PSYZ_INTERP_ANY_TEXTURE the packet pairs whatever its texture
- * coordinates (an environment map that follows the view); otherwise a
- * packet only pairs when they did not change. */
-#define PSYZ_INTERP_ANY_TEXTURE 1u
-/* With PSYZ_INTERP_MIDPOINT_ONLY the packet is drawn into the midpoint only
- * (geometry the game culls but whose previous pose still shows there); it
- * is left out when it does not pair. */
-#define PSYZ_INTERP_MIDPOINT_ONLY 2u
-/* With PSYZ_INTERP_FRAME_ONLY the packet is left out of the midpoint (a
- * new level of detail whose previous one is drawn there instead); it still
- * pairs with the next frame. */
-#define PSYZ_INTERP_FRAME_ONLY 4u
-/* With PSYZ_INTERP_NO_POSE (and PSYZ_INTERP_MIDPOINT_ONLY) the packet's
- * coordinates this frame are no projection (geometry passing behind the
- * view): the midpoint continues the last motion of the pose drawn in the
- * frame before instead of pairing with them, and leaves it out without
- * one. */
-#define PSYZ_INTERP_NO_POSE 8u
-void Psyz_GpuTagInterpolationPacketFlags(const void *packet,unsigned long long id,unsigned flags);
-/* Packets the PS1 would not draw (a port's added views, frame
- * interpolation's midpoint-only geometry): [begin, end) of the packets built
+/* Packets the PS1 would not draw (a port's added views): [begin, end) of the packets built
  * for the next DrawOTag. The offline clock's GPU timing (gpu_timing.c) takes
  * no time for them, so host-only options leave the emulated time as it is.
  * Clear starts a frame's list (all ranges forgotten). */
 void Psyz_GpuTimingHostPackets(const void *begin, const void *end);
 void Psyz_GpuTimingClearHostPackets(void);
-/* Like Psyz_GpuPrepareInterpolatedPresent, for a game that waits on VSync(1)
- * over several fields with one VSync(0) per frame: the midpoint is presented
- * at the next blank that passes during that wait (paced presents), and not
- * at all when the next present is a new frame. */
-void Psyz_GpuPrepareInterpolatedBlank(int next_y);
-/* Before a frame is drawn into the rows at dst_y: the midpoint target there
- * starts as the frame drawn at src_y (the one before), so what the midpoint
- * leaves uncovered (geometry the new frame culled) shows that frame instead
- * of an older picture. */
-void Psyz_GpuInterpolationBackdrop(int x,int src_y,int dst_y,int w,int h);
 void Psyz_GpuSetSpriteAtlasesEnabled(int enabled);
 int Psyz_GpuGetSpriteAtlasesEnabled(void);
 /* Selects one cell for the next GP0 primitive only. Use a queued user command

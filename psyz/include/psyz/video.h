@@ -211,7 +211,7 @@ unsigned Psyz_VideoGetInternalResolution(void);
  *
  * When enabled, the internal resolution is 1 and no enhancement that needs
  * the GPU rasterizer is on (antialiasing, geometry correction, model or
- * sprite filtering, widescreen, frame interpolation, loaded sprite atlases,
+ * sprite filtering, widescreen, loaded sprite atlases,
  * PSYZ_DITHER_OFF full-colour shading),
  * primitives and VRAM transfers are processed by the CPU rasterizer, which
  * reproduces the PS1 GPU pixel for pixel (fill convention, attribute
@@ -239,7 +239,6 @@ enum {
     PSYZ_VIDEO_FEATURE_FILTERING = 1 << 2,     /**< model/sprite filtering */
     PSYZ_VIDEO_FEATURE_GEOMETRY = 1 << 3,      /**< geometry correction */
     PSYZ_VIDEO_FEATURE_WIDESCREEN = 1 << 4,    /**< Psyz_VideoSetWidescreen */
-    PSYZ_VIDEO_FEATURE_INTERPOLATION = 1 << 5, /**< frame interpolation */
 };
 
 /**

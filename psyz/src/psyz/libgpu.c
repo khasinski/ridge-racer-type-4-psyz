@@ -421,7 +421,6 @@ static int is_packed_command_stream(const u32* words, int count) {
 
 extern u_long Psyz_LibgpuTermMove[];
 
-static unsigned enqueue_nodes;
 static void GPU_Enqueue(u_long* packets) {
     DR_ENV* env = (DR_ENV*)packets;
     Psyz_GpuTimingBegin();
@@ -471,23 +470,17 @@ static void GPU_Enqueue(u_long* packets) {
                 u32* prim_data = (u32*)env->code;
                 for (u_long i = 0; i < env->len; i++) {
                     queue_buf[queue_len + i] = prim_data[i];
-                    Psyz_GpuCopyInterpolationPacket(&prim_data[i],&queue_buf[queue_len+i]);
                     Psyz_GteCopyQueuedPgxpSxy(
                         &prim_data[i], &queue_buf[queue_len + i], prim_data[i]);
                 }
             } else if (env->len > 0) {
                 memcpy(queue_buf + queue_len, env->code,
                        env->len * sizeof(u_long));
-                for(u_long i=0;i<env->len;++i)Psyz_GpuCopyInterpolationPacket((u_long *)env->code+i,&queue_buf[queue_len+i]);
             }
         }
         if (!Psyz_GpuTimingHostPacket(env))
             Psyz_GpuTimingNode(&queue_buf[queue_len], (int)env->len);
         queue_len += (int)env->len;
-        /* a long list (4x, the extended draw distance) took over 10 ms here
-         * without letting a due 60 FPS output be presented */
-        if ((++enqueue_nodes & 255u) == 0)
-            Psyz_GpuPollPresentation();
         if (isendprim(env)) {
             break;
         }
@@ -534,13 +527,11 @@ static int psyz_cwb(u32* data, s32 n) {
     if (sizeof(u_long) == 8 && is_packed_command_stream(data, n)) {
         for (int i = 0; i < n; ++i) {
             queue_buf[i] = data[i];
-            Psyz_GpuCopyInterpolationPacket(&data[i],&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(&data[i], &queue_buf[i], data[i]);
         }
     } else {
         memcpy(queue_buf, data, (size_t)n * sizeof(u_long));
         for (int i = 0; i < n; ++i){
-            Psyz_GpuCopyInterpolationPacket((u_long *)data+i,&queue_buf[i]);
             Psyz_GteCopyQueuedPgxpSxy(
                 (u_long*)data + i, &queue_buf[i], (unsigned)queue_buf[i]);
         }

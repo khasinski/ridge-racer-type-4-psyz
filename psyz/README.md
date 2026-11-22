@@ -13,8 +13,7 @@ timing or card variables of the calling shell (`PSYZ_AUDIO_CLOCK`,
 `tests/`, the working directory the golden images and card directories are
 relative to. Every test passes or skips there; a red run means a
 regression. Other modes give other results by design: a visible window
-paces presents by the monitor (the interpolation tests then present other
-fields), `PSYZ_HEADLESS=1` draws with the CPU rasterizer and skips the tests
+paces presents by the monitor, `PSYZ_HEADLESS=1` draws with the CPU rasterizer and skips the tests
 that need a GPU renderer, and `PSYZ_AUDIO_CLOCK=video` puts the kernel on
 the offline clock, where time passes only as audio is mixed: the tests that
 wait for real time then wait forever. The `audio_clock` tests need that
@@ -59,16 +58,7 @@ one later in the process has no effect):
 | `PSYZ_FRAME_STATS`, `PSYZ_FRAME_LOG=file`, `PSYZ_PRESENT_PACING=0` | renderer statistics (present intervals, host work), one line per present, presents made in VSync before the blank wait |
 | `PSYZ_GPU=off` | no SDL GPU device, as on a system without a Vulkan or D3D12 driver: the CPU rasterizer draws and an SDL renderer presents (the fallback; `Psyz_VideoGetFeatures` reports no GPU enhancements) |
 | `PSYZ_GPU_COMMAND_DESCRIPTOR_LIMIT=n` | submit the frame's command buffer every n descriptors (4..1024, default 256) |
-| `PSYZ_BATCH_VERTICES=n`, `PSYZ_BATCH_PRIMITIVES=n` | draw GPU batches of at most n vertices or primitives (tests: the interpolation midpoint must not depend on the batches) |
-| `PSYZ_INTERP_STATS=1` | one `[interp-stats]` line a frame: screen area by what the midpoint did with it, batches, midpoint draws and splits, table overflows |
-| `PSYZ_INTERP_HOLD=share` | hold the frame before (no midpoint) when geometry without a pose in it covers more than this share of the picture (default 0.15) |
-| `PSYZ_INTERP_EXPOSE=cells` | hold when this many 4x4-pixel cells show something farther in the midpoint than in both frames (default 8; 0: no test); `PSYZ_INTERP_EXPOSE_DUMP=frame` logs the cells of one frame |
-| `PSYZ_INTERP_PROBE=x,y[,first,last]` | log every primitive of frames first..last covering pixel x,y (x=-1: all) |
-| `PSYZ_INTERP_DEBUG=1` / `2` | tint the midpoint's unpaired tagged primitives magenta (2: untagged ones green too) |
-| `PSYZ_INTERP_GHOSTS=0`, `PSYZ_INTERP_FIELD=0`, `PSYZ_INTERP_JUNCTIONS=0`, `PSYZ_INTERP_SIZE_CULLED=0` | turn off a midpoint step: ghosts of vanished identities, moving one-pose geometry with its neighbours, T-junction snapping, drawing triangles the GPU skips for their size |
-
-The frame interpolation and its tuned thresholds are described at the top
-of `src/platform/frame_interp.h`.
+| `PSYZ_BATCH_VERTICES=n`, `PSYZ_BATCH_PRIMITIVES=n` | draw GPU batches of at most n vertices or primitives (tests of smaller batches) |
 
 The PS1 time costs PsyZ spends on the offline clock, and the DuckStation runs
 they were fitted from, are in `src/timing_profile.h`.

@@ -46,10 +46,6 @@ typedef struct {
     unsigned int exact[5][4];
 } Vertex;
 
-#ifdef PSYZ_CAPTURE_INTERPOLATION
-static void InterpCapture(const void *packet,Vertex *v,unsigned count,const u32 *index,unsigned indices);
-static void InterpEnqueued(void);
-#endif
 
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
 #define TPAGE_NOTEXTURE 0x8000 // flag untextured poly
@@ -78,11 +74,6 @@ static void InterpEnqueued(void);
 static u_short cur_tpage = 0;
 static bool mask_set_bit, mask_check_bit; /* GP0 E6h */
 static Vertex vertex_buf[MAX_VERTEX_COUNT];
-#ifdef PSYZ_CAPTURE_INTERPOLATION
-/* The view depth of each queued vertex's projection (PGXP), -1 without one:
- * the midpoint interpolates in view space with it. */
-static float vertex_depth[MAX_VERTEX_COUNT];
-#endif
 /* 32-bit indices: a batch may hold more than 65536 vertices. */
 static u32 index_buf[MAX_INDEX_COUNT];
 static Vertex* vertex_cur;
@@ -116,16 +107,10 @@ static void Draw_EnqueueBuffer(int vertices, int indices) {
     assert(n_vertices + vertices <= MAX_VERTEX_COUNT);
     assert(n_indices + indices <= MAX_INDEX_COUNT);
 
-#ifdef PSYZ_CAPTURE_INTERPOLATION
-    PSYZ_CAPTURE_INTERPOLATION(vertex_cur,(unsigned)vertices,index_cur,(unsigned)indices);
-#endif
     vertex_cur += vertices;
     index_cur += indices;
     n_vertices += vertices;
     n_indices += indices;
-#ifdef PSYZ_CAPTURE_INTERPOLATION
-    InterpEnqueued();
-#endif
 }
 
 // real hardware use XY coords as signed 11-bit
@@ -150,10 +135,6 @@ static int writePacket(Vertex* v, int code, int n, u_long* packet, u16* pOut) {
         } else if (pgxp_kind == 1) {
             v->t = TPAGE_MODEL;
         }
-#ifdef PSYZ_CAPTURE_INTERPOLATION
-        if (v >= vertex_buf && v < vertex_buf + MAX_VERTEX_COUNT)
-            vertex_depth[v - vertex_buf] = pgxp_kind ? v->pgxp_pos[2] : -1.0f;
-#endif
     }
     packet++;
     n--;
