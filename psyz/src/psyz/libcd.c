@@ -1757,6 +1757,7 @@ static void start_data_read(void) {
 }
 
 static uint64_t command_ack_ns; // CD_cw
+static unsigned cw_count; // commands issued (CD_cw)
 /* A command the drive refuses answers with an error interrupt (INT5), which
  * LIBCD's getintr hands to the ready callback too (CdlDiskError): a read's
  * callback (cb_read) then retries the read, as on DuckStation when the XA
@@ -1822,7 +1823,9 @@ static void deliver_data_sector(void) {
                     sector);
         }
     } else {
-        drive_irq(irq_ns, CD_DATA_IRQ_CLOCKS, CD_DATA_IRQ_CLOCKS);
+        unsigned clocks = CD_DATA_IRQ_CLOCKS +
+                          (Psyz_CardChainInstalled() || drive_is_instant() ? 0 : CD_DATA_IRQ_BOOT_CLOCKS);
+        drive_irq(irq_ns, clocks, clocks);
     }
     if (!CD_cbready) {
         return;
@@ -1843,6 +1846,7 @@ static void deliver_data_sector(void) {
     st_irq_extra = 0;
     CdlCB ready = CD_cbready;
     long debt = Psyz_KernelDebtClocks();
+    unsigned commands = cw_count;
     ready(CdlDataReady, result);
     if (sector_in_dma) {
         // served by libetc's dispatcher in the DMA's exception (no entry,
@@ -1855,6 +1859,14 @@ static void deliver_data_sector(void) {
                                   (int)ST_SECTOR_IRQ_CLOCKS -
                                       (int)CD_DATA_IRQ_CLOCKS +
                                       (int)st_irq_extra);
+    } else if (ready == (CdlCB)cb_read && cw_count != commands && !drive_is_instant()) {
+        /* CdRead's callback that ends the read with its Pause: the
+         * exception lasts the callback's work and the rest of it past the
+         * command (DuckStation: 5011 clocks before the card driver's chain,
+         * the Pause's write 3887 in; 5400 with it) [mark] */
+        long spent = Psyz_KernelDebtClocks() - debt;
+        Psyz_KernelResizeDispatch(irq_ns, (int)spent + CD_READ_END_EXCEPTION_CYCLES,
+                                  CD_READ_END_EXCEPTION_CYCLES);
     } else if (ready != (CdlCB)cb_read && !drive_is_instant()) {
         // a ready callback of the program's own (the XA player's): the
         // exception without CdRead's callback, with the time the program's
@@ -1883,6 +1895,13 @@ static void deliver_data_sector(void) {
     }
 }
 
+/* The completion of the command just issued is charged at its time:
+ * CdRead's ending Pause (cdread.c), whose completion's exception comes in
+ * whatever the CPU then runs (DuckStation: 2477 clocks in the boot's
+ * CdReadSync loops, before the card driver's chain) [mark] */
+static unsigned done_charge;
+void Psyz_CdChargeDone(unsigned clocks) { done_charge = clocks; }
+
 // A command's completion raises CdSyncCallback once its time has come.
 static void service_sync_callback(void) {
     if (!drive.sync_cb_due || drive_now() < drive.done_ns) {
@@ -1890,7 +1909,11 @@ static void service_sync_callback(void) {
     }
     drive.sync_cb_due = 0;
     if (drive.done_ns != command_ack_ns) {
-        drive_irq(drive.done_ns, CD_DONE_IRQ_CLOCKS, 0); // a second response
+        // a second response; a read's ending Pause's, which nothing waits
+        // for, takes the CPU's time where it comes (Psyz_CdChargeDone)
+        unsigned charged = done_charge;
+        done_charge = 0;
+        drive_irq(drive.done_ns, charged ? charged : CD_DONE_IRQ_CLOCKS, charged);
     }
     if (CD_cbsync) {
         u_char result[8];
@@ -2253,7 +2276,21 @@ static unsigned cd_result_bytes(u_char com) {
     }
 }
 
-static unsigned cw_count; // commands issued (CD_cw)
+/* A command CD_cw does not wait for (CdControlF): its acknowledge's
+ * exception takes the CPU's time at the acknowledge, as another
+ * interrupt's does (DuckStation: the XA player's GetlocP, 3107 clocks every
+ * race frame) [exc] */
+static uint64_t unwaited_ack_ns;
+static unsigned unwaited_ack_clocks;
+static void unwaited_ack(void) {
+    Psyz_KernelLockInterrupts();
+    unsigned clocks = unwaited_ack_clocks;
+    unwaited_ack_clocks = 0;
+    if (clocks)
+        drive_irq(unwaited_ack_ns, clocks, clocks);
+    Psyz_KernelUnlockInterrupts();
+}
+
 static int cw_error;       // ... and whether the latest one was refused
 
 int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
@@ -2264,6 +2301,7 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     Psyz_KernelUnlockInterrupts();
     drive_wait_done(previous_done);
     Psyz_CdServiceDrive();
+    done_charge = 0;
     // in a ready callback (the CPU's position there is sector_callback_ns):
     // the wait ends at the previous command's completion
     if (sector_callback_ns && previous_done > sector_callback_ns) {
@@ -2316,7 +2354,16 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive_schedule();
     uint64_t ack = command_ack_ns;
     unsigned result_clocks = (cd_result_bytes(com) - 1) * CD_RESULT_BYTE_CLOCKS;
-    drive_irq(ack, CD_ACK_IRQ_CLOCKS + result_clocks, 0); // CD_CW_ACK_CYCLES has its time
+    /* (the XA player's GetlocP, every race frame, is held: the race frames'
+     * CPU model was fitted without its 3104 clocks, docs/TECH_DEBT.md F13) */
+    if (arg3 && !drive_is_instant() && com != CdlGetlocP) {
+        unwaited_ack_ns = ack;
+        unwaited_ack_clocks = CD_UNWAITED_ACK_CLOCKS + result_clocks +
+                              (com == CdlReadN || com == CdlReadS ? CD_UNWAITED_READ_ACK_CLOCKS : 0);
+        Psyz_KernelPostAtNs(ack, unwaited_ack);
+    } else {
+        drive_irq(ack, CD_ACK_IRQ_CLOCKS + result_clocks, 0); // CD_CW_ACK_CYCLES has its time
+    }
     Psyz_KernelUnlockInterrupts();
     if (!arg3) {
         // the interrupts during the spin run within it, as on DuckStation

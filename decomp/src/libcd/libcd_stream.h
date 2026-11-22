@@ -35,6 +35,8 @@ void Psyz_CdCpu(unsigned cycles);
  * than CdControl's own return charge, never below nothing) */
 int Psyz_CdControlThen(u_char com, u_char* param, u_char* result, int then_cycles);
 unsigned Psyz_CdDoneIrqCycles(void);
+void Psyz_CdChargeDone(unsigned clocks);
+void Psyz_KernelExceptionContext(int clocks);
 #include "../../../psyz/src/timing_profile.h"
 #endif
 #endif

@@ -507,9 +507,22 @@ enum {
      * (DSF_EXC, 4672 with the marks' own; DUCKSTATION_DMA_TRACE IRQX) [exc] */
     SPU_CLEAR_DMA_IRQ_CLOCKS = 4580,
     SPU_CLEAR_DMA_SAVED_PER_64_BYTES = 5,
+    /* ... and a vblank's exception during those chunks takes 2387 clocks
+     * on DuckStation (fields 88-90: the chunk's DMA interrupts 15027
+     * apart across it against 12640), 49 less than KERNEL_IRQ_CYCLES and
+     * VBLANK_HANDLER_CYCLES (the boot's bzero); one 327 clocks into a
+     * chunk's DMA exception adds 606, 229 less than the shared exception's
+     * SHARED_EXCEPTION_SAVED_CYCLES gives [trace] */
+    SPU_CLEAR_VBLANK_SAVED_CYCLES = 49,
+    SPU_CLEAR_SHARED_VBLANK_SAVED_CYCLES = 229,
+    /* ... and from the last chunk's DMA interrupt to the caller's next
+     * call (WaitEvent's return, the restores): 4807 clocks on DuckStation
+     * (DSF_MARKS SpuClearReverbWorkArea:ret, _SsInit; DUCKSTATION_DMA_TRACE
+     * IRQX), the exception's SPU_CLEAR_DMA_IRQ_CLOCKS of them [trace] */
+    SPU_CLEAR_RETURN_CYCLES = 4807 - SPU_CLEAR_DMA_IRQ_CLOCKS,
     /* SpuInit (cold): _spu_init's resets and waits and SpuStart, 29.2k up
      * to SsInit's SpuClearReverbWorkArea [mark] */
-    SPU_INIT_CYCLES = 29230,
+    SPU_INIT_CYCLES = 29249, // (29230 before; SsInit to SpuClearReverbWorkArea, DSF_MARKS, 3 stubs out)
     /* SpuIsTransferCompleted(SPU_TRANSFER_PEEK) while the DMA runs, and
      * Psyz_SpuDmaWait's step: a poll's time in ns. [unrecorded] dd07ccc */
     SPU_TRANSFER_POLL_NS = 1000,
@@ -715,9 +728,40 @@ enum {
      * the return: LoadR4Directory's CdReadSync(1) during which that Pause
      * completes 640 clocks into it returns 69 clocks after the
      * completion's exception, the return mark's stub included [mark] */
-    CD_READ_SYNC_TURN_CYCLES = 241,
-    CD_READ_SYNC_END_CYCLES = 680 - 241 - 45,
-    CD_READ_SYNC_RETURN_CYCLES = 45,
+    /* Remeasured with marks inside LIBCD's loop (DSF_MARKS 0x8008f0c8, the
+     * return from its first VSync(-1), and 0x8008f130, its look at the
+     * Pause's flag; DSF_EXC=0, 7 clocks a stub taken out; the boot's
+     * CdSearchFile and LoadR4Directory reads): a CdReadSync(0) turn 245
+     * clocks from look to look (the entry to its first look 245 too); a
+     * CdReadSync(1) call 681 (its look at the flag, after CdReady, 623
+     * after its entry; from it to the next call's entry 58, the caller's
+     * loop included); in CdReadSync(0)'s exit from that look to CdReady's
+     * return 396 [mark]. (241, 394 and 45 had been
+     * fitted against the boot's acknowledges without the unwaited
+     * acknowledges' exceptions and with the Pause's completion charged
+     * after the look.) */
+    CD_READ_SYNC_TURN_CYCLES = 245,
+    CD_READ_SYNC_END_CYCLES = 396,
+    CD_READ_SYNC_POLL_END_CYCLES = 623 - 245,
+    CD_READ_SYNC_RETURN_CYCLES = 46,
+    /* ... a vblank's exception in those loops takes 2387 clocks from them
+     * (every one of the boot's), 49 less than KERNEL_IRQ_CYCLES and
+     * VBLANK_HANDLER_CYCLES (measured in SoundSystemInit's bzero) [mark] */
+    CD_READ_SYNC_VBLANK_SAVED_CYCLES = 49,
+    /* ... VSync(-1)'s repeat of its hblank counter read (18 clocks): in
+     * 1.04% of CdReadSync(0)'s turns with one mark in them, 0.73% with
+     * two, 1.85% of CdReadSync(1)'s calls with one: the unmarked loops'
+     * mean, in 1/100000 clocks a turn and a call, from the boot's waits'
+     * ends against DuckStation's unmarked acknowledges and the PCs its
+     * Pause completions interrupt (DUCKSTATION_DMA_TRACE IRQX, a map of
+     * those PCs to the look from DSF_EXC runs) and SsStart's timer phase:
+     * CdSearchFile's three waits end within 5, 23 and 5 clocks of
+     * DuckStation's, SsStart's last RCNT2 write 1 late [trace] */
+    CD_READ_SYNC_TURN_RETRY = 18601,
+    CD_READ_SYNC_CALL_RETRY = 37770,
+    /* ... and a CdReadSync(1) call while the read's Pause is pending 3
+     * more (691 against 688 with one mark) [mark] */
+    CD_READ_SYNC_PENDING_CYCLES = 3,
     /* LIBCD's CD_cw around a command: from its call to the command
      * register write, and from the acknowledge (the interrupt, the result
      * read, the return) to the caller; and the completion interrupt's
@@ -752,6 +796,11 @@ enum {
      * (CD_CW_ACK_CYCLES, CD_DONE_IRQ_CYCLES). [exc] the boot's reads
      * (3800, 2420) and the Grand Prix menus' loads (4130, 2790) */
     CD_DATA_IRQ_CLOCKS = 3780,
+    /* ... and 58 more before the card driver's chain: a sector in the
+     * boot's LoadR4Directory read takes 3838 from the CPU on DuckStation
+     * (DSF_EXC=0, a mark in its CdReadSync loop), 4157 with the chain in
+     * the menus' loads [mark] */
+    CD_DATA_IRQ_BOOT_CLOCKS = 58,
     /* ... of which CdRead's ready callback (cb_read, its two CdGetSector
      * calls: the sector's header and 512 words) takes this much: a sector
      * whose ready callback is the program's own takes the exception without
@@ -795,6 +844,12 @@ enum {
     /* ... with the card driver's chain, 40 less than its BIOS_CARD_CHAIN_CYCLES
      * [trace] */
     CD_DATA_CALLBACK_CHAIN_CW_CLOCKS = -40,
+    /* ... and that exception's rest past the callback's work as charged
+     * (its CD_cw, CdControlF): 1124 clocks from the Pause's write to the
+     * exception's end before the chain, 5011 in all, on DuckStation
+     * (DSF_EXC=0, marks in the boot's CdReadSync loops; 5400 in the
+     * menus' loads with the chain, DSF_EXC) [mark] [exc] */
+    CD_READ_END_EXCEPTION_CYCLES = 1124 - 485 - CD_DATA_IRQ_BOOT_CLOCKS,
     /* A movie's stream sector (CdRead2, StCdInterrupt as its ready
      * callback): the exception 3110 clocks with the card driver's chain
      * when StCdInterrupt leaves the sector for the MDEC callback (the
@@ -825,6 +880,14 @@ enum {
     CD_IN_DMA_FIRST_CYCLES = 3130 - ST_COPY_CYCLES,
     CD_IN_DMA_CHAIN_CYCLES = 528,
     CD_ACK_IRQ_CLOCKS = 2400,
+    /* ... the exception of an acknowledge CD_cw does not wait for
+     * (CdControlF), which takes the CPU's time where it comes: on
+     * DuckStation a read's ending Pause's 2457 clocks, its ReadN's 2469,
+     * before the card driver's chain (the boot's CdReadSync loops, DSF_EXC=0,
+     * a mark in the loop; BIOS_CARD_CHAIN_CYCLES more with it, and
+     * CD_RESULT_BYTE_CLOCKS a result byte: the race's GetlocP 3107) [mark] */
+    CD_UNWAITED_ACK_CLOCKS = 2457,
+    CD_UNWAITED_READ_ACK_CLOCKS = 2469 - 2457,
     /* ... and for each byte of the first response past the status that
      * LIBCD's handler reads: a GetlocP's acknowledge (8 bytes) takes 3087
      * clocks on DuckStation against a ReadS's 2868 and the port's 2814
@@ -847,19 +910,24 @@ enum {
      * 27660 in the boot's CdInit, before SpuInit (CD_cw's issue and its
      * 25000 included; DSF_MARKS CD_sync:ret: the wait's return 2650 and
      * 2608 clocks after the completion) [exc] [mark] */
-    CD_DONE_IRQ_CYCLES = 2222 + 26,
+    CD_DONE_IRQ_CYCLES = 2222 + 19, // (with the boot refit on 27660 and 27695; +26 before)
     CD_DONE_IRQ_BOOT_SAVED_CYCLES = 42,
     /* CdRead's ending Pause: its completion's sync callback (restoring the
      * caller's) and the wait loop's return, more than CD_DONE_IRQ_CYCLES;
      * the Pause done to the next read's Setloc acknowledge of the boot's
      * directory reads on DuckStation (31143 clocks; the commands and
      * CD_SEARCH_* between them as charged) [exc] */
-    CD_READ_PAUSE_CALLBACK_CYCLES = 160,
+    CD_READ_PAUSE_CALLBACK_CYCLES = 0,
+    /* ... which is an exception that nothing waits for, charged where it
+     * comes (it was charged at the poll that saw it, with the 160 above):
+     * 2477 clocks on DuckStation in the boot's CdReadSync loops (DSF_EXC=0,
+     * a mark in the loop), its callback included [mark] */
+    CD_READ_PAUSE_DONE_CLOCKS = 2477,
     /* CD_init to its first CD_cw: 4681 clocks the boot's first call, 4617
      * a later one's (SoundSystemInit's CdReset: its ResetCallback finds
      * the callbacks set up) on DuckStation's exact timing [mark] */
     CD_INIT_CYCLES = 4680,
-    CD_INIT_AGAIN_CYCLES = 4617 + 39,
+    CD_INIT_AGAIN_CYCLES = 4598, // (SoundSystemInit's CdInit: 30052 to its Nop's acknowledge, DSF_MARKS CD_init)
     /* ... and a later CD_init's Nop (the shell's open status) to its Reset
      * [trace] */
     CD_INIT_NOP_TO_RESET_CYCLES = 40,
@@ -867,7 +935,7 @@ enum {
      * CD_init's last acknowledge, to the caller's next call (SoundSystemInit:
      * DuckStation's Demute acknowledge to SsSetSerialAttr 3167 clocks, less
      * CD_CW_ACK_CYCLES) [mark] */
-    CD_INITVOL_CYCLES = 547,
+    CD_INITVOL_CYCLES = 547 - 7, // (the Demute's acknowledge to SsStart's last RCNT2 write 7080 clocks, DUCKSTATION_CD_TRACE)
     /* CdControl, CdControlF, CdControlB around CD_cw: before it, and from
      * its return after an acknowledge to the caller [mark] */
     CD_CONTROL_CYCLES = 73,
@@ -911,9 +979,13 @@ enum {
      * exception on DuckStation (CD_CW_ACK_CYCLES, CD_INITVOL_CYCLES as
      * charged) [mark] */
     CD_SEARCH_NEWMEDIA_CYCLES = 345 - 129 - 12,
-    CD_SEARCH_PVD_CYCLES = 2359 + 58,
-    CD_SEARCH_PATH_TABLE_CYCLES = 1653 + 314,
-    CD_SEARCH_DIR_CYCLES = 14047 - 845 + 73,
+    /* (remeasured from CdReadSync's look's return, DSF_MARKS 0x8008f158,
+     * CdControl: 2397, 1691 and 18927 with the compares and the found
+     * name's return, CD_READ_SYNC_RETURN_CYCLES of each CdReadSync's; they
+     * had been fitted 58, 314 and 73 longer) [mark] */
+    CD_SEARCH_PVD_CYCLES = 2397 - 46,
+    CD_SEARCH_PATH_TABLE_CYCLES = 1691 - 46,
+    CD_SEARCH_DIR_CYCLES = 18927 - 46 - 4 * 747 - 2699,
     CD_SEARCH_CMP_CYCLES = 747,
     CD_SEARCH_FOUND_CYCLES = 2699,
     /* ... and a search in the directory already cached (CdAudioFindStreamFile's

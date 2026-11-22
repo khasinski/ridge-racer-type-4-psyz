@@ -42,7 +42,7 @@ static volatile int read_pause_irq_owed;
 static void read_pause_irq(void) {
     if (read_pause_irq_owed) {
         read_pause_irq_owed = 0;
-        Psyz_CdCpu(Psyz_CdDoneIrqCycles() + CD_READ_PAUSE_CALLBACK_CYCLES);
+        Psyz_CdCpu(CD_READ_PAUSE_CALLBACK_CYCLES);
     }
 }
 #endif
@@ -59,6 +59,9 @@ static void cd_read_restore_sync(u_char intr, u_char* result) {
 static void cd_read_end(void) {
     CdSyncCallback(cd_read_restore_sync);
     CdControlF(CdlPause, NULL);
+#ifdef __psyz
+    Psyz_CdChargeDone(CD_READ_PAUSE_DONE_CLOCKS);
+#endif
     read_pause_pending = 1;
 }
 
@@ -307,13 +310,38 @@ int CdRead(int sectors, u_long* buf, int mode) {
     return cd_read_retry(0) > 0;
 }
 
+#ifdef __psyz
+/* A vblank's exception that comes in CdReadSync's polling takes less of
+ * the CPU's time than elsewhere (CD_READ_SYNC_VBLANK_SAVED_CYCLES). */
+static void read_sync_poll(unsigned cycles) {
+    Psyz_KernelExceptionContext(-(int)CD_READ_SYNC_VBLANK_SAVED_CYCLES);
+    Psyz_CdPollCycles(cycles);
+    Psyz_KernelExceptionContext(0);
+}
+
+/* ... and VSync(-1)'s second read of the hblank counter, which it repeats
+ * (18 clocks) when an hblank comes between the two: about 1% of
+ * CdReadSync(0)'s turns (two calls) and 2% of CdReadSync(1)'s calls
+ * (four) on DuckStation, charged as their mean (CD_READ_SYNC_*_RETRY) */
+static unsigned read_sync_part; // 1/100000 clocks
+static unsigned read_sync_retry(unsigned part) {
+    read_sync_part += part;
+    unsigned whole = read_sync_part / 100000;
+    read_sync_part %= 100000;
+    return whole;
+}
+#endif
+
 int CdReadSync(int mode, u_char* result) {
     int ret;
 
     do {
 #ifdef __psyz
-        // The drive reads on while the caller polls.
-        Psyz_CdPollCycles(CD_READ_SYNC_TURN_CYCLES);
+        // The drive reads on while the caller polls: a turn up to its look
+        // at the read's state (CdReadSync(0)'s at the Pause's flag)
+        read_sync_poll(CD_READ_SYNC_TURN_CYCLES +
+                       read_sync_retry(mode ? CD_READ_SYNC_CALL_RETRY
+                                            : CD_READ_SYNC_TURN_RETRY));
 #endif
         CD_LOCK();
         if (VSync(-1) > ReadAttr.start_time + 1200) {
@@ -331,14 +359,19 @@ int CdReadSync(int mode, u_char* result) {
 
 #ifdef __psyz
     // the Pause may complete meanwhile: its look comes after CdReady
-    Psyz_CdPollCycles(CD_READ_SYNC_END_CYCLES);
+    read_sync_poll(mode ? CD_READ_SYNC_POLL_END_CYCLES : CD_READ_SYNC_END_CYCLES);
 #endif
     CdReady(1, result);
     if (ret == 0 && read_pause_pending) {
         ret = 1;
     }
 #ifdef __psyz
-    Psyz_CdCpu(CD_READ_SYNC_RETURN_CYCLES);
+    // (a call after the read's last sector, while its Pause is pending,
+    // takes LIBCD's other path back: CD_READ_SYNC_PENDING_CYCLES more)
+    Psyz_CdCpu(CD_READ_SYNC_RETURN_CYCLES + (ret == 1 && mode && ReadAttr.remaining == 0 &&
+                                                     read_pause_pending
+                                                 ? CD_READ_SYNC_PENDING_CYCLES
+                                                 : 0));
 #endif
 #ifdef __psyz
     if (ret == 0) {

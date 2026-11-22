@@ -898,6 +898,14 @@ void Psyz_KernelRomCode(int enter) { rom_code += enter ? 1 : -1; }
 
 static unsigned RomRefetch(void) { return rom_code > 0 ? BIOS_ROM_IRQ_REFETCH_CYCLES : 0; }
 
+/* A loop whose interrupted code makes a vblank's or a root counter's
+ * exception take more or less of the CPU's time than KERNEL_IRQ_CYCLES
+ * (LIBCD's CdReadSync polling, CD_READ_SYNC_VBLANK_SAVED_CYCLES) */
+static int exception_context, shared_exception_context;
+void Psyz_KernelExceptionContext(int clocks) { exception_context = clocks; }
+/* ... and a blank served inside another interrupt's exception there */
+void Psyz_KernelSharedExceptionContext(int clocks) { shared_exception_context = clocks; }
+
 /* The root counter or vblank handler running (ServiceLine): its exception's
  * time and the handler time owed when it began, for where its writes land
  * (Psyz_KernelHandlerPositionNs); line_debt_base -1 outside one. */
@@ -924,7 +932,9 @@ static void ServiceLine(int line, uint64_t at_ns) {
      * clocks after a blank 1100 clocks into a root counter's exception,
      * two-cards vsync 904, where a separate exception after it would end
      * at 5824) [exc] */
-    if (line == IRQ_VBLANK && InOpenException(at_ns)) {
+    int shared_vblank = line == IRQ_VBLANK && InOpenException(at_ns);
+    entry += shared_vblank ? shared_exception_context : exception_context;
+    if (shared_vblank) {
         entry -= SHARED_EXCEPTION_SAVED_CYCLES;
         if (Psyz_KernelBlankInDispatch(at_ns, BIOS_CHAIN_CARD_TEST_CLOCKS,
                                        LIBETC_DISPATCH_EXIT_CLOCKS)) {

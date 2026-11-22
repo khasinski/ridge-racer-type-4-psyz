@@ -9,6 +9,8 @@ extern s32 _spu_zerobuf[];
 void Psyz_SpendCycles(unsigned cycles);
 uint64_t Psyz_KernelNowNs(void);
 void Psyz_KernelDispatch(uint64_t at_ns, unsigned cycles, unsigned charged);
+void Psyz_KernelExceptionContext(int clocks);
+void Psyz_KernelSharedExceptionContext(int clocks);
 /* The SPU DMA rate (spu.c), the setup of each chunk (_spu_t's waits, the
  * DMA event) and the DMA interrupt's exception at its end:
  * SPU_DMA_CLOCKS_PER_BYTE, SPU_CLEAR_*. */
@@ -60,7 +62,10 @@ long SpuClearReverbWorkArea(long rev_mode) {
         // the chunk's setup and DMA take their PS1 time, then the DMA
         // interrupt's exception, in which a blank is served (DuckStation:
         // one 327 clocks into it adds 606 clocks, a separate vblank
-        // exception 2387)
+        // exception 2387: SPU_CLEAR_*_VBLANK_SAVED_CYCLES less than the
+        // kernel's elsewhere)
+        Psyz_KernelExceptionContext(-(int)SPU_CLEAR_VBLANK_SAVED_CYCLES);
+        Psyz_KernelSharedExceptionContext(-(int)SPU_CLEAR_SHARED_VBLANK_SAVED_CYCLES);
         {
             // signed: below 6 bytes the interrupt's part exceeds the rest
             long cycles = (long)size * SPU_DMA_CLOCKS_PER_BYTE -
@@ -71,6 +76,8 @@ long SpuClearReverbWorkArea(long rev_mode) {
         Psyz_KernelDispatch(Psyz_KernelNowNs(), SPU_CLEAR_DMA_IRQ_CLOCKS,
                             SPU_CLEAR_DMA_IRQ_CLOCKS);
         _spu_DmaDone();
+        Psyz_KernelExceptionContext(0);
+        Psyz_KernelSharedExceptionContext(0);
 #else
         _spu_t(2, dstAddr);
         _spu_t(1);
@@ -80,6 +87,9 @@ long SpuClearReverbWorkArea(long rev_mode) {
         length -= 0x400;
         dstAddr += 0x400;
     }
+#ifdef __psyz
+    Psyz_SpendCycles(SPU_CLEAR_RETURN_CYCLES);
+#endif
     if (transmodeCleared != 0) {
         _spu_transMode = oldTransmode;
     }
