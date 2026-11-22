@@ -2354,9 +2354,7 @@ int CD_cw(u_char com, u_char* param, u_char* result, s32 arg3) {
     drive_schedule();
     uint64_t ack = command_ack_ns;
     unsigned result_clocks = (cd_result_bytes(com) - 1) * CD_RESULT_BYTE_CLOCKS;
-    /* (the XA player's GetlocP, every race frame, is held: the race frames'
-     * CPU model was fitted without its 3104 clocks, docs/TECH_DEBT.md F13) */
-    if (arg3 && !drive_is_instant() && com != CdlGetlocP) {
+    if (arg3 && !drive_is_instant()) {
         unwaited_ack_ns = ack;
         unwaited_ack_clocks = CD_UNWAITED_ACK_CLOCKS + result_clocks +
                               (com == CdlReadN || com == CdlReadS ? CD_UNWAITED_READ_ACK_CLOCKS : 0);
