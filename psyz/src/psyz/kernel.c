@@ -429,14 +429,19 @@ static void ServiceStalls(uint64_t now_ns) {
     }
 }
 
-/* The stalls still due before end_ns, taken out of the ring and returned:
- * a DMA interrupt's handler that starts the transfer (the GPU queue's) has
- * them in its exception's own time. */
-unsigned Psyz_KernelTakeStallsBeforeNs(uint64_t end_ns) {
+/* The stalls that come while an exception of `cycles` from at_ns runs, taken
+ * out of the ring and returned: each one lengthens the exception, so a
+ * later one that then falls inside it is taken too (a DMA interrupt's
+ * handler that starts a queued transfer has that transfer's slices while
+ * it runs in its own time; the slices the GPU's FIFO holds back to later
+ * come at their times). */
+unsigned Psyz_KernelTakeStallsInWindow(uint64_t at_ns, unsigned cycles) {
     unsigned taken = 0;
-    while (stall_len && stalls[stall_head].at_ns < end_ns) {
+    uint64_t end = at_ns + (uint64_t)cycles * 1000000000u / SYSTEM_CLOCK_HZ;
+    while (stall_len && stalls[stall_head].at_ns < end) {
         NoteStall(stalls[stall_head].at_ns, stalls[stall_head].clocks);
         taken += stalls[stall_head].clocks;
+        end += (uint64_t)stalls[stall_head].clocks * 1000000000u / SYSTEM_CLOCK_HZ;
         stall_head = (stall_head + 1) % STALLS_MAX;
         stall_len--;
     }

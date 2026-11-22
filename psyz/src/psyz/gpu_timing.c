@@ -591,10 +591,14 @@ static void QueueInterrupt(void) {
     }
     unsigned chain = Psyz_CardChainInstalled() ? BIOS_CARD_CHAIN_CYCLES : 0;
     // the queued transfer's DMA, which its callback starts, stalls the CPU
-    // in the exception
-    unsigned total = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain +
-                     GPU_QUEUE_CALLBACK_CYCLES +
-                     Psyz_KernelTakeStallsBeforeNs(ns_of(d.dma_free) + 1);
+    // in the exception while it runs; a busy GPU's full FIFO holds the rest
+    // of the list back to its command events, after the exception (Versus:
+    // the second viewport's list is drawn while the CPU builds the first's
+    // objects, DuckStation's slices running through them; all of the list
+    // taken here had them 1-3k short there and this exception 16k long)
+    unsigned own = KERNEL_IRQ_CYCLES + DMA_IRQ_DISPATCH_CYCLES + chain +
+                   GPU_QUEUE_CALLBACK_CYCLES;
+    unsigned total = own + Psyz_KernelTakeStallsInWindow(Psyz_KernelNowNs(), own);
     Psyz_KernelDeviceIrq(QueueCallback, DEVICE_IRQ_TO_HANDLER_CYCLES,
                          total - DEVICE_IRQ_TO_HANDLER_CYCLES,
                          DMA_DISPATCH_EXIT_CLOCKS);
