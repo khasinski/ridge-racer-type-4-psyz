@@ -99,6 +99,7 @@ static struct {
     int answered; // the controller ACKed the address byte
     int halfwords; // of the packet received to its end, else 0
     int refused;   // the controller did not ACK the command byte
+    int gates;     // the actuator gates _padAllocGates opened (bit per byte)
 } exchanged[2];
 
 static void Send(u8 byte) {
@@ -701,6 +702,12 @@ static int Exchange(Channel* c, int port) {
         return -4;
     // _padTransferPacket
     AllocGates(c);
+    // the gates of a DualShock's actuators, which libpad matched to its
+    // PadSetAct buffer (not a digital pad's, all open)
+    if (c->pending && c->data28) {
+        for (int j = 0; j < 6; j++)
+            exchanged[port].gates |= GATES(c)[j] ? 1 << j : 0;
+    }
     while (bytes_left >= 2) {
         if (slot_index[port ^ 1] < 0)
             break;
@@ -779,6 +786,20 @@ int Psyz_PadDriverRunning(void) { return com_started; }
 
 int Psyz_LibpadRefused(int port) {
     return port >= 0 && port <= 1 && exchanged[port].refused;
+}
+
+/* The time an exchange's open actuator gates add to libpad's handler: on
+ * DuckStation a DualShock's vblank exception is 47 clocks longer with its
+ * small motor's gate open, 90 with the large motor's, 146 with both (the
+ * Time Attack race's rumble: VSync's return to PutDispEnv against the
+ * port's in 760 race fields, by the gates the port opened in the same
+ * fields, ta-course4; DSF_MARKS PutDispEnv, DSF_EXC=0) [mark] */
+unsigned Psyz_LibpadGateCycles(int port) {
+    if (port < 0 || port > 1)
+        return 0;
+    int g = exchanged[port].gates;
+    return (g & 1 ? LIBPAD_GATE_SMALL_CYCLES : 0) + (g & 2 ? LIBPAD_GATE_LARGE_CYCLES : 0) +
+           ((g & 3) == 3 ? LIBPAD_GATES_BOTH_CYCLES : 0);
 }
 
 int Psyz_LibpadExchanged(int port, int* halfwords) {

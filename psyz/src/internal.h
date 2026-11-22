@@ -270,6 +270,8 @@ int Psyz_LibpadExchanged(int port, int* halfwords);
 // Whether that port's controller refused the command byte at the latest
 // vblank (the exchange stopped there).
 int Psyz_LibpadRefused(int port);
+// The handler time of the actuator gates that port's exchange opened.
+unsigned Psyz_LibpadGateCycles(int port);
 // The controllers' side of the serial exchange (pad.c): the byte a
 // controller answers to @p in with the input of @p frame, and whether it
 // ACKs it; deselecting the port ends its command.

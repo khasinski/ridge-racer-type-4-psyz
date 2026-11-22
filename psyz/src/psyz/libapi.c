@@ -201,11 +201,11 @@ void Psyz_VSyncBlank(void) {
                  : Psyz_CardDriverRunning() && card_turn ? CARD_VBLANK_TURN_CYCLES
                                                          : 0) +
         (pad_exchange
-             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) -
+             ? LIBPAD_VBLANK_CYCLES + PacketCycles(0) + Psyz_LibpadGateCycles(0) -
                    (!Psyz_LibpadExchanged(0, NULL) ? LIBPAD_EMPTY_PORT1_SAVED_CYCLES : 0) -
                    (Psyz_LibpadRefused(0) ? LIBPAD_REFUSED_COMMAND_SAVED_CYCLES : 0) +
                    (Psyz_LibpadExchanged(1, NULL)
-                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) -
+                        ? LIBPAD_VBLANK_PORT2_CYCLES + PacketCycles(1) + Psyz_LibpadGateCycles(1) -
                               (Psyz_LibpadRefused(1) ? LIBPAD_REFUSED_COMMAND_PORT2_SAVED_CYCLES
                                                      : 0)
                         : 0)
@@ -370,6 +370,7 @@ int VSync(int mode) {
     if (PadTrace())
         fprintf(stderr, "pad: vsync return handler %llu ns wait %u lines\n",
                 (unsigned long long)handler_ns, wait_lines);
+    int waited_field = !(handler_ns > wait_ns);
     if (handler_ns > wait_ns) {
         /* the vblank's exception: an interrupt that comes before it ends
          * is served in it and lengthens it, where a poll of GPUSTAT takes
@@ -385,7 +386,13 @@ int VSync(int mode) {
         vsync_return_lines = (unsigned)((wait_ns + LineNs() / 2) / LineNs());
     }
     if (Psyz_KernelOfflineClock()) {
-        Psyz_SpendCycles(VSYNC_RETURN_CYCLES);
+        /* interlaced: the loop on GPUSTAT's field bit after the count's; it
+         * sees the change it waited for sooner than the exception's return,
+         * or it reads the bit once more after the exception */
+        Psyz_SpendCycles(!interlace      ? VSYNC_RETURN_CYCLES
+                         : waited_field ? VSYNC_FIELD_WAIT_RETURN_CYCLES
+                                        : VSYNC_RETURN_CYCLES +
+                                              VSYNC_FIELD_CHECK_CYCLES);
     }
     Psyz_CdServiceDrive();
     /* Keep periodic waits on their scheduled blank. Native presentation can

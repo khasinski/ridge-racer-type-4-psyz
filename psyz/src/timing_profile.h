@@ -225,10 +225,20 @@ enum {
      * PutDispEnv) */
     /* ... on the unmarked runs PutDrawEnv's packet DMA (below) starts 6
      * late against DuckStation's DUCKSTATION_DMA_TRACE with this 110, its
-     * entry about 17 late, in the menus' frames [trace]; 14 less puts the
-     * unformatted card's raw reads a vblank off from field 2604 (the card
-     * menu's own costs were fitted with it): kept */
+     * entry about 17 late, in the menus' frames [trace]: the 480-line
+     * menus' field wait below (and DrawOTag's part after its DMA) */
     VSYNC_RETURN_CYCLES = 110,
+    /* In a 480-line interlaced mode VSync then waits for GPUSTAT's field
+     * bit to change: from the blank to the caller's next call (PutDispEnv)
+     * 125833 clocks on DuckStation where it waits 58 lines (125755 of
+     * them), 31 less than the return above gave, in every menu (options,
+     * gp-rules: 5000 frames, 28-34 apart); where the exception's return
+     * comes after the change the bit's look takes 16 more than a
+     * non-interlaced mode's return (the 480-line menus' frames 18 clocks
+     * longer than the port's in the median, the race's and the 240-line
+     * menus' 2) [mark] (DSF_MARKS PutDispEnv, DSF_EXC=0) */
+    VSYNC_FIELD_WAIT_RETURN_CYCLES = 110 - 31,
+    VSYNC_FIELD_CHECK_CYCLES = 16,
     /* A VSync(1) query in the game's frame loop (do {} while (VSync(1) <
      * threshold)): 99 clocks from one call to the next, and from the last
      * to its VSync(0) (DuckStation's exact timing, DSF_MARKS VSync: the
@@ -272,6 +282,10 @@ enum {
      * (25-clock SIO phase steps; DSF_EXC, the opening movie, its wait loop
      * and the menus), 3200 gave 26703 [exc] */
     LIBPAD_HALFWORD_CYCLES = 3253,
+    /* the actuator gates' (libpad.c Psyz_LibpadGateCycles) [mark] */
+    LIBPAD_GATE_SMALL_CYCLES = 47,
+    LIBPAD_GATE_LARGE_CYCLES = 90,
+    LIBPAD_GATES_BOTH_CYCLES = 9,
     /* A vblank that arrives while another interrupt's exception runs
      * (libapi.c Psyz_VSyncBlank): the BIOS priority chains test for it
      * this long after that interrupt, libpad's verifier (_padIsVsync) and
@@ -420,14 +434,17 @@ enum {
     /* DrawOTag to an idle GPU: 430-441 clocks on DuckStation's exact
      * timing (the frame loop's, every menu frame; DSF_MARKS DrawOTag:ret,
      * 452 with the mark's stub), 468 charged before [mark] */
-    DRAW_OTAG_CYCLES = 430,
+    /* ... of it the part after the list DMA's first slice, which stalls
+     * the CPU (42 clocks in the menus, 72 in the race), is 79: its return
+     * comes 82 after that slice's end on DuckStation in the menus and the
+     * race alike (DSF_MARKS DrawOTag:ret with DUCKSTATION_DMA_TRACE,
+     * gp-rules fields 1505 and 12700; the port's 110 put the menus' frames
+     * 34 clocks late at PadUpdate) [trace] */
+    DRAW_OTAG_CYCLES = 320 + 79,
     /* its entry to the list DMA's start: 324 clocks from its mark to the
      * channel's start (DMAT) on DuckStation in 3267 of 3300 calls (above),
      * 4 of them the stub's, the rest to its return (the GPU model's 317 +
-     * 113) [trace]. DrawOTag's entry to the first ClearOTagR's (whose DMA
-     * comes 99 after its mark) is 14-26 shorter on DuckStation than with
-     * 430, but 416 puts the unformatted card's reads a vblank off as the
-     * VSync's return does (above): kept */
+     * 113) [trace] */
     DRAW_OTAG_TO_EXEC_CYCLES = 320,
     /* A DrawOTag behind a list whose DMA is still in progress, which
      * _addque2 queues: the frame loop's second DrawOTag (the race's and
@@ -435,7 +452,8 @@ enum {
      * takes 527 and 522 clocks on DuckStation (a Grand Prix's results and
      * race, entry marks on the frame loop's calls, 7 clocks a stub), the
      * port's 426 and 446 with an idle DrawOTag's charge [mark] */
-    DRAW_OTAG_QUEUED_CYCLES = 90,
+    /* (its total kept: 90 with the 110 after the exec above) */
+    DRAW_OTAG_QUEUED_CYCLES = 90 + 31,
     /* ClearOTagR besides its DMA: 1030 clocks for the frame loop's 704
      * entries (DSF_MARKS ClearOTagR:ret, 1041 with the mark's stub), 1078
      * charged before [mark] */
