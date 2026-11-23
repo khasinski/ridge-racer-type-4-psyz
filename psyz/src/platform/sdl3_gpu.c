@@ -230,7 +230,12 @@ static SDL_GPUTexture* clut_cache = NULL;
 static u32 clut_cache_reg = 0xFFFFFFFFu;
 static bool clut_cache_8bit;
 static unsigned clut_cache_row, clut_cache_loads; /* loads since a flush */
+/* The scaled target's copy for semi-transparent primitives: not made when
+ * the shader reads the destination itself (destination_fetch). */
 static SDL_GPUTexture* scaled_blend_sample = NULL;
+/* A scaled VRAM copy's scratch (MoveImage) without scaled_blend_sample. */
+static SDL_GPUTexture* scaled_move_scratch;
+static Uint32 scaled_move_scratch_w, scaled_move_scratch_h;
 static SDL_GPUSampler* vram_sampler = NULL;
 static SDL_GPUTexture* scaled_vram_render = NULL;
 /* Physical raster scale; public resolution excludes the SSAA factor. */
@@ -265,25 +270,29 @@ static bool set_geometry_correction = false;
 static unsigned pgxp_trace_budget;
 static unsigned long long pgxp_mixed_polygons, pgxp_none_polygons;
 static unsigned long long pgxp_valid_polygons, pgxp_fallback_polygons, pgxp_nonfinite_polygons;
-static SDL_GPUBuffer* vbuf = NULL;
-static SDL_GPUBuffer* ibuf = NULL;
+/* Batches are uploaded one after another into the vertex and index buffers
+ * of the ring's generation and vtx_transfer (indices after MAX_VERTEX_COUNT
+ * vertices in the transfer buffer). A batch that does not fit starts the
+ * next generation at 0 (the transfer buffer is cycled then: cycling on every
+ * batch made SDL keep one full-size buffer per batch in flight, and those
+ * pools never shrink). The generations are buffers of their own, not SDL
+ * cycles of one: a batch whose native drawing is deferred (NativeDefer) is
+ * drawn later from its generation's buffers, which stay as they are until
+ * the ring comes round to them again (RING_GENERATIONS wraps: by then the
+ * wrap throttle has waited for every earlier use of them). */
+#define RING_WRAPS_IN_FLIGHT 3
+#define RING_GENERATIONS (RING_WRAPS_IN_FLIGHT + 1)
+static SDL_GPUBuffer* vbufs[RING_GENERATIONS];
+static SDL_GPUBuffer* ibufs[RING_GENERATIONS];
+static unsigned ring_gen;
 static SDL_GPUBuffer* clear_vbuf = NULL;
 static SDL_GPUTransferBuffer* vtx_transfer = NULL;
-/* Batches are uploaded one after another into vbuf/ibuf and vtx_transfer
- * (indices after MAX_VERTEX_COUNT vertices in the transfer buffer). Only a
- * batch that does not fit starts again at 0 and cycles the buffers, so SDL
- * allocates a new full-size buffer only when the previous one is still in use
- * at a wrap. Cycling on every batch made SDL keep one full-size buffer per
- * batch in flight; those pools never shrink (100+ GB with small batches). */
 static Uint32 ring_vertex_pos, ring_index_pos;
 static bool ring_restart = true;
 static void RingWrapThrottle(void);
-/* vbuf/ibuf still to cycle: a wrap reserved only transfer space (a fill's
- * quad goes to clear_vbuf), so the next batch upload cycles them */
-static bool ring_cycle_buffers;
+static void NativeRingReuse(unsigned gen);
 /* Space for a batch in the ring; true when the transfer buffer is to be
- * cycled (mapped with cycle). RingCycleBuffers then says whether the
- * batch's vbuf/ibuf uploads cycle. */
+ * cycled (mapped with cycle): the ring starts its next generation. */
 static bool RingReserve(Uint32 vertices, Uint32 indices, Uint32* vertex_at, Uint32* index_at) {
     const bool cycle = ring_restart || ring_vertex_pos + vertices > MAX_VERTEX_COUNT ||
                        ring_index_pos + indices > MAX_INDEX_COUNT;
@@ -291,17 +300,13 @@ static bool RingReserve(Uint32 vertices, Uint32 indices, Uint32* vertex_at, Uint
         RingWrapThrottle();
         ring_vertex_pos = ring_index_pos = 0;
         ring_restart = false;
-        ring_cycle_buffers = true;
+        ring_gen = (ring_gen + 1) % RING_GENERATIONS;
+        NativeRingReuse(ring_gen);
     }
     *vertex_at = ring_vertex_pos;
     *index_at = ring_index_pos;
     ring_vertex_pos += vertices;
     ring_index_pos += indices;
-    return cycle;
-}
-static bool RingCycleBuffers(void) {
-    const bool cycle = ring_cycle_buffers;
-    ring_cycle_buffers = false;
     return cycle;
 }
 static SDL_GPUTransferBuffer* tex_upload_transfer = NULL;
@@ -338,6 +343,38 @@ static SDL_GPUCommandBuffer* pending_cmd = NULL;
  * available for presentation/overlays and never roll its heaps mid-draw. */
 static unsigned command_descriptor_limit, command_descriptors;
 static bool descriptor_rollover_reported;
+static unsigned long long command_rollovers;
+
+/* The deferred native draws (NativeDefer, below). */
+static DrawNativeStats native_stats;
+static void NativeRead(SDL_Rect r);
+static void NativeWrite(SDL_Rect r, bool overwrite);
+static void NativeDrawAll(void);
+static void NativeDiscard(void);
+static void NativePresent(void);
+static void NativeClutReuse(Uint32 load);
+static void NativeCover(SDL_Rect cover);
+/* PSYZ_NATIVE_VERIFY=1 (diagnostics): every native draw also goes at once
+ * into vram_verify, uploads, fills and copies are copied there, and each
+ * native read that drew queued draws or rebuilt pixels, and each download,
+ * compares the region with it (VerifyCompare; counts in the log). */
+static SDL_GPUTexture* vram_verify;
+static void VerifySync(SDL_Rect r);
+static void VerifyCompare(SDL_Rect r, const char* why);
+static Uint8 verify_rebuilt_tile[VRAM_H / 16][VRAM_W / 16];
+static SDL_Rect IntersectRects(SDL_Rect a, SDL_Rect b);
+/* What the batch being built reads (texels, bounds) and the load number of
+ * its oldest CLUT cache row (0: none). */
+static SDL_Rect batch_read;
+static Uint32 batch_clut_oldest;
+/* batch_drawn does not bound what the batch draws (widescreen moves and
+ * widens primitives; a packet it could not read) */
+static bool batch_drawn_unknown;
+/* The largest rectangle an opaque untextured rectangle of the batch fills
+ * (no mask check, no widescreen): the native pixels there before the batch
+ * do not matter any more (NativeCover). */
+static SDL_Rect batch_cover;
+static Uint32 clut_cache_row_load;
 
 static SDL_GPUCommandBuffer *AcquireCmd(void);
 static SDL_GPUTexture *GetRenderTarget(void);
@@ -760,7 +797,6 @@ static bool SubmitCmd(void) {
  * reads them and keeps every buffer it cycled in; presents are fenced
  * (SubmitFrame), and this bounds those buffers also while a game draws or
  * loads without presenting. */
-#define RING_WRAPS_IN_FLIGHT 3
 static SDL_GPUFence* ring_wrap_fences[RING_WRAPS_IN_FLIGHT];
 static unsigned ring_wrap_index;
 static void RingWrapThrottle(void) {
@@ -824,6 +860,7 @@ void Psyz_GpuResetSpriteAtlases(void) {
     /* A room transition may still have queued draws reading the old cells.
      * Retire those reads before another room uploads into the same storage. */
     Draw_FlushBuffer();
+    NativeDrawAll();
     if (!RetireGpu()) return; /* preserve all atlas keys/cells on uncertainty */
     sprite_atlas_count=0;
     sprite_atlas_cells=0;
@@ -942,6 +979,8 @@ int Psyz_GpuLoadSpriteAtlas(uint64_t key, const char *filename) {
         }
     }
     SDL_UnmapGPUTransferBuffer(device,upload);SDL_DestroySurface(rgba);
+    Draw_FlushBuffer();
+    NativeDrawAll(); /* queued draws read the atlas as it is */
     SDL_GPUCommandBuffer *cmd=AcquireCmd();
     if (!cmd) { SDL_ReleaseGPUTransferBuffer(device,upload);return -1; }
     SDL_GPUCopyPass *copy=SDL_BeginGPUCopyPass(cmd);
@@ -984,6 +1023,7 @@ static SDL_GPUCommandBuffer* ReserveDrawDescriptors(unsigned count) {
         (count > command_descriptor_limit ||
          command_descriptors > command_descriptor_limit - count)) {
         SubmitCmd();
+        ++command_rollovers;
         if (!descriptor_rollover_reported) {
             INFOF("GPU descriptor batch rollover (budget %u)",
                   command_descriptor_limit);
@@ -995,6 +1035,15 @@ static SDL_GPUCommandBuffer* ReserveDrawDescriptors(unsigned count) {
         command_descriptors += count;
     return cmd;
 }
+
+unsigned Draw_SetCommandDescriptorLimit(unsigned limit) {
+    const unsigned previous = command_descriptor_limit;
+    if (device)
+        Draw_FlushBuffer();
+    command_descriptor_limit = limit;
+    return previous;
+}
+unsigned long long Draw_GetCommandRollovers(void) { return command_rollovers; }
 
 // FIX: the fence mechanic solves a out-of-memory on Windows when running a
 // game with SDL_VIDEODRIVER=offscreen and PSYZ_VSYNC_LIMITLESS when the CPU
@@ -1306,6 +1355,11 @@ static bool CreateGpuResources(void) {
         .num_levels = 1,
     };
     vram_render = SDL_CreateGPUTexture(device, &render_info);
+    {
+        const char* verify = SDL_getenv("PSYZ_NATIVE_VERIFY");
+        if (verify && *verify == '1')
+            vram_verify = SDL_CreateGPUTexture(device, &render_info);
+    }
     SDL_GPUTextureCreateInfo sample_info = render_info;
     sample_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
     vram_sample = SDL_CreateGPUTexture(device, &sample_info);
@@ -1337,18 +1391,24 @@ static bool CreateGpuResources(void) {
         .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
         .size = MAX_VERTEX_COUNT * sizeof(Vertex),
     };
-    vbuf = SDL_CreateGPUBuffer(device, &vbuf_info);
     const SDL_GPUBufferCreateInfo ibuf_info = {
         .usage = SDL_GPU_BUFFERUSAGE_INDEX,
         .size = MAX_INDEX_COUNT * sizeof(*index_buf),
     };
-    ibuf = SDL_CreateGPUBuffer(device, &ibuf_info);
+    for (unsigned g = 0; g < RING_GENERATIONS; ++g) {
+        vbufs[g] = SDL_CreateGPUBuffer(device, &vbuf_info);
+        ibufs[g] = SDL_CreateGPUBuffer(device, &ibuf_info);
+        if (!vbufs[g] || !ibufs[g]) {
+            ERRORF("SDL_CreateGPUBuffer: %s", SDL_GetError());
+            return false;
+        }
+    }
     const SDL_GPUBufferCreateInfo clear_vbuf_info = {
         .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
         .size = 4 * sizeof(Vertex),
     };
     clear_vbuf = SDL_CreateGPUBuffer(device, &clear_vbuf_info);
-    if (!vbuf || !ibuf || !clear_vbuf) {
+    if (!clear_vbuf) {
         ERRORF("SDL_CreateGPUBuffer: %s", SDL_GetError());
         return false;
     }
@@ -1816,8 +1876,10 @@ static bool CreateScaledVramTarget(unsigned n) {
     SDL_GPUTexture *render = SDL_CreateGPUTexture(device, &info);
     SDL_GPUTextureCreateInfo sample_info = info;
     sample_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-    SDL_GPUTexture *sample = render ? SDL_CreateGPUTexture(device, &sample_info) : NULL;
-    if (!render || !sample) {
+    SDL_GPUTexture *sample = render && !destination_fetch
+                                 ? SDL_CreateGPUTexture(device, &sample_info)
+                                 : NULL;
+    if (!render || (!sample && !destination_fetch)) {
         ERRORF("scaled VRAM texture creation failed (%dx): %s", n, SDL_GetError());
         if (render) SDL_ReleaseGPUTexture(device, render);
         if (sample) SDL_ReleaseGPUTexture(device, sample);
@@ -1827,6 +1889,9 @@ static bool CreateScaledVramTarget(unsigned n) {
     }
     if (scaled_vram_render) SDL_ReleaseGPUTexture(device, scaled_vram_render);
     if (scaled_blend_sample) SDL_ReleaseGPUTexture(device, scaled_blend_sample);
+    if (scaled_move_scratch) SDL_ReleaseGPUTexture(device, scaled_move_scratch);
+    scaled_move_scratch = NULL;
+    scaled_move_scratch_w = scaled_move_scratch_h = 0;
     scaled_vram_render = render;
     scaled_blend_sample = sample;
     SDL_WaitForGPUIdle(device);
@@ -1948,6 +2013,8 @@ static void ApplyPendingInternalRes(void) {
         return;
     }
     Draw_FlushBuffer(); // render pending prims with the old multiplier
+    /* the native VRAM complete (from the old scaled target where needed) */
+    NativeRead((SDL_Rect){0, 0, VRAM_W, VRAM_H});
     if (want_scaled && (n != internal_res || !have_scaled)) {
         bool created = CreateScaledVramTarget(n);
         if (!created) {
@@ -1995,6 +2062,11 @@ static void ApplyPendingInternalRes(void) {
         if (scaled_blend_sample) {
             SDL_ReleaseGPUTexture(device, scaled_blend_sample);
             scaled_blend_sample = NULL;
+        }
+        if (scaled_move_scratch) {
+            SDL_ReleaseGPUTexture(device, scaled_move_scratch);
+            scaled_move_scratch = NULL;
+            scaled_move_scratch_w = scaled_move_scratch_h = 0;
         }
     }
     if (!set_antialiasing && antialias_display) {
@@ -2494,6 +2566,7 @@ static void PlatformBackend_Present(void) {
     }
 
     DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    NativePresent();
     OutputSizeChanged();
     ApplyPendingInternalRes();
     if (native_rasterizer)
@@ -2798,6 +2871,10 @@ static void ReleaseGpuDevice(void) {
         SDL_ReleaseGPUTexture(device, vram_render);
         vram_render = NULL;
     }
+    if (vram_verify) {
+        SDL_ReleaseGPUTexture(device, vram_verify);
+        vram_verify = NULL;
+    }
     if (vram_sample) {
         SDL_ReleaseGPUTexture(device, vram_sample);
         vram_sample = NULL;
@@ -2814,6 +2891,11 @@ static void ReleaseGpuDevice(void) {
         SDL_ReleaseGPUTexture(device, scaled_blend_sample);
         scaled_blend_sample = NULL;
     }
+    if (scaled_move_scratch) {
+        SDL_ReleaseGPUTexture(device, scaled_move_scratch);
+        scaled_move_scratch = NULL;
+        scaled_move_scratch_w = scaled_move_scratch_h = 0;
+    }
     if (scaled_vram_render) {
         SDL_ReleaseGPUTexture(device, scaled_vram_render);
         scaled_vram_render = NULL;
@@ -2822,13 +2904,13 @@ static void ReleaseGpuDevice(void) {
         SDL_ReleaseGPUSampler(device, vram_sampler);
         vram_sampler = NULL;
     }
-    if (vbuf) {
-        SDL_ReleaseGPUBuffer(device, vbuf);
-        vbuf = NULL;
-    }
-    if (ibuf) {
-        SDL_ReleaseGPUBuffer(device, ibuf);
-        ibuf = NULL;
+    NativeDiscard();
+    for (unsigned g = 0; g < RING_GENERATIONS; ++g) {
+        if (vbufs[g])
+            SDL_ReleaseGPUBuffer(device, vbufs[g]);
+        if (ibufs[g])
+            SDL_ReleaseGPUBuffer(device, ibufs[g]);
+        vbufs[g] = ibufs[g] = NULL;
     }
     if (clear_vbuf) {
         SDL_ReleaseGPUBuffer(device, clear_vbuf);
@@ -2859,6 +2941,12 @@ static void ReleaseGpuDevice(void) {
 
 static void QuitPlatform(void) {
     SDL_RemoveEventWatch(WatchSwapchainResize, NULL);
+    if (native_stats.deferred)
+        INFOF("[Native VRAM] deferred=%llu drawn_later=%llu dropped=%llu "
+              "overwritten=%llu rebuilt_pixels=%llu",
+              native_stats.deferred, native_stats.replayed,
+              native_stats.dropped, native_stats.overwritten,
+              native_stats.repaired_pixels);
     if (device) {
         /* Retire before overlay destroy, window release, SDL_Quit or any GPU
          * dependency destruction. Failure preserves the entire graph. */
@@ -2918,6 +3006,8 @@ static bool DownloadVramRegionAsRGBA8888(int x, int y, int w, int h, u8* out) {
         free(words);
         return true;
     }
+    NativeRead((SDL_Rect){x, y, w, h});
+    VerifyCompare((SDL_Rect){x, y, w, h}, "download");
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return false;
@@ -3902,7 +3992,9 @@ void Draw_ClearCache(void) {
  * the command stream, so a batch drawing over the CLUT is flushed first. */
 static void ClutCacheUpdate(u16 tpage, u16 clut) {
     const int depth = (tpage >> 7) & 3;
-    if (depth >= 2 || (clut == clut_cache_reg && (depth == 0 || clut_cache_8bit)))
+    if (depth >= 2)
+        return;
+    if (clut == clut_cache_reg && (depth == 0 || clut_cache_8bit))
         return;
     const int cx = (clut & 63) * 16, cy = (clut >> 6) & 511;
     const int cw = depth ? 256 : 16;
@@ -3913,6 +4005,9 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
         DRAW_FLUSH_FOR(DRAW_FLUSH_CLUT);
     if (gpu_failed || !device || !clut_cache)
         return;
+    /* the copy reads the native VRAM: queued draws there come first */
+    NativeRead(row);
+    NativeRead(wrapped);
     if (n_clut_loads + 2 > SDL_arraysize(clut_loads)) {
         SDL_GPUCommandBuffer* cmd = AcquireCmd(); /* records the queued */
         if (!cmd)
@@ -3926,8 +4021,11 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
         clut_reuse[slot].key == key &&
         clut_load_count - clut_reuse[slot].load < CLUT_CACHE_ROWS - 1) {
         clut_cache_row = clut_reuse[slot].row;
+        clut_cache_row_load = clut_reuse[slot].load;
         return;
     }
+    /* the row this load overwrites may still be read by queued draws */
+    NativeClutReuse(clut_load_count + 1);
     /* the ring's next row (clut_cache_row may name a reused older one) */
     clut_cache_row = clut_load_count % CLUT_CACHE_ROWS;
     clut_cache_loads++;
@@ -3935,6 +4033,7 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     clut_reuse[slot].generation = clut_generation;
     clut_reuse[slot].row = (Uint16)clut_cache_row;
     clut_reuse[slot].load = ++clut_load_count;
+    clut_cache_row_load = clut_load_count;
     const int first = SDL_min(cw, VRAM_W - cx);
     clut_loads[n_clut_loads++] = (ClutLoad){
         (Uint16)cx, (Uint16)cy, (Uint16)first, (Uint16)clut_cache_row, 0};
@@ -3956,8 +4055,10 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
     if (!(code & 0x40)) {
         const int count = (code & EXTRA_VERTEX) ? 4 : 3;
         const bool gouraud = (code & GOURAUD) != 0;
-        if (max_len < 1 + count * (1 + textured) + (count - 1) * gouraud)
+        if (max_len < 1 + count * (1 + textured) + (count - 1) * gouraud) {
+            batch_drawn_unknown = true;
             return;
+        }
         for (int i = 0, at = 1; i < count; i++) {
             if (gouraud && i)
                 at++;
@@ -3984,14 +4085,18 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
         x1 = x0 + scissor_rect.w;
         y1 = y0 + scissor_rect.h;
     } else {
-        if (max_len < 2 + textured)
+        if (max_len < 2 + textured) {
+            batch_drawn_unknown = true;
             return;
+        }
         const u32 xy = (u32)words[1];
         int w = 1, h = 1;
         switch (code & 0x18) {
         case 0x00:
-            if (max_len < 3 + textured)
+            if (max_len < 3 + textured) {
+                batch_drawn_unknown = true;
                 return;
+            }
             w = (int)((u32)words[2 + textured] & (VRAM_W - 1));
             h = (int)(((u32)words[2 + textured] >> 16) & (VRAM_H - 1));
             break;
@@ -4003,6 +4108,14 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
         y0 = s11((short)(s11((short)(xy >> 16)) + draw_offset.y)) - draw_offset.y;
         x1 = x0 + w;
         y1 = y0 + h;
+        if ((code & 0xE0) == 0x60 && !textured && !(code & SEMITRANSP) &&
+            !mask_check_bit && !WidescreenDraw() && w > 0 && h > 0) {
+            const SDL_Rect cover = IntersectRects(
+                (SDL_Rect){x0 + draw_offset.x, y0 + draw_offset.y, w, h},
+                scissor_rect);
+            if ((Sint64)cover.w * cover.h > (Sint64)batch_cover.w * batch_cover.h)
+                batch_cover = cover;
+        }
         if (textured) {
             const u32 uv = (u32)words[2];
             u0 = (int)(uv & 255), u1 = u0 + w - 1;
@@ -4012,15 +4125,25 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
     }
     if (textured)
         ClutCacheUpdate(tpage, clut);
-    if (textured && batch_drawn.w > 0) {
+    if (textured) {
         SDL_Rect read[2];
         const int n = TextureFootprint(tpage, u0, u1, v0, v1, read);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; batch_drawn.w > 0 && i < n; i++) {
             if (RectsIntersect(read[i], batch_drawn)) {
                 DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
                 break;
             }
         }
+        /* the texels as the queued native draws leave them */
+        for (int i = 0; i < n; i++) {
+            NativeRead(read[i]);
+            UniteRect(&batch_read, read[i]);
+        }
+        /* the CLUT cache row it reads, in the batch it joins (after any
+         * flush above) */
+        if (((tpage >> 7) & 3) < 2 && clut_cache_row_load &&
+            (!batch_clut_oldest || clut_cache_row_load < batch_clut_oldest))
+            batch_clut_oldest = clut_cache_row_load;
     }
     /* what it draws, within the drawing area (which bounds it otherwise) */
     SDL_Rect area = scissor_rect;
@@ -4033,6 +4156,8 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
         area = (SDL_Rect){ax0, ay0, ax1 - ax0, ay1 - ay0};
     }
     UniteRect(&batch_drawn, area);
+    if (WidescreenDraw())
+        batch_drawn_unknown = true;
 }
 
 /* A run of pixels of one line on one row, [x, x + n) at row y in VRAM
@@ -4574,6 +4699,7 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     }
     /* the fill comes after the primitives queued before it */
     Draw_FlushBuffer();
+    NativeWrite((SDL_Rect){rect->x, rect->y, rect->w, rect->h}, true);
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return;
@@ -4630,9 +4756,11 @@ void Draw_ClearImage(PS1_RECT* rect, u_char r, u_char g, u_char b) {
     SDL_EndGPURenderPass(pass);
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
     SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    VerifySync((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
 }
 
 static void UploadVram(PS1_RECT* rect, const u16* p);
+static void UploadVramTo(PS1_RECT* rect, const u16* p, bool sync_scaled);
 static bool DownloadVramRegionAsRGBA8888(int x, int y, int w, int h, u8* out);
 
 /* Uploads and copies under a mask setting (GP0 E6h): a pixel whose bit 15
@@ -4698,6 +4826,10 @@ void Draw_LoadImage(PS1_RECT* rect, u_long* p) {
 
 /* Writes native RGB555 pixels into the GPU VRAM (and the scaled target). */
 static void UploadVram(PS1_RECT* rect, const u16* p) {
+    NativeWrite((SDL_Rect){rect->x, rect->y, rect->w, rect->h}, true);
+    UploadVramTo(rect, p, true);
+}
+static void UploadVramTo(PS1_RECT* rect, const u16* p, bool sync_scaled) {
     /* (a wrap submits the command buffer: mapped before acquiring one) */
     Uint32 upload_at;
     u8* map = UploadMap((Uint32)(rect->w * rect->h * 4), &upload_at);
@@ -4731,7 +4863,10 @@ static void UploadVram(PS1_RECT* rect, const u16* p) {
     SDL_UploadToGPUTexture(copy, &src, &dst, false);
     SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
-    SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+    if (sync_scaled) {
+        SyncNativeVramToScaled(rect->x, rect->y, rect->w, rect->h);
+        VerifySync((SDL_Rect){rect->x, rect->y, rect->w, rect->h});
+    }
 }
 
 void Draw_StoreImage(PS1_RECT* rect, u_long* p) {
@@ -4805,7 +4940,32 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     if (MaskedVramWrite(&dst_rect, NULL, src_x, src_y))
         return;
     Draw_FlushBuffer(); // flush primitives before operating with the VRAM
+    NativeRead((SDL_Rect){src_x, src_y, copy_w, copy_h});
+    NativeWrite((SDL_Rect){dst_x, dst_y, copy_w, copy_h}, true);
 
+    const bool overlap = RectsOverlap(src_x, src_y, dst_x, dst_y, copy_w, copy_h);
+    const int rows = overlap ? copy_h : 1, step = overlap ? 1 : copy_h;
+    /* the scaled copy's scratch: the blend copy, or one of the copy's size */
+    const Uint32 scratch_w = (Uint32)copy_w * internal_res;
+    const Uint32 scratch_h = (Uint32)step * internal_res;
+    if (scaled_vram_render && !scaled_blend_sample &&
+        (scaled_move_scratch_w < scratch_w || scaled_move_scratch_h < scratch_h)) {
+        if (scaled_move_scratch)
+            SDL_ReleaseGPUTexture(device, scaled_move_scratch);
+        const SDL_GPUTextureCreateInfo info = {
+            .type = SDL_GPU_TEXTURETYPE_2D,
+            .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = SDL_max(scratch_w, scaled_move_scratch_w),
+            .height = SDL_max(scratch_h, scaled_move_scratch_h),
+            .layer_count_or_depth = 1,
+            .num_levels = 1};
+        scaled_move_scratch = SDL_CreateGPUTexture(device, &info);
+        scaled_move_scratch_w = scaled_move_scratch ? info.width : 0;
+        scaled_move_scratch_h = scaled_move_scratch ? info.height : 0;
+        if (!scaled_move_scratch)
+            return;
+    }
     SDL_GPUCommandBuffer* cmd = AcquireCmd();
     if (!cmd) {
         return;
@@ -4815,18 +4975,20 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
      * scratch texture. The upscaled VRAM copies its own pixels, keeping
      * their detail (its first pixel of every NxN block is the native copy). */
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-    const bool overlap = RectsOverlap(src_x, src_y, dst_x, dst_y, copy_w, copy_h);
-    const int rows = overlap ? copy_h : 1, step = overlap ? 1 : copy_h;
     for (unsigned target = 0; target < (scaled_vram_render ? 2u : 1u); ++target) {
         SDL_GPUTexture* vram = target ? scaled_vram_render : vram_render;
-        SDL_GPUTexture* bounce = target ? scaled_blend_sample : vram_sample;
+        SDL_GPUTexture* bounce = !target ? vram_sample
+                                 : scaled_blend_sample ? scaled_blend_sample
+                                                       : scaled_move_scratch;
+        const bool own_scratch = target && !scaled_blend_sample;
         const Uint32 n = target ? internal_res : 1;
         for (int row = 0; row < rows; row++) {
             const SDL_GPUTextureLocation src = {
                 .texture = vram, .x = (Uint32)src_x * n,
                 .y = (Uint32)(src_y + row) * n};
             const SDL_GPUTextureLocation scratch = {
-                .texture = bounce, .x = src.x, .y = src.y};
+                .texture = bounce, .x = own_scratch ? 0 : src.x,
+                .y = own_scratch ? 0 : src.y};
             const SDL_GPUTextureLocation dst = {
                 .texture = vram, .x = (Uint32)dst_x * n,
                 .y = (Uint32)(dst_y + row) * n};
@@ -4841,6 +5003,7 @@ void Draw_MoveImage(PS1_RECT* rect, unsigned int x, unsigned int y) {
     SDL_EndGPUCopyPass(copy);
     MarkVramDirty((SDL_Rect){dst_x, dst_y, copy_w, copy_h});
     MarkVramDirty((SDL_Rect){src_x, src_y, copy_w, copy_h});
+    VerifySync((SDL_Rect){dst_x, dst_y, copy_w, copy_h});
 }
 
 /* The drawing state of queued primitives: mark k holds the state of the
@@ -4897,6 +5060,10 @@ void Draw_ResetBuffer(void) {
     index_cur = index_buf;
     batch_has_texture = false;
     batch_drawn = (SDL_Rect){0, 0, 0, 0};
+    batch_read = (SDL_Rect){0, 0, 0, 0};
+    batch_clut_oldest = 0;
+    batch_drawn_unknown = false;
+    batch_cover = (SDL_Rect){0, 0, 0, 0};
     clut_cache_loads = 0;
 }
 
@@ -4914,36 +5081,98 @@ typedef struct DrawSegment {
 #define DRAW_SEGMENTS_MAX 32
 /* Runs in one pass when the shader fetches the destination (no copies). */
 #define DRAW_SEGMENTS_FETCH_MAX 512
-static bool PrimitiveBox(const Vertex* vertices, const u32* indices,
-                         int start, int end,
-                         bool scaled_target, unsigned target_scale,
-                         Posi offset, float sub_x, float sub_y, float target_centre,
-                         float ws_squeeze, SDL_Rect clip, SemiBox* box) {
+/* What a deferred native draw keeps of a vertex (NativeDefer): the fields
+ * DrawTargetRuns reads on the CPU for the native target. */
+typedef struct NativeVertex {
+    short x, y;
+    u8 semi, exact, polygon, pad;
+} NativeVertex;
+
+/* What a target's draws need from one drawing state (ApplyDrawState). */
+typedef struct DrawView {
+    bool visible; /* the drawing area is not empty */
+    SDL_Rect clip; /* drawing area, squeezed in widescreen (VRAM pixels) */
+    SDL_Rect area; /* the drawing area itself (VRAM pixels) */
+    Posi offset;
+    float ws_squeeze, target_centre, sub_x, sub_y, grid_x;
+    SDL_GPUViewport viewport;
+    SDL_Rect scissor; /* target pixels */
+    float offset_ubo[8];
+    u32 pass_flags;
+    bool mask_check;
+} DrawView;
+
+/* What one target draws of a batch (DrawTargetRuns): vertices (or a
+ * deferred native draw's compact ones) and indices, the buffers they were
+ * uploaded to, the end index and view of each drawing state, the texture
+ * bound third (sprite atlas or VRAM) and whether the draw grid is 1:1. */
+typedef struct DrawTargetBatch {
+    SDL_GPUTexture* target;
+    unsigned target_index, target_scale;
+    const Vertex* vertices;
+    const NativeVertex* native;
+    const u32* indices;
+    int n_indices;
+    SDL_GPUBuffer *vbuf, *ibuf;
+    Uint32 vertex_offset, index_offset; /* bytes into vbuf, ibuf */
+    const int* mark_end;
+    const DrawView* views;
+    SDL_GPUTexture* extra_texture;
+    SDL_GPUSampler* extra_sampler;
+    bool grid_same;
+} DrawTargetBatch;
+
+static bool BatchSemi(const DrawTargetBatch* b, u32 i) {
+    return b->native ? b->native[i].semi != 0 : b->vertices[i].a != 0xFF;
+}
+static bool BatchExact(const DrawTargetBatch* b, u32 i) {
+    return b->native ? b->native[i].exact != 0
+                     : b->vertices[i].exact[0][3] != 0;
+}
+
+static bool PrimitiveBox(const DrawTargetBatch* b, int start, int end,
+                         const DrawView* view, SemiBox* box) {
+    const unsigned target_scale = b->target_scale;
+    const bool scaled_target = b->target_index != 0;
+    const Posi offset = view->offset;
     float min_x = 1e9f, min_y = 1e9f, max_x = -1e9f, max_y = -1e9f;
     /* Sprites and rectangles on whole target pixels cover exactly
      * [min, max); anything else may round to one more pixel each side. */
     bool rectangle = true;
     for (int i = start; i < end; ++i) {
-        const Vertex* v = &vertices[indices[i]];
-        float bias =
-            (v->t & TPAGE_POLYGON) ? 0.5f / (float)target_scale : 0.0f;
-        bool use_pgxp =
-            scaled_target &&
-            (geometry_correction || effect_geometry_correction) &&
-            (v->t & TPAGE_POLYGON) &&
-            v->pgxp_pos[2] > 0.0f;
-        float vx = (use_pgxp ? v->pgxp_pos[0] : (float)v->x) + sub_x;
-        float vy = (use_pgxp ? v->pgxp_pos[1] : (float)v->y) + sub_y;
-        float x = offset.x + (vx + bias) * GetDrawGridXScale();
-        x = (target_centre + (x - target_centre) * ws_squeeze) * target_scale;
+        const u32 k = b->indices[i];
+        bool polygon;
+        float vx, vy;
+        if (b->native) {
+            const NativeVertex* v = &b->native[k];
+            polygon = v->polygon != 0;
+            vx = (float)v->x;
+            vy = (float)v->y;
+        } else {
+            const Vertex* v = &b->vertices[k];
+            polygon = (v->t & TPAGE_POLYGON) != 0;
+            const bool use_pgxp =
+                scaled_target &&
+                (geometry_correction || effect_geometry_correction) &&
+                polygon && v->pgxp_pos[2] > 0.0f;
+            vx = use_pgxp ? v->pgxp_pos[0] : (float)v->x;
+            vy = use_pgxp ? v->pgxp_pos[1] : (float)v->y;
+        }
+        vx += view->sub_x;
+        vy += view->sub_y;
+        float bias = polygon ? 0.5f / (float)target_scale : 0.0f;
+        float x = offset.x + (vx + bias) * view->grid_x;
+        x = (view->target_centre + (x - view->target_centre) *
+                                       view->ws_squeeze) *
+            target_scale;
         float y = (offset.y + vy + bias) * target_scale;
-        rectangle &= !(v->t & TPAGE_POLYGON) && x == SDL_floorf(x) &&
-                     y == SDL_floorf(y);
+        rectangle &= !polygon && x == SDL_floorf(x) && y == SDL_floorf(y);
         min_x = SDL_min(min_x, x);
         max_x = SDL_max(max_x, x);
         min_y = SDL_min(min_y, y);
         max_y = SDL_max(max_y, y);
     }
+    const SDL_Rect clip = view->clip;
     int widen = rectangle ? 0 : 1;
     int x0 = (int)SDL_floorf(min_x) - widen;
     int x1 = (int)SDL_ceilf(max_x) + widen;
@@ -4965,22 +5194,10 @@ static int SharedVertices(const u32* indices, int a, int b) {
     return shared;
 }
 
-/* What a target's draws need from one drawing state (ApplyDrawState). */
-typedef struct DrawView {
-    bool visible; /* the drawing area is not empty */
-    SDL_Rect clip; /* drawing area, squeezed in widescreen (VRAM pixels) */
-    Posi offset;
-    float ws_squeeze, target_centre, sub_x, sub_y;
-    SDL_GPUViewport viewport;
-    SDL_Rect scissor; /* target pixels */
-    float offset_ubo[8];
-    u32 pass_flags;
-    bool mask_check;
-} DrawView;
-
 static void ComputeDrawView(DrawView* view, unsigned target_index,
                             unsigned target_scale) {
     view->visible = scissor_rect.w > 0 && scissor_rect.h > 0;
+    view->area = scissor_rect;
     view->offset = draw_offset;
     /* Widescreen squeezes X around the display buffer's centre. A clip
      * narrower than the screen (a menu list) is squeezed with its contents;
@@ -5014,6 +5231,7 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     view->sub_x = sub_x;
     view->sub_y = sub_y;
     const float grid_x = GetDrawGridXScale();
+    view->grid_x = grid_x;
     const float render_scale = (float)target_scale;
     view->viewport = (SDL_GPUViewport){
         .x = (float)draw_offset.x * render_scale * (1.0f - grid_x),
@@ -5052,26 +5270,8 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     view->mask_check = mask_check_bit;
 }
 
-/* What one target draws of a batch (DrawTargetRuns): vertices and indices,
- * the end index and view of each drawing state, the texture bound third
- * (sprite atlas or VRAM) and whether the draw grid is 1:1. */
-typedef struct DrawTargetBatch {
-    SDL_GPUTexture* target;
-    unsigned target_index, target_scale;
-    const Vertex* vertices;
-    const u32* indices;
-    int n_indices;
-    Uint32 vertex_offset, index_offset; /* bytes into vbuf, ibuf */
-    const int* mark_end;
-    const DrawView* views;
-    SDL_GPUTexture* extra_texture;
-    SDL_GPUSampler* extra_sampler;
-    bool grid_same;
-} DrawTargetBatch;
-
 /* Draws a batch into one target; false when the command buffer failed. */
 static bool DrawTargetRuns(const DrawTargetBatch* b) {
-    const Vertex* vb = b->vertices;
     const u32* ix = b->indices;
     const int n_indices = b->n_indices;
     SDL_GPUTexture* render_target = b->target;
@@ -5110,28 +5310,25 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
                 continue;
             }
             int seg_start = end;
-            bool semi = vb[ix[seg_start]].a != 0xFF;
+            bool semi = BatchSemi(b, ix[seg_start]);
             int seg_end =
-                seg_start + (vb[ix[seg_start]].exact[0][3] ? 6 : 3);
+                seg_start + (BatchExact(b, ix[seg_start]) ? 6 : 3);
             /* The two triangles of one quad (two shared vertices) cover
              * disjoint pixels: they read the same copy. */
             if (semi && seg_end + 3 <= mark_end &&
-                !vb[ix[seg_start]].exact[0][3] &&
-                vb[ix[seg_end]].a != 0xFF &&
+                !BatchExact(b, ix[seg_start]) &&
+                BatchSemi(b, ix[seg_end]) &&
                 SharedVertices(ix, seg_start, seg_end) >= 2)
                 seg_end += 3;
             if (!semi || destination_fetch) {
                 while (seg_end < mark_end &&
-                       (vb[ix[seg_end]].a != 0xFF) == semi)
+                       BatchSemi(b, ix[seg_end]) == semi)
                     seg_end += 3;
             }
             if (seg_end > mark_end)
                 seg_end = mark_end;
             SemiBox box;
-            bool visible = PrimitiveBox(
-                vb, ix, seg_start, seg_end, target_index != 0,
-                target_scale, view->offset, view->sub_x, view->sub_y,
-                view->target_centre, view->ws_squeeze, view->clip, &box);
+            bool visible = PrimitiveBox(b, seg_start, seg_end, view, &box);
             if (semi && n_segments && !destination_fetch) {
                 bool overlaps = false;
                 for (int i = 0; visible && i < n_segments; ++i)
@@ -5200,9 +5397,9 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
         ++frame_stats_batches;
         SDL_GPURenderPass* pass =
             SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
-        const SDL_GPUBufferBinding vbind = {.buffer = vbuf, .offset = b->vertex_offset};
+        const SDL_GPUBufferBinding vbind = {.buffer = b->vbuf, .offset = b->vertex_offset};
         SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
-        const SDL_GPUBufferBinding ibind = {.buffer = ibuf, .offset = b->index_offset};
+        const SDL_GPUBufferBinding ibind = {.buffer = b->ibuf, .offset = b->index_offset};
         SDL_BindGPUIndexBuffer(pass, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
         const SDL_GPUTextureSamplerBinding sampler_binding[4] = {
             {.texture=vram_sample,.sampler=vram_sampler},
@@ -5263,6 +5460,692 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
     return true;
 }
 
+/* ===== Deferred native drawing =====
+ * With a scaled target each batch was drawn twice: at the scale (what is
+ * shown) and into the native 1x VRAM, which only serves what reads the VRAM
+ * back: textures and palettes the game drew itself (the replay's blur
+ * draws the previous frame over the next), StoreImage and MoveImage, a
+ * 24-bit display, captures. A batch that draws only into display buffers
+ * (the regions presented recently) now keeps its native draw queued: its
+ * views, indices and compact vertices, and the ring generation its vertices
+ * went to. It is drawn into the native VRAM, in order, only when something
+ * reads the pixels it draws or writes them or what it read: NativeRead and
+ * NativeWrite (with the queued draws that must come first); a write that
+ * covers a queued draw whole drops it unseen. Nothing a queued draw uses
+ * changes before it is drawn: a write to what it read, or a read of what it
+ * drew, draws it first, its vertex buffers stay until the ring comes round
+ * to them (NativeRingReuse) and its palette rows until the CLUT cache's
+ * ring does (NativeClutReuse). There a draw queued two presents or more
+ * before is dropped instead: the pixels it may draw are marked out of date
+ * (native_stale) and are rebuilt from the scaled picture if anything reads
+ * them later (NativeRepair: each NxN block's first pixel, the 1x pixel where
+ * no enhancement moved the geometry; counted and logged). PSYZ_NATIVE_DEFER=0
+ * draws every batch at once, as before. */
+enum { NATIVE_QUEUED, NATIVE_NEEDED, NATIVE_DROP, NATIVE_GONE };
+typedef struct NativeEntry {
+    void* block; /* vertices, indices, views and mark ends */
+    NativeVertex* vertices;
+    u32* indices;
+    DrawView* views;
+    int* mark_end;
+    int n_indices, n_marks;
+    unsigned gen;
+    Uint32 vertex_offset, index_offset;
+    SDL_GPUTexture* extra_texture;
+    SDL_GPUSampler* extra_sampler;
+    bool grid_same;
+    SDL_Rect drawn, read; /* bounds of its drawing areas and its texels */
+    Uint32 clut_oldest; /* its oldest palette row's load, 0: none */
+    Uint32 present;
+    int state;
+} NativeEntry;
+static NativeEntry* native_queue;
+static int native_count, native_capacity;
+static SDL_Rect native_drawn_box, native_read_box;
+static Uint32 native_present;
+static int native_defer_setting = -1;
+enum { NATIVE_DISPLAYS = 4 };
+static SDL_Rect native_display[NATIVE_DISPLAYS];
+static unsigned native_displays;
+static Uint8 native_stale[VRAM_H][VRAM_W / 8];
+static SDL_Rect native_stale_box;
+static bool native_repair_logged;
+/* PSYZ_NATIVE_TRACE=1: each rebuild and each read or write that draws
+ * queued draws, and the counts every 600 presents (diagnostics). */
+static int native_trace = -1;
+static bool NativeTrace(void) {
+    if (native_trace < 0) {
+        const char* env = SDL_getenv("PSYZ_NATIVE_TRACE");
+        native_trace = env && *env == '1';
+    }
+    return native_trace > 0;
+}
+
+static SDL_Rect ClipToVram(SDL_Rect r) {
+    const int x0 = SDL_max(r.x, 0), y0 = SDL_max(r.y, 0);
+    const int x1 = SDL_min(r.x + r.w, VRAM_W), y1 = SDL_min(r.y + r.h, VRAM_H);
+    if (r.w <= 0 || r.h <= 0 || x1 <= x0 || y1 <= y0)
+        return (SDL_Rect){0, 0, 0, 0};
+    return (SDL_Rect){x0, y0, x1 - x0, y1 - y0};
+}
+static SDL_Rect IntersectRects(SDL_Rect a, SDL_Rect b) {
+    if (!RectsIntersect(a, b))
+        return (SDL_Rect){0, 0, 0, 0};
+    const int x0 = SDL_max(a.x, b.x), y0 = SDL_max(a.y, b.y);
+    const int x1 = SDL_min(a.x + a.w, b.x + b.w);
+    const int y1 = SDL_min(a.y + a.h, b.y + b.h);
+    return (SDL_Rect){x0, y0, x1 - x0, y1 - y0};
+}
+static bool RectContains(SDL_Rect outer, SDL_Rect inner) {
+    return inner.w > 0 && inner.h > 0 && outer.w > 0 && outer.h > 0 &&
+           inner.x >= outer.x && inner.y >= outer.y &&
+           inner.x + inner.w <= outer.x + outer.w &&
+           inner.y + inner.h <= outer.y + outer.h;
+}
+
+/* The out-of-date native pixels (dropped draws), one bit each, and the
+ * 16x16 tiles that may hold some. */
+static Uint8 native_stale_tile[VRAM_H / 16][VRAM_W / 16];
+static void StaleSet(SDL_Rect r, bool stale) {
+    r = ClipToVram(r);
+    if (r.w <= 0 || r.h <= 0)
+        return;
+    if (stale)
+        UniteRect(&native_stale_box, r);
+    else if (!RectsIntersect(r, native_stale_box))
+        return;
+    for (int y = r.y; y < r.y + r.h; ++y) {
+        Uint8* row = native_stale[y];
+        for (int x = r.x; x < r.x + r.w;) {
+            if (!(x & 7) && x + 8 <= r.x + r.w) {
+                row[x >> 3] = stale ? 0xFF : 0;
+                x += 8;
+                continue;
+            }
+            if (stale)
+                row[x >> 3] |= (Uint8)(1u << (x & 7));
+            else
+                row[x >> 3] &= (Uint8)~(1u << (x & 7));
+            ++x;
+        }
+    }
+    for (int ty = r.y >> 4; ty <= (r.y + r.h - 1) >> 4; ++ty)
+        for (int tx = r.x >> 4; tx <= (r.x + r.w - 1) >> 4; ++tx) {
+            if (stale)
+                native_stale_tile[ty][tx] = 1;
+            else if (RectContains(r, (SDL_Rect){tx * 16, ty * 16, 16, 16}))
+                native_stale_tile[ty][tx] = 0;
+        }
+    if (!stale && RectContains(r, native_stale_box))
+        native_stale_box = (SDL_Rect){0, 0, 0, 0};
+}
+static bool StalePixel(int x, int y) {
+    return (native_stale[y][x >> 3] >> (x & 7)) & 1;
+}
+static bool StaleAny(SDL_Rect r) {
+    r = IntersectRects(ClipToVram(r), native_stale_box);
+    if (r.w <= 0)
+        return false;
+    for (int ty = r.y >> 4; ty <= (r.y + r.h - 1) >> 4; ++ty)
+        for (int tx = r.x >> 4; tx <= (r.x + r.w - 1) >> 4; ++tx) {
+            if (!native_stale_tile[ty][tx])
+                continue;
+            const SDL_Rect t = IntersectRects(r, (SDL_Rect){tx * 16, ty * 16, 16, 16});
+            for (int y = t.y; y < t.y + t.h; ++y)
+                for (int x = t.x; x < t.x + t.w; ++x) {
+                    if (!(x & 7) && x + 8 <= t.x + t.w) {
+                        if (native_stale[y][x >> 3])
+                            return true;
+                        x += 7;
+                        continue;
+                    }
+                    if (StalePixel(x, y))
+                        return true;
+                }
+        }
+    return false;
+}
+
+/* Downloads a region of a texture (RGBA8); waits for the GPU. */
+static bool DownloadTexture(SDL_GPUTexture* texture, Uint32 x, Uint32 y,
+                            Uint32 w, Uint32 h, u8* out) {
+    const Uint64 bytes = (Uint64)w * h * 4;
+    if (!bytes || bytes > 0xFFFFFFFFu)
+        return false;
+    SDL_GPUTransferBuffer* transfer = tex_download_transfer;
+    if (bytes > VRAM_BYTES) {
+        const SDL_GPUTransferBufferCreateInfo info = {
+            .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size = (Uint32)bytes};
+        transfer = SDL_CreateGPUTransferBuffer(device, &info);
+    }
+    SDL_GPUCommandBuffer* cmd = transfer ? AcquireCmd() : NULL;
+    SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+    bool ok = false;
+    if (copy) {
+        const SDL_GPUTextureRegion region = {
+            .texture = texture, .x = x, .y = y, .w = w, .h = h, .d = 1};
+        const SDL_GPUTextureTransferInfo destination = {.transfer_buffer = transfer};
+        SDL_DownloadFromGPUTexture(copy, &region, &destination);
+        SDL_EndGPUCopyPass(copy);
+        const u8* map = SubmitCmdAndWait()
+                            ? SDL_MapGPUTransferBuffer(device, transfer, false)
+                            : NULL;
+        if (map) {
+            memcpy(out, map, (size_t)bytes);
+            SDL_UnmapGPUTransferBuffer(device, transfer);
+            ok = true;
+        }
+    }
+    if (transfer && transfer != tex_download_transfer && !gpu_retirement_uncertain)
+        SDL_ReleaseGPUTransferBuffer(device, transfer);
+    return ok;
+}
+
+/* Rebuilds the out-of-date native pixels of r from the scaled picture. */
+static void NativeRepair(SDL_Rect r) {
+    r = IntersectRects(ClipToVram(r), native_stale_box);
+    if (r.w <= 0 || r.h <= 0 || !StaleAny(r))
+        return;
+    if (!scaled_vram_render || !vram_render) {
+        StaleSet(r, false);
+        return;
+    }
+    const Uint32 n = internal_res, w = (Uint32)r.w, h = (Uint32)r.h;
+    u8* native = malloc((size_t)w * h * 4);
+    u8* scaled = malloc((size_t)w * n * h * n * 4);
+    u16* pixels = malloc((size_t)w * h * sizeof(u16));
+    if (native && scaled && pixels &&
+        DownloadTexture(vram_render, (Uint32)r.x, (Uint32)r.y, w, h, native) &&
+        DownloadTexture(scaled_vram_render, (Uint32)r.x * n, (Uint32)r.y * n,
+                        w * n, h * n, scaled)) {
+        unsigned repaired = 0;
+        for (Uint32 y = 0; y < h; ++y)
+            for (Uint32 x = 0; x < w; ++x)
+                if (StalePixel(r.x + (int)x, r.y + (int)y)) {
+                    memcpy(native + ((size_t)y * w + x) * 4,
+                           scaled + ((size_t)y * n * w * n + (size_t)x * n) * 4,
+                           4);
+                    ++repaired;
+                }
+        ConvertRgba8888ToRgb5551(native, pixels, (size_t)w * h);
+        PS1_RECT region = {(short)r.x, (short)r.y, (short)r.w, (short)r.h};
+        UploadVramTo(&region, pixels, false);
+        native_stats.repaired_pixels += repaired;
+        for (int ty = r.y >> 4; ty <= (r.y + r.h - 1) >> 4; ++ty)
+            for (int tx = r.x >> 4; tx <= (r.x + r.w - 1) >> 4; ++tx)
+                verify_rebuilt_tile[ty][tx] = vram_verify != NULL;
+        if (NativeTrace())
+            INFOF("[Native VRAM] present %u: rebuilt %u pixels in (%d,%d %dx%d)",
+                  native_present, repaired, r.x, r.y, r.w, r.h);
+        if (!native_repair_logged) {
+            native_repair_logged = true;
+            INFOF("native VRAM: %u out-of-date pixels at (%d,%d %dx%d) "
+                  "rebuilt from the scaled picture (logged once)",
+                  repaired, r.x, r.y, r.w, r.h);
+        }
+    }
+    free(native);
+    free(scaled);
+    free(pixels);
+    StaleSet(r, false);
+}
+
+static void NativeBoxes(void) {
+    native_drawn_box = native_read_box = (SDL_Rect){0, 0, 0, 0};
+    for (int i = 0; i < native_count; ++i) {
+        UniteRect(&native_drawn_box, native_queue[i].drawn);
+        UniteRect(&native_read_box, native_queue[i].read);
+    }
+}
+
+static void NativeCompact(void) {
+    int to = 0;
+    for (int i = 0; i < native_count; ++i) {
+        if (native_queue[i].state == NATIVE_GONE) {
+            free(native_queue[i].block);
+            continue;
+        }
+        native_queue[i].state = NATIVE_QUEUED;
+        native_queue[to++] = native_queue[i];
+    }
+    native_count = to;
+    NativeBoxes();
+}
+
+static void NativeReplay(NativeEntry* e) {
+    const DrawTargetBatch b = {
+        vram_render, 0, 1, NULL, e->vertices, e->indices, e->n_indices,
+        vbufs[e->gen], ibufs[e->gen], e->vertex_offset, e->index_offset,
+        e->mark_end, e->views, e->extra_texture, e->extra_sampler,
+        e->grid_same};
+    DrawTargetRuns(&b);
+    for (int k = 0; k < e->n_marks; ++k) {
+        const SDL_Rect area = e->views[k].area;
+        if (area.w > 0 && area.h > 0)
+            MarkVramDirty(area);
+    }
+    ++native_stats.replayed;
+}
+
+/* Draws the entries marked needed, in order (the out-of-date pixels under
+ * them rebuilt first), and forgets them and the dropped ones. */
+static void NativeDrawNeeded(void) {
+    for (int i = 0; i < native_count; ++i)
+        if (native_queue[i].state == NATIVE_NEEDED)
+            NativeRepair(native_queue[i].drawn);
+    for (int i = 0; i < native_count; ++i) {
+        NativeEntry* e = &native_queue[i];
+        if (e->state == NATIVE_NEEDED)
+            NativeReplay(e);
+        else if (e->state == NATIVE_DROP)
+            ++native_stats.overwritten;
+        else
+            continue;
+        e->state = NATIVE_GONE;
+    }
+    NativeCompact();
+}
+
+/* What is left of clip outside r when it is one rectangle (or none). */
+static bool RectMinus(SDL_Rect clip, SDL_Rect r, SDL_Rect* left) {
+    if (!RectsIntersect(clip, r)) {
+        *left = clip;
+        return true;
+    }
+    const int cx1 = clip.x + clip.w, cy1 = clip.y + clip.h;
+    const int rx1 = r.x + r.w, ry1 = r.y + r.h;
+    const bool wide = r.x <= clip.x && rx1 >= cx1;
+    const bool tall = r.y <= clip.y && ry1 >= cy1;
+    *left = (SDL_Rect){0, 0, 0, 0};
+    if (wide && tall)
+        return true;
+    if (wide) {
+        if (r.y > clip.y && ry1 < cy1)
+            return false;
+        *left = r.y > clip.y ? (SDL_Rect){clip.x, clip.y, clip.w, r.y - clip.y}
+                             : (SDL_Rect){clip.x, ry1, clip.w, cy1 - ry1};
+        return true;
+    }
+    if (tall) {
+        if (r.x > clip.x && rx1 < cx1)
+            return false;
+        *left = r.x > clip.x ? (SDL_Rect){clip.x, clip.y, r.x - clip.x, clip.h}
+                             : (SDL_Rect){rx1, clip.y, cx1 - rx1, clip.h};
+        return true;
+    }
+    return false;
+}
+
+/* A write replaces r: a queued draw keeps only its drawing outside r, when
+ * each of its drawing areas less r is one rectangle. */
+static bool NativeShrink(NativeEntry* e, SDL_Rect r) {
+    SDL_Rect left[DRAW_MARKS_MAX + 1];
+    for (int k = 0; k < e->n_marks; ++k) {
+        if (!e->views[k].visible)
+            continue;
+        if (!RectMinus(IntersectRects(ClipToVram(e->views[k].clip), e->drawn),
+                       r, &left[k]))
+            return false;
+    }
+    SDL_Rect drawn = {0, 0, 0, 0};
+    for (int k = 0; k < e->n_marks; ++k) {
+        DrawView* view = &e->views[k];
+        if (!view->visible)
+            continue;
+        view->clip = left[k];
+        view->scissor = left[k];
+        view->visible = left[k].w > 0 && left[k].h > 0;
+        UniteRect(&drawn, left[k]);
+    }
+    e->drawn = drawn;
+    return true;
+}
+
+/* Before the native VRAM in r is read (write: written; overwrite: every
+ * pixel of r replaced). The queued draws that touch r are drawn, with every
+ * earlier one that draws where they draw or reads what they draw; with
+ * write, also those that read r; with overwrite, those inside r are
+ * dropped. */
+static void NativeResolve(SDL_Rect r, bool write, bool overwrite) {
+    r = ClipToVram(r);
+    if (r.w <= 0 || r.h <= 0)
+        return;
+    if (native_count && (RectsIntersect(native_drawn_box, r) ||
+                         (write && RectsIntersect(native_read_box, r)))) {
+        enum { NEED_RECTS = 16 };
+        SDL_Rect need[NEED_RECTS];
+        int n_need = 0;
+        bool any = false;
+        for (int i = native_count - 1; i >= 0; --i) {
+            NativeEntry* e = &native_queue[i];
+            if (write && overwrite && RectContains(r, e->drawn)) {
+                e->state = NATIVE_DROP;
+                any = true;
+                continue;
+            }
+            bool needed = write && RectsIntersect(e->read, r);
+            if (!needed && RectsIntersect(e->drawn, r))
+                needed = !(write && overwrite && NativeShrink(e, r));
+            for (int k = 0; !needed && k < n_need; ++k)
+                needed = RectsIntersect(e->drawn, need[k]) ||
+                         RectsIntersect(e->read, need[k]);
+            if (!needed)
+                continue;
+            e->state = NATIVE_NEEDED;
+            any = true;
+            if (n_need == NEED_RECTS) {
+                for (int k = 1; k < n_need; ++k)
+                    UniteRect(&need[0], need[k]);
+                n_need = 1;
+            }
+            need[n_need++] = e->drawn;
+        }
+        if (any && NativeTrace()) {
+            int needed = 0, dropped = 0;
+            for (int i = 0; i < native_count; ++i) {
+                needed += native_queue[i].state == NATIVE_NEEDED;
+                dropped += native_queue[i].state == NATIVE_DROP;
+            }
+            INFOF("[Native VRAM] present %u: %s (%d,%d %dx%d) draws %d of %d "
+                  "queued, drops %d",
+                  native_present, write ? (overwrite ? "overwrite" : "write") : "read",
+                  r.x, r.y, r.w, r.h, needed, native_count, dropped);
+        }
+        if (any)
+            NativeDrawNeeded();
+        if (any && !write)
+            VerifyCompare(r, "read after queued draws");
+    }
+    if (write && overwrite)
+        StaleSet(r, false);
+    else
+        NativeRepair(r);
+}
+/* PSYZ_NATIVE_VERIFY: the tiles with rebuilt pixels; reads of them, and
+ * one read in 61, are compared. */
+static void VerifyRead(SDL_Rect r) {
+    static unsigned reads;
+    r = ClipToVram(r);
+    if (!vram_verify || r.w <= 0)
+        return;
+    bool rebuilt = false;
+    for (int ty = r.y >> 4; ty <= (r.y + r.h - 1) >> 4 && !rebuilt; ++ty)
+        for (int tx = r.x >> 4; tx <= (r.x + r.w - 1) >> 4 && !rebuilt; ++tx)
+            rebuilt = verify_rebuilt_tile[ty][tx] != 0;
+    if (rebuilt)
+        VerifyCompare(r, "read of rebuilt pixels");
+    else if (!(++reads % 61))
+        VerifyCompare(r, "sampled read");
+}
+static void NativeRead(SDL_Rect r) {
+    if (native_count || native_stale_box.w > 0)
+        NativeResolve(r, false, false);
+    VerifyRead(r);
+}
+static void NativeWrite(SDL_Rect r, bool overwrite) {
+    if (native_count || native_stale_box.w > 0)
+        NativeResolve(r, true, overwrite);
+}
+/* Draws every queued draw (the sampled textures of all are to change). */
+static void NativeDrawAll(void) {
+    for (int i = 0; i < native_count; ++i)
+        native_queue[i].state = NATIVE_NEEDED;
+    if (native_count)
+        NativeDrawNeeded();
+}
+
+/* The queued draws up to index last must go (their buffers or palette rows
+ * are about to be reused): drawn when any is from the last two presents,
+ * else dropped and their pixels marked out of date. */
+static void NativeExpire(int last) {
+    if (last < 0)
+        return;
+    bool young = false;
+    for (int i = 0; i <= last; ++i)
+        young |= native_present - native_queue[i].present < 2;
+    for (int i = 0; i <= last; ++i) {
+        NativeEntry* e = &native_queue[i];
+        if (young) {
+            e->state = NATIVE_NEEDED;
+            continue;
+        }
+        for (int k = 0; k < e->n_marks; ++k)
+            if (e->views[k].visible)
+                StaleSet(IntersectRects(ClipToVram(e->views[k].clip), e->drawn), true);
+        ++native_stats.dropped;
+        e->state = NATIVE_GONE;
+    }
+    NativeDrawNeeded();
+}
+static void NativeRingReuse(unsigned gen) {
+    int last = -1;
+    for (int i = 0; i < native_count; ++i)
+        if (native_queue[i].gen == gen)
+            last = i;
+    NativeExpire(last);
+}
+/* Before the CLUT cache load number load overwrites its row. */
+static void NativeClutReuse(Uint32 load) {
+    int last = -1;
+    for (int i = 0; i < native_count; ++i) {
+        const Uint32 oldest = native_queue[i].clut_oldest;
+        if (oldest && oldest + CLUT_CACHE_ROWS <= load)
+            last = i;
+    }
+    NativeExpire(last);
+}
+
+static unsigned long long verify_checks, verify_pixels, verify_mismatches;
+static void VerifySync(SDL_Rect r) {
+    r = ClipToVram(r);
+    if (!vram_verify || r.w <= 0)
+        return;
+    SDL_GPUCommandBuffer* cmd = AcquireCmd();
+    SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
+    if (!copy)
+        return;
+    const SDL_GPUTextureLocation from = {.texture = vram_render, .x = (Uint32)r.x, .y = (Uint32)r.y};
+    const SDL_GPUTextureLocation to = {.texture = vram_verify, .x = (Uint32)r.x, .y = (Uint32)r.y};
+    SDL_CopyGPUTextureToTexture(copy, &from, &to, (Uint32)r.w, (Uint32)r.h, 1, false);
+    SDL_EndGPUCopyPass(copy);
+}
+static void VerifyCompare(SDL_Rect r, const char* why) {
+    r = ClipToVram(r);
+    if (!vram_verify || r.w <= 0)
+        return;
+    u8* a = malloc((size_t)r.w * r.h * 4);
+    u8* b = malloc((size_t)r.w * r.h * 4);
+    if (a && b &&
+        DownloadTexture(vram_render, (Uint32)r.x, (Uint32)r.y, (Uint32)r.w, (Uint32)r.h, a) &&
+        DownloadTexture(vram_verify, (Uint32)r.x, (Uint32)r.y, (Uint32)r.w, (Uint32)r.h, b)) {
+        unsigned differ = 0;
+        for (size_t i = 0; i < (size_t)r.w * r.h; ++i)
+            differ += memcmp(a + i * 4, b + i * 4, 4) != 0;
+        ++verify_checks;
+        verify_pixels += (unsigned long long)r.w * r.h;
+        if (differ) {
+            verify_mismatches += differ;
+            static unsigned logged;
+            if (logged++ < 20)
+                INFOF("[Native VRAM] verify: %u of %d pixels differ in (%d,%d %dx%d), %s, present %u",
+                      differ, r.w * r.h, r.x, r.y, r.w, r.h, why, native_present);
+        }
+    }
+    free(a);
+    free(b);
+}
+
+/* The batch being flushed fills cover whole: the queued draws inside it
+ * are drawn over (when that batch is drawn, now or later) and go, and the
+ * out-of-date pixels there do not need rebuilding. */
+static void NativeCover(SDL_Rect cover) {
+    cover = ClipToVram(cover);
+    if (cover.w <= 0)
+        return;
+    bool any = false;
+    for (int i = 0; i < native_count; ++i) {
+        if (RectContains(cover, native_queue[i].drawn)) {
+            native_queue[i].state = NATIVE_GONE;
+            ++native_stats.overwritten;
+            any = true;
+        }
+    }
+    if (any)
+        NativeCompact();
+    StaleSet(cover, false);
+}
+
+/* Forgets the queue (the device goes). */
+static void NativeDiscard(void) {
+    for (int i = 0; i < native_count; ++i)
+        free(native_queue[i].block);
+    native_count = 0;
+    free(native_queue);
+    native_queue = NULL;
+    native_capacity = 0;
+    native_drawn_box = native_read_box = native_stale_box =
+        (SDL_Rect){0, 0, 0, 0};
+    memset(native_stale, 0, sizeof(native_stale));
+    memset(native_stale_tile, 0, sizeof(native_stale_tile));
+    native_displays = 0;
+}
+
+/* A present: the region shown joins the display buffers (the last few
+ * distinct ones). */
+static void NativePresent(void) {
+    ++native_present;
+    if ((NativeTrace() || vram_verify) && !(native_present % 600))
+        INFOF("[Native VRAM] present %u: queued=%d deferred=%llu drawn_later=%llu "
+              "dropped=%llu overwritten=%llu rebuilt_pixels=%llu verified=%llu/%llu px "
+              "mismatching=%llu",
+              native_present, native_count, native_stats.deferred,
+              native_stats.replayed, native_stats.dropped,
+              native_stats.overwritten, native_stats.repaired_pixels,
+              verify_checks, verify_pixels, verify_mismatches);
+    if (!disp_on || display_size.x <= 0 || display_size.y <= 0)
+        return;
+    const int words = display_rgb24 ? (display_size.x * 3 + 1) / 2 : display_size.x;
+    const SDL_Rect shown = ClipToVram(
+        (SDL_Rect){display_area.x, display_area.y, words, display_size.y});
+    if (shown.w <= 0)
+        return;
+    const unsigned n = SDL_min(native_displays, (unsigned)NATIVE_DISPLAYS);
+    for (unsigned i = 0; i < n; ++i)
+        if (!memcmp(&native_display[i], &shown, sizeof(shown)))
+            return;
+    native_display[native_displays++ % NATIVE_DISPLAYS] = shown;
+}
+
+static bool NativeDeferEnabled(void) {
+    if (native_defer_setting < 0) {
+        const char* env = SDL_getenv("PSYZ_NATIVE_DEFER");
+        native_defer_setting = !(env && !strcmp(env, "0"));
+    }
+    return native_defer_setting > 0;
+}
+
+/* Whether a batch's native draw can wait: there is a scaled target and
+ * every drawing area of it lies in a display buffer. */
+static bool NativeDeferrable(const DrawView* views, int n_marks) {
+    if (!NativeDeferEnabled() || !scaled_vram_render || gpu_failed ||
+        !native_displays)
+        return false;
+    const unsigned n = SDL_min(native_displays, (unsigned)NATIVE_DISPLAYS);
+    for (int k = 0; k < n_marks; ++k) {
+        if (!views[k].visible)
+            continue;
+        const SDL_Rect clip = ClipToVram(views[k].clip);
+        if (clip.w <= 0)
+            continue;
+        bool shown = false;
+        for (unsigned i = 0; i < n && !shown; ++i)
+            shown = RectContains(native_display[i], clip);
+        if (!shown)
+            return false;
+    }
+    return true;
+}
+
+/* Queues the native draw of the batch being flushed. */
+static bool NativeDefer(const DrawView* views, const int* mark_end,
+                        int n_marks, Uint32 vertex_offset, Uint32 index_offset,
+                        SDL_GPUTexture* extra_texture,
+                        SDL_GPUSampler* extra_sampler, bool grid_same) {
+    if (native_count == native_capacity) {
+        const int capacity = native_capacity ? native_capacity * 2 : 64;
+        NativeEntry* grown = realloc(native_queue, (size_t)capacity * sizeof(*grown));
+        if (!grown)
+            return false;
+        native_queue = grown;
+        native_capacity = capacity;
+    }
+    const size_t vertices = (size_t)n_vertices * sizeof(NativeVertex);
+    const size_t indices = (size_t)n_indices * sizeof(u32);
+    const size_t view_bytes = (size_t)n_marks * sizeof(DrawView);
+    const size_t mark_bytes = (size_t)n_marks * sizeof(int);
+    u8* block = malloc(view_bytes + vertices + indices + mark_bytes);
+    if (!block)
+        return false;
+    NativeEntry* e = &native_queue[native_count];
+    *e = (NativeEntry){0};
+    e->block = block;
+    e->views = (DrawView*)block;
+    e->vertices = (NativeVertex*)(block + view_bytes);
+    e->indices = (u32*)(block + view_bytes + vertices);
+    e->mark_end = (int*)(block + view_bytes + vertices + indices);
+    memcpy(e->views, views, view_bytes);
+    memcpy(e->mark_end, mark_end, mark_bytes);
+    memcpy(e->indices, index_buf, indices);
+    for (int i = 0; i < n_vertices; ++i) {
+        const Vertex* v = &vertex_buf[i];
+        e->vertices[i] = (NativeVertex){
+            v->x, v->y, v->a != 0xFF, v->exact[0][3] != 0,
+            (v->t & TPAGE_POLYGON) != 0, 0};
+    }
+    e->n_indices = n_indices;
+    e->n_marks = n_marks;
+    e->gen = ring_gen;
+    e->vertex_offset = vertex_offset;
+    e->index_offset = index_offset;
+    e->extra_texture = extra_texture;
+    e->extra_sampler = extra_sampler;
+    e->grid_same = grid_same;
+    for (int k = 0; k < n_marks; ++k)
+        if (views[k].visible)
+            UniteRect(&e->drawn, ClipToVram(views[k].clip));
+    /* what its primitives cover, when known */
+    if (!batch_drawn_unknown)
+        e->drawn = IntersectRects(e->drawn, ClipToVram(batch_drawn));
+    e->read = batch_read;
+    e->clut_oldest = batch_clut_oldest;
+    e->present = native_present;
+    e->state = NATIVE_QUEUED;
+    ++native_count;
+    UniteRect(&native_drawn_box, e->drawn);
+    UniteRect(&native_read_box, e->read);
+    ++native_stats.deferred;
+    return true;
+}
+
+void Draw_GetNativeStats(DrawNativeStats* out) {
+    if (out)
+        *out = native_stats;
+}
+
+int Draw_SetNativeDefer(int enabled) {
+    const int previous = NativeDeferEnabled();
+    if (!device || UseSoftwareBackend()) {
+        native_defer_setting = enabled != 0;
+        return previous;
+    }
+    Draw_FlushBuffer();
+    if (!enabled)
+        NativeRead((SDL_Rect){0, 0, VRAM_W, VRAM_H});
+    native_defer_setting = enabled != 0;
+    return previous;
+}
+
 /* A batch is full (PSYZ_BATCH_VERTICES, PSYZ_BATCH_PRIMITIVES: tests of
  * smaller batches). */
 static bool DrawBatchFull(unsigned vertices, unsigned indices) {
@@ -5290,6 +6173,28 @@ static void DrawCountFlush(unsigned reason) {
     ++frame_stats_flushes;
     if (reason == DRAW_FLUSH_OVERFLOW || reason == DRAW_FLUSH_MARKS || reason == DRAW_FLUSH_CLUT)
         ++frame_stats_overflows;
+}
+
+/* PSYZ_NATIVE_VERIFY: the batch's native draw, at once, into vram_verify. */
+static void VerifyDraw(const DrawView* views, const int* mark_end,
+                       SDL_GPUBuffer* vbuf, SDL_GPUBuffer* ibuf,
+                       Uint32 vertex_offset, Uint32 index_offset,
+                       SDL_GPUTexture* extra_texture,
+                       SDL_GPUSampler* extra_sampler, bool grid_same) {
+    static bool synced;
+    if (!vram_verify)
+        return;
+    if (!synced) {
+        synced = true;
+        NativeRead((SDL_Rect){0, 0, VRAM_W, VRAM_H});
+        VerifySync((SDL_Rect){0, 0, VRAM_W, VRAM_H});
+        return;
+    }
+    const DrawTargetBatch target = {
+        vram_verify, 0, 1, vertex_buf, NULL, index_buf, n_indices, vbuf, ibuf,
+        vertex_offset, index_offset, mark_end, views, extra_texture,
+        extra_sampler, grid_same};
+    DrawTargetRuns(&target);
 }
 
 void Draw_FlushBuffer(void) {
@@ -5332,17 +6237,18 @@ void Draw_FlushBuffer(void) {
     memcpy(map + idx_offset, index_buf, idx_size);
     SDL_UnmapGPUTransferBuffer(device, vtx_transfer);
 
+    SDL_GPUBuffer* const vbuf = vbufs[ring_gen];
+    SDL_GPUBuffer* const ibuf = ibufs[ring_gen];
     SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
     const SDL_GPUTransferBufferLocation vtx_src = {
         .transfer_buffer = vtx_transfer, .offset = vtx_offset};
     const SDL_GPUBufferRegion vtx_dst = {.buffer = vbuf, .offset = vtx_offset, .size = vtx_size};
-    const bool buffers_cycle = RingCycleBuffers();
-    SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, buffers_cycle);
+    SDL_UploadToGPUBuffer(copy, &vtx_src, &vtx_dst, false);
     const SDL_GPUTransferBufferLocation idx_src = {
         .transfer_buffer = vtx_transfer, .offset = idx_offset};
     const SDL_GPUBufferRegion idx_dst = {
         .buffer = ibuf, .offset = index_at * (Uint32)sizeof(*index_buf), .size = idx_size};
-    SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, buffers_cycle);
+    SDL_UploadToGPUBuffer(copy, &idx_src, &idx_dst, false);
     if (batch_has_texture && vram_dirty.w > 0 && vram_dirty.h > 0) {
         const SDL_GPUTextureLocation vram_src = {.texture = vram_render,
                                                  .x = (Uint32)vram_dirty.x,
@@ -5363,7 +6269,7 @@ void Draw_FlushBuffer(void) {
     draw_marks[n_draw_marks].end = n_indices;
     draw_marks[n_draw_marks].state = current_state;
     const int n_marks = n_draw_marks + 1;
-    static DrawView views[DRAW_MARKS_MAX + 1];
+    static DrawView views[2][DRAW_MARKS_MAX + 1];
     static int mark_end[DRAW_MARKS_MAX + 1];
     for (int k = 0; k < n_marks; ++k)
         mark_end[k] = draw_marks[k].end;
@@ -5374,44 +6280,60 @@ void Draw_FlushBuffer(void) {
         (sprite_atlas_texture && sprite_atlas_sampler) ? sprite_atlas_sampler
                                                          : vram_sampler;
     const bool grid_same = draw_grid_source_width == draw_grid_target_width;
-
-    /* Native VRAM is independently rasterized: gameplay readback and texture
-     * feedback must not depend on high-resolution sample positions. */
-    for (unsigned target_index = 0;
-         target_index < (scaled_vram_render ? 2u : 1u); ++target_index) {
-        SDL_GPUTexture* render_target =
-            target_index ? scaled_vram_render : vram_render;
-        unsigned target_scale = target_index ? internal_res : 1;
+    const unsigned n_targets = scaled_vram_render ? 2u : 1u;
+    for (unsigned target_index = 0; target_index < n_targets; ++target_index) {
+        const unsigned target_scale = target_index ? internal_res : 1;
         for (int k = 0; k < n_marks; ++k) {
             ApplyDrawState(&draw_marks[k].state);
-            ComputeDrawView(&views[k], target_index, target_scale);
+            ComputeDrawView(&views[target_index][k], target_index, target_scale);
         }
+    }
+    ApplyDrawState(&current_state);
+    /* Native VRAM is independently rasterized: gameplay readback and texture
+     * feedback must not depend on high-resolution sample positions. Its
+     * draw waits when it lies in display buffers (NativeDefer). */
+    NativeCover(batch_cover);
+    bool defer = n_targets == 2 && NativeDeferrable(views[0], n_marks);
+    SDL_Rect drawn = {0, 0, 0, 0};
+    for (int k = 0; k < n_marks; ++k)
+        if (views[0][k].visible)
+            UniteRect(&drawn, ClipToVram(views[0][k].clip));
+    for (unsigned target_index = n_targets; target_index-- > 0;) {
+        /* the native target last: a draw that cannot be queued is drawn */
+        if (!target_index && defer &&
+            NativeDefer(views[0], mark_end, n_marks, vtx_offset,
+                        index_at * (Uint32)sizeof(*index_buf), extra_texture,
+                        extra_sampler, grid_same)) {
+            VerifyDraw(views[0], mark_end, vbuf, ibuf, vtx_offset,
+                       index_at * (Uint32)sizeof(*index_buf), extra_texture,
+                       extra_sampler, grid_same);
+            Draw_ResetBuffer();
+            return;
+        }
+        if (!target_index)
+            NativeWrite(drawn, false); /* after the queued draws there */
         const DrawTargetBatch target = {
-            render_target, target_index, target_scale,
-            vertex_buf, index_buf, n_indices,
-            vtx_offset, index_at * (Uint32)sizeof(*index_buf), mark_end, views,
-            extra_texture, extra_sampler, grid_same};
+            target_index ? scaled_vram_render : vram_render, target_index,
+            target_index ? internal_res : 1, vertex_buf, NULL, index_buf,
+            n_indices, vbuf, ibuf, vtx_offset,
+            index_at * (Uint32)sizeof(*index_buf), mark_end,
+            views[target_index], extra_texture, extra_sampler, grid_same};
         if (!DrawTargetRuns(&target))
             goto abort_flush;
     }
-    ApplyDrawState(&current_state);
     for (int k = 0; k < n_marks; ++k) {
         const SDL_Rect area = draw_marks[k].state.scissor;
         if (area.w > 0 && area.h > 0)
             MarkVramDirty(area);
     }
+    VerifyDraw(views[0], mark_end, vbuf, ibuf, vtx_offset,
+               index_at * (Uint32)sizeof(*index_buf), extra_texture,
+               extra_sampler, grid_same);
     Draw_ResetBuffer();
     return;
 abort_flush:
-    ApplyDrawState(&current_state);
     Draw_ResetBuffer();
 }
-
-
-
-
-
-
 
 
 /* ===== Native rasterizer mode =====

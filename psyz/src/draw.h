@@ -118,4 +118,23 @@ static inline int Draw_LineVertices(const u_long* words, int max_len, int* lengt
     return count;
 }
 
+
+// ===== SDL GPU backend only (tests and diagnostics) =====
+// The native (1x) VRAM's deferred draws: batches queued instead of drawn
+// into the native VRAM, drawn there later, dropped unseen at their ring
+// generation's reuse, dropped as overwritten whole, and the out-of-date
+// native pixels rebuilt from the scaled picture for a read.
+typedef struct DrawNativeStats {
+    unsigned long long deferred, replayed, dropped, overwritten;
+    unsigned long long repaired_pixels;
+} DrawNativeStats;
+void Draw_GetNativeStats(DrawNativeStats* out);
+// Turns the deferral on or off (off draws what is queued); the previous.
+int Draw_SetNativeDefer(int enabled);
+// Command buffers are submitted after this many sampler descriptors (0:
+// never); returns the previous limit. Draw_GetCommandRollovers counts those
+// submissions.
+unsigned Draw_SetCommandDescriptorLimit(unsigned limit);
+unsigned long long Draw_GetCommandRollovers(void);
+
 #endif

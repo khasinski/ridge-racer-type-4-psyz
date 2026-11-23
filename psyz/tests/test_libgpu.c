@@ -873,6 +873,194 @@ ZTEST(gpu, ssaa_window_downscale_resolves_distant_texture_detail) {
 #endif
 }
 
+#ifdef PSYZ_TEST_SDL_GPU
+/* A frame of many batches and drawing states: overlapping opaque and
+ * semi-transparent textured quads in the four blend modes, lines, mask
+ * bits, drawing areas and offsets, and a texture the GPU drew itself (part
+ * of the display buffer drawn first, read back onto it). */
+static void DrawCommandBoundaryScene(int frame) {
+    static u16 texels[128 * 64];
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 128; ++x)
+            texels[y * 128 + x] =
+                (u16)((x * 31 / 127) | ((y * 31 / 63) << 5) |
+                      (((x ^ y) & 31) << 10) | ((x + y) % 7 ? 0 : 0x8000));
+    RECT page = {640, 0, 128, 64};
+    LoadImage(&page, (u_long*)texels);
+    RECT clear = {0, 0, 320, 240};
+    ClearImage(&clear, 16, 32, 48);
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 240);
+    env.dtd = 1;
+    PutDrawEnv(&env);
+    for (int i = 0; i < 400; ++i) {
+        if (i % 50 == 25) {
+            DR_AREA area;
+            RECT r = {(short)(i / 50 * 6), (short)(i / 50 * 3),
+                      (short)(316 - i / 50 * 12), (short)(236 - i / 50 * 6)};
+            SetDrawArea(&area, &r);
+            DrawPrim(&area);
+        }
+        if (i % 90 == 45) {
+            /* GP0 E6h: set the mask bit on every pixel drawn, or not */
+            DR_STP stp = {0};
+            setlen(&stp, 1);
+            stp.code[0] = 0xE6000000u | ((i / 90) & 1);
+            DrawPrim(&stp);
+        }
+        if (i % 40 == 7) {
+            LINE_G2 line = {0};
+            setLineG2(&line);
+            setRGB0(&line, 255, i & 255, 0);
+            setRGB1(&line, 0, 255, 255 - (i & 255));
+            setXY2(&line, i % 300, 10 + i % 200, 300 - i % 280, 230 - i % 190);
+            DrawPrim(&line);
+        }
+        POLY_FT4 q = {0};
+        setPolyFT4(&q);
+        setRGB0(&q, 64 + (i * 5 + frame) % 128, 128, 200 - i % 100);
+        setXYWH(&q, (i * 37 + frame) % 280, (i * 53) % 200, 24 + i % 17,
+                20 + i % 13);
+        setUVWH(&q, (i * 7) % 100, (i * 3) % 40, 24, 20);
+        q.tpage = getTPage(2, i & 3, 640, 0);
+        setSemiTrans(&q, i % 3 != 0);
+        DrawPrim(&q);
+    }
+    /* the GPU's own drawing as a texture: the display buffer's top left
+     * corner, semi-transparent over its middle */
+    POLY_FT4 feedback = {0};
+    setPolyFT4(&feedback);
+    setRGB0(&feedback, 128, 128, 128);
+    setXYWH(&feedback, 100, 90, 96, 64);
+    setUVWH(&feedback, 8, 8, 96, 64);
+    feedback.tpage = getTPage(2, 0, 0, 0);
+    setSemiTrans(&feedback, 1);
+    DrawPrim(&feedback);
+    DrawSync(0);
+}
+
+typedef struct BoundaryFrame {
+    u8* rendered;
+    u8* shown;
+    u16* native;
+    int w, h, sw, sh;
+} BoundaryFrame;
+
+/* Draws the scene twice (the second frame's batches can wait for the
+ * native VRAM: its buffer has been shown) and keeps the second frame. */
+static BoundaryFrame DrawBoundaryFrames(void) {
+    BoundaryFrame f = {0};
+    DISPENV disp;
+    SetDefDispEnv(&disp, 0, 0, 320, 240);
+    PutDispEnv(&disp);
+    for (int frame = 0; frame < 2; ++frame) {
+        DrawCommandBoundaryScene(frame);
+        VSync(0);
+        PutDispEnv(&disp);
+    }
+    f.rendered = Psyz_VideoAllocRenderedFrame(&f.w, &f.h);
+    f.shown = Psyz_VideoAllocHiddenDisplay(&f.sw, &f.sh);
+    f.native = malloc(1024 * 512 * sizeof(u16));
+    RECT all = {0, 0, 1024, 512};
+    StoreImage(&all, (u_long*)f.native);
+    DrawSync(0);
+    return f;
+}
+
+static void ExpectSameFrames(const BoundaryFrame* a, const BoundaryFrame* b) {
+    zassert_ptr_ne(NULL, a->rendered);
+    zassert_ptr_ne(NULL, b->rendered);
+    zassert_ptr_ne(NULL, a->shown);
+    zassert_ptr_ne(NULL, b->shown);
+    zassert_s32_eq(a->w, b->w);
+    zassert_s32_eq(a->h, b->h);
+    zassert_s32_eq(a->sw, b->sw);
+    zassert_s32_eq(a->sh, b->sh);
+    zexpect_s32_eq(0, memcmp(a->rendered, b->rendered, (size_t)a->w * a->h * 3));
+    zexpect_s32_eq(0, memcmp(a->shown, b->shown, (size_t)a->sw * a->sh * 3));
+    zexpect_s32_eq(0, memcmp(a->native, b->native, 1024 * 512 * sizeof(u16)));
+}
+
+static void FreeFrames(BoundaryFrame* f) {
+    free(f->rendered);
+    free(f->shown);
+    free(f->native);
+}
+#endif
+
+/* Each frame's GPU work goes to the GPU in several command buffers: one
+ * every few draws' worth of sampler descriptors (256 by default). Forcing a
+ * submission before every render pass must not lose or reorder anything:
+ * the drawn VRAM at the scale, the native VRAM and the presented output are
+ * the same as with no limit. */
+ZTEST(gpu, command_buffer_rollovers_keep_every_draw) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!SdlGpuHidden()) zskip("requires hidden SDL GPU output");
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
+    const unsigned scales[] = {1, 2, 4};
+    for (unsigned s = 0; s < 3; ++s) {
+        Psyz_VideoSetInternalResolution(scales[s]);
+        const unsigned previous = Draw_SetCommandDescriptorLimit(0);
+        BoundaryFrame whole = DrawBoundaryFrames();
+        Draw_SetCommandDescriptorLimit(4);
+        const unsigned long long before = Draw_GetCommandRollovers();
+        BoundaryFrame split = DrawBoundaryFrames();
+        const unsigned long long rollovers = Draw_GetCommandRollovers() - before;
+        Draw_SetCommandDescriptorLimit(previous);
+        printf("%ux: %llu command buffer rollovers in two frames\n", scales[s],
+               rollovers);
+        zexpect_s32_eq(1, rollovers > 100);
+        ExpectSameFrames(&whole, &split);
+        FreeFrames(&whole);
+        FreeFrames(&split);
+    }
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* With a scaled target the native VRAM's draws wait until something reads
+ * or writes there (here: the scene's own feedback quad, StoreImage). The
+ * pictures and the native VRAM are those of drawing every batch into both
+ * at once. */
+ZTEST(gpu, deferred_native_draws_match_immediate_ones) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!SdlGpuHidden()) zskip("requires hidden SDL GPU output");
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
+    const unsigned scales[] = {2, 4};
+    for (unsigned s = 0; s < 2; ++s) {
+        Psyz_VideoSetInternalResolution(scales[s]);
+        const int previous = Draw_SetNativeDefer(0);
+        BoundaryFrame immediate = DrawBoundaryFrames();
+        Draw_SetNativeDefer(1);
+        DrawNativeStats before, after;
+        Draw_GetNativeStats(&before);
+        BoundaryFrame deferred = DrawBoundaryFrames();
+        Draw_GetNativeStats(&after);
+        Draw_SetNativeDefer(previous);
+        printf("%ux: %llu native draws deferred, %llu drawn later\n",
+               scales[s], after.deferred - before.deferred,
+               after.replayed - before.replayed);
+        zexpect_s32_eq(1, after.deferred > before.deferred);
+        zexpect_s32_eq(1, after.replayed > before.replayed);
+        zexpect_s32_eq(1, after.repaired_pixels == before.repaired_pixels);
+        ExpectSameFrames(&immediate, &deferred);
+        FreeFrames(&immediate);
+        FreeFrames(&deferred);
+    }
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
 ZTEST(gpu, optional_model_filter_and_ssaa_preserve_native_vram_and_text) {
 #ifdef PSYZ_TEST_SDL_GPU
     if (CpuRasterizerOnly())
