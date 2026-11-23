@@ -17,6 +17,21 @@ static bool headless_renderer;
 static bool native_rasterizer_requested, native_rasterizer;
 static bool hidden_gpu_renderer;
 static SDL_GPUTexture* hidden_present_target;
+/* The hidden renderer's output size: 1280x720, or PSYZ_HEADLESS_SIZE=WxH
+ * (a window's drawable size, to measure the presentation at it). */
+static Uint32 hidden_w = 1280, hidden_h = 720;
+static void HiddenPresentSize(void) {
+    static bool read;
+    if (read) return;
+    read = true;
+    const char* env = SDL_getenv("PSYZ_HEADLESS_SIZE");
+    unsigned w = 0, h = 0;
+    if (env && sscanf(env, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64 &&
+        w <= 8192 && h <= 8192) {
+        hidden_w = w;
+        hidden_h = h;
+    }
+}
 static bool UseSoftwareBackend(void);
 #define PSYZ_SOFTWARE_ROUTING
 /* Drawing state changes between queued primitives (mask bits, drawing area,
@@ -228,8 +243,20 @@ static Uint32 antialias_width, antialias_height;
 static SDL_GPUTexture* prescale_display;
 static Uint32 prescale_width, prescale_height;
 static struct { SDL_GPUTexture* texture; Uint32 w, h; } display_reduce[14];
+/* The scale asked for: 1..PSYZ_INTERNAL_RES_MAX, or PSYZ_INTERNAL_RES_AUTO
+ * (0): the output's own resolution (OutputMatchScale). */
 static unsigned set_internal_res = 1;
 static unsigned output_internal_res = 1;
+/* Psyz_VideoSetRenderBudget: the most pixels drawn for the shown picture,
+ * as a multiple of the output's (0: no limit). */
+static float render_budget;
+/* A scaled target that could not be created caps the scale below it. */
+static unsigned scale_failure_cap = 16;
+/* The output (window drawable, or the hidden renderer's target) the scale
+ * follows; a new size is taken once it has held for a moment
+ * (OutputSizeChanged), not on every step of a window drag. */
+static Uint32 scale_output_w, scale_output_h;
+static Uint64 output_change_since;
 static bool geometry_correction = false;
 static bool dynamic_lighting = false;
 static bool effect_geometry_correction = false;
@@ -624,7 +651,7 @@ PsyzOverlayRenderCB_SDL3GPU Psyz_OverlayRender_SDL3GPU(
     return prev;
 }
 
-static SDL_GPUCommandBuffer* AcquireCmd(void) {
+static SDL_GPUCommandBuffer* AcquireCmdOnly(void) {
     if (gpu_failed || !device) return NULL;
     if (!pending_cmd) {
         command_descriptors = 0;
@@ -634,6 +661,61 @@ static SDL_GPUCommandBuffer* AcquireCmd(void) {
         }
     }
     return pending_cmd;
+}
+
+/* CLUT cache loads (ClutCacheUpdate) waiting to be recorded: a race frame
+ * loads hundreds of palettes, and a copy pass of its own for each one (a
+ * blit encoder each on Metal) cost the GPU about as much as the frame's
+ * drawing. They are recorded together, in one copy pass, before the next
+ * command: every command recorded goes through AcquireCmd, so none can
+ * change the VRAM (or read the cache) before the loads that come first. */
+typedef struct ClutLoad {
+    Uint16 x, y, w, row, to_x;
+} ClutLoad;
+static ClutLoad clut_loads[CLUT_CACHE_ROWS * 2];
+static unsigned n_clut_loads;
+static void RecordClutLoads(SDL_GPUCommandBuffer* cmd) {
+    if (!n_clut_loads)
+        return;
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+    if (!copy) {
+        n_clut_loads = 0;
+        return;
+    }
+    for (unsigned i = 0; i < n_clut_loads; ++i) {
+        const ClutLoad* l = &clut_loads[i];
+        const SDL_GPUTextureLocation src = {
+            .texture = vram_render, .x = l->x, .y = l->y};
+        const SDL_GPUTextureLocation dst = {
+            .texture = clut_cache, .x = l->to_x, .y = l->row};
+        SDL_CopyGPUTextureToTexture(copy, &src, &dst, l->w, 1, 1, false);
+    }
+    SDL_EndGPUCopyPass(copy);
+    n_clut_loads = 0;
+}
+
+/* A palette loaded again before anything else is recorded (no draw, upload
+ * or copy can have changed the VRAM in between) reads the same texels: the
+ * row loaded first serves it. A race frame loads a few dozen palettes some
+ * hundred times; each copy is a compute dispatch on Metal. Every command
+ * recorded (AcquireCmd) starts a new generation. */
+enum { CLUT_REUSE_SLOTS = 1024 };
+static struct {
+    Uint32 key, generation, load;
+    Uint16 row;
+} clut_reuse[CLUT_REUSE_SLOTS];
+static Uint32 clut_generation = 1;
+static Uint32 clut_load_count; /* rows loaded: a row is reused for a later
+                                  load only while the ring has not come
+                                  round to it again */
+
+static SDL_GPUCommandBuffer* AcquireCmd(void) {
+    SDL_GPUCommandBuffer* cmd = AcquireCmdOnly();
+    if (cmd && n_clut_loads)
+        RecordClutLoads(cmd);
+    if (++clut_generation == 0)
+        clut_generation = 1;
+    return cmd;
 }
 
 /* Fences waited for are released after the next submit. SDL's Metal
@@ -1619,11 +1701,17 @@ static bool PlatformBackend_SetPresentSync(bool enable) {
 /* The frame's drawing runs during the blank wait; the present's command
  * buffer then holds only the display copy (the frame fences of SubmitFrame
  * still bound the frames in flight). */
+static bool GpuTimeLog(void);
+static double GpuTimedSubmit(void);
+static double gpu_time_draw;
 static void PlatformBackend_SubmitDrawing(void) {
     if (gpu_failed || !device)
         return;
     DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
-    SubmitCmd();
+    if (GpuTimeLog())
+        gpu_time_draw += GpuTimedSubmit();
+    else
+        SubmitCmd();
 }
 
 static void UpdateScissor(void);
@@ -1761,16 +1849,96 @@ static unsigned AdjustInternalRes(unsigned scale) {
     return n;
 }
 
-static void ApplyPendingInternalRes(void) {
+static void HiddenPresentSize(void);
+/* The output's pixel size: the window's drawable size, or the hidden
+ * renderer's target. */
+static void OutputPixelSize(Uint32* w, Uint32* h) {
+    int ww = 0, wh = 0;
+    if (hidden_gpu_renderer) {
+        HiddenPresentSize();
+        ww = (int)hidden_w;
+        wh = (int)hidden_h;
+    } else if (sdl3_window) {
+        SDL_GetWindowSizeInPixels(sdl3_window, &ww, &wh);
+    }
+    *w = ww > 0 ? (Uint32)ww : 1280;
+    *h = wh > 0 ? (Uint32)wh : 720;
+}
+
+/* Picture rows the scale is chosen for: a PS1 picture's 240 lines (a PAL
+ * 256-line one is close; a fixed count keeps the scale from changing, and
+ * the scaled VRAM from being made again, between screens). */
+static float ScalePictureRows(void) { return 240.0f; }
+
+/* The height of the game picture in the output: the 16:9 box of the
+ * widescreen view (a 4:3 picture is a bit narrower, the same height). */
+static float OutputPictureHeight(void) {
+    if (!scale_output_w || !scale_output_h)
+        OutputPixelSize(&scale_output_w, &scale_output_h);
+    return SDL_min((float)scale_output_h, (float)scale_output_w * 9.0f / 16.0f);
+}
+
+/* The whole scale that draws the picture at least at the output's
+ * resolution (so the last step only shrinks it). */
+static unsigned OutputMatchScale(void) {
+    const float exact = OutputPictureHeight() / ScalePictureRows();
+    unsigned n = (unsigned)SDL_ceilf(exact - 0.05f);
+    return SDL_clamp(n, 1u, 16u);
+}
+
+/* The scale shown (antialiasing resolves to it). */
+static unsigned RequestedScale(void) {
+    return set_internal_res == PSYZ_INTERNAL_RES_AUTO ? OutputMatchScale()
+                                                      : set_internal_res;
+}
+
+/* The scale drawn at: antialiasing doubles the shown scale; the render
+ * budget keeps the pixels drawn under budget x the output's (never below
+ * the output's own resolution, and never above the shown scale's double). */
+static unsigned PhysicalScale(unsigned shown) {
     const char* cheap = SDL_getenv("PSYZ_AA_CHEAP");
-    unsigned requested = set_internal_res;
+    unsigned n = shown;
     if (set_antialiasing)
-        requested = cheap && *cheap == '1' && requested > 2 ? requested + 2 : requested * 2;
-    unsigned n = AdjustInternalRes(requested);
+        n = cheap && *cheap == '1' && n > 2 ? n + 2 : n * 2;
+    if (render_budget > 0.0f) {
+        const float match = OutputPictureHeight() / ScalePictureRows();
+        unsigned cap = (unsigned)SDL_floorf(match * SDL_sqrtf(render_budget) + 0.001f);
+        cap = SDL_max(cap, OutputMatchScale());
+        /* the scaled VRAM pair: 8 MiB a scale step squared */
+        cap = SDL_min(cap, 12u);
+        n = SDL_min(n, cap);
+    }
+    return SDL_min(n, scale_failure_cap);
+}
+
+/* The output size the scale follows changed and has held (Present). */
+static bool OutputSizeChanged(void) {
+    if (set_internal_res != PSYZ_INTERNAL_RES_AUTO && render_budget <= 0.0f)
+        return false;
+    Uint32 w, h;
+    OutputPixelSize(&w, &h);
+    if (w == scale_output_w && h == scale_output_h) {
+        output_change_since = 0;
+        return false;
+    }
+    const Uint64 now = SDL_GetTicks();
+    if (!output_change_since)
+        output_change_since = now;
+    if (now - output_change_since < 250 && scale_output_w)
+        return false;
+    output_change_since = 0;
+    scale_output_w = w;
+    scale_output_h = h;
+    return true;
+}
+
+static void ApplyPendingInternalRes(void) {
+    const unsigned shown = RequestedScale();
+    unsigned n = AdjustInternalRes(PhysicalScale(shown));
     bool want_scaled = n > 1 || set_geometry_correction ||
                        set_effect_geometry_correction || set_model_filtering || set_sprite_filtering;
     bool have_scaled = scaled_vram_render != NULL;
-    if (n == internal_res && set_internal_res == output_internal_res && set_geometry_correction == geometry_correction &&
+    if (n == internal_res && SDL_min(shown, n) == output_internal_res && set_geometry_correction == geometry_correction &&
         set_effect_geometry_correction == effect_geometry_correction &&
         set_antialiasing == antialiasing &&
         set_model_filtering == model_filtering && set_sprite_filtering == sprite_filtering && want_scaled == have_scaled) {
@@ -1788,7 +1956,7 @@ static void ApplyPendingInternalRes(void) {
             unsigned requested_n = n;
             n = internal_res;
             set_antialiasing = antialiasing;
-            set_internal_res = output_internal_res;
+            scale_failure_cap = SDL_max(requested_n > 1 ? requested_n - 1 : 1, internal_res);
             if (!have_scaled && requested_n > 1 &&
                 (set_geometry_correction || set_effect_geometry_correction ||
                  set_model_filtering || set_sprite_filtering) &&
@@ -1835,7 +2003,7 @@ static void ApplyPendingInternalRes(void) {
         antialias_width = antialias_height = 0;
     }
     internal_res = n;
-    output_internal_res = SDL_min(set_internal_res, n);
+    output_internal_res = SDL_min(shown, n);
     geometry_correction = set_geometry_correction;
     if (geometry_correction || set_effect_geometry_correction) {
         pgxp_trace_budget=4;
@@ -1855,8 +2023,14 @@ static void ApplyPendingInternalRes(void) {
     Psyz_PgxpSetCulling(geometry_correction);
     Psyz_PgxpSetEffectEnabled(effect_geometry_correction);
     UpdateScissor();
-    INFOF("internal resolution set to %dx (%dx%d), geometry_correction=%d", n,
-          VRAM_W * n, VRAM_H * n, (int)geometry_correction);
+    if (!scale_output_w)
+        OutputPixelSize(&scale_output_w, &scale_output_h);
+    INFOF("internal resolution set to %ux (picture %ux%u, shown at %ux, %s), "
+          "output %ux%u, geometry_correction=%d",
+          n, (unsigned)(display_size.x * n), (unsigned)(display_size.y * n),
+          output_internal_res,
+          set_internal_res == PSYZ_INTERNAL_RES_AUTO ? "auto" : "fixed",
+          scale_output_w, scale_output_h, (int)geometry_correction);
 }
 
 /* Display-only title material. Native RGB24 pixels remain the UI authority. */
@@ -2277,6 +2451,28 @@ static void FallbackPresent(void) {
     present_commit_pending = frame_presented && !host_clock_pause_depth;
 }
 
+/* PSYZ_GPU_TIME=file: one line a present, "<ms> <draw_ms> <present_ms>":
+ * the GPU's time for the frame's drawing (submitted at the blank) and for
+ * its presentation (scaling to the output). Each submission is waited for
+ * on its own, so the GPU starts it idle (diagnostics only: it serialises
+ * the CPU and the GPU). */
+static FILE* gpu_time_log;
+static bool GpuTimeLog(void) {
+    static int state = -1;
+    if (state < 0) {
+        const char* path = SDL_getenv("PSYZ_GPU_TIME");
+        gpu_time_log = path && *path ? fopen(path, "w") : NULL;
+        state = gpu_time_log != NULL;
+    }
+    return state > 0;
+}
+/* Submits and waits; the milliseconds the GPU took. */
+static double GpuTimedSubmit(void) {
+    const Uint64 submit = SDL_GetPerformanceCounter();
+    SubmitCmdAndWait();
+    return (double)(SDL_GetPerformanceCounter() - submit) * 1000.0 /
+           (double)SDL_GetPerformanceFrequency();
+}
 static void PlatformBackend_Present(void) {
     frame_presented=false;present_commit_pending=false;
     if(host_clock_pause_depth||SDL_GetAtomicInt(&app_in_background)){present_window_start=0;present_window_frames=0;actual_present_fps=0;}
@@ -2298,6 +2494,7 @@ static void PlatformBackend_Present(void) {
     }
 
     DRAW_FLUSH_FOR(DRAW_FLUSH_PRESENT);
+    OutputSizeChanged();
     ApplyPendingInternalRes();
     if (native_rasterizer)
         PresentNativeVram();
@@ -2325,7 +2522,8 @@ static void PlatformBackend_Present(void) {
             sc_w = ws_capture_width;
             sc_h = ws_capture_height;
         } else if (hidden_gpu_renderer) {
-            sc_w = 1280; sc_h = 720;
+            HiddenPresentSize();
+            sc_w = hidden_w; sc_h = hidden_h;
             if (!hidden_present_target) {
                 const SDL_GPUTextureCreateInfo info = {
                     .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
@@ -2542,7 +2740,14 @@ static void PlatformBackend_Present(void) {
         pgxp_valid_polygons=pgxp_fallback_polygons=pgxp_nonfinite_polygons=0;
     }
     if (ws_capture_active) SubmitCmd();
-    else SubmitFrame();
+    else if (GpuTimeLog()) {
+        const double present_ms = GpuTimedSubmit();
+        fprintf(gpu_time_log, "%.3f %.3f %.3f\n",
+                (double)SDL_GetPerformanceCounter() * 1000.0 /
+                    (double)SDL_GetPerformanceFrequency(),
+                gpu_time_draw, present_ms);
+        gpu_time_draw = 0.0;
+    } else SubmitFrame();
 }
 
 /* Releases the device and everything made on it (idle already). */
@@ -2551,6 +2756,7 @@ static void ReleaseGpuDevice(void) {
         return;
     if (hidden_present_target) SDL_ReleaseGPUTexture(device, hidden_present_target);
     hidden_present_target = NULL;
+    n_clut_loads = 0;
     ReleaseFrameFences(); /* global idle already established */
     ReleaseRingFences();
     ReleaseWaitedFences();
@@ -2846,7 +3052,8 @@ unsigned char* Psyz_VideoAllocHiddenDisplay(int* w, int* h) {
     if (w) *w = 0;
     if (h) *h = 0;
     if (!w || !h || !hidden_gpu_renderer || !hidden_present_target) return NULL;
-    const unsigned width = 1280, height = 720;
+    HiddenPresentSize();
+    const unsigned width = hidden_w, height = hidden_h;
     const size_t count = (size_t)width * height;
     unsigned char* pixels = malloc(count * 3);
     const SDL_GPUTransferBufferCreateInfo info = {
@@ -3047,13 +3254,24 @@ unsigned Psyz_VideoGetInternalResolution(void) {
     return output_internal_res;
 }
 
+int Psyz_VideoSetRenderBudget(float output_multiple) {
+    if (gpu_failed) return -1;
+    render_budget = output_multiple > 0.0f ? output_multiple : 0.0f;
+    if (sdl3_window && is_platform_init_successful)
+        ApplyPendingInternalRes();
+    return 0;
+}
+
+unsigned Psyz_VideoGetDrawScale(void) {
+    return internal_res;
+}
+
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
     if (gpu_failed) return -1;
-    if (fallback_presenter && multiplier != 1)
+    if (fallback_presenter && multiplier > 1)
         return -1; /* the CPU rasterizer draws 1x only */
-    if (multiplier < 1) {
-        return -1;
-    }
+    if (fallback_presenter)
+        multiplier = 1;
     if (multiplier > PSYZ_INTERNAL_RES_MAX) {
         WARNF("internal resolution %dx exceeds maximum value of %dx",
               multiplier, PSYZ_INTERNAL_RES_MAX);
@@ -3693,29 +3911,37 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
         DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
     else if (clut_cache_loads + 1 >= CLUT_CACHE_ROWS)
         DRAW_FLUSH_FOR(DRAW_FLUSH_CLUT);
-    SDL_GPUCommandBuffer* cmd = AcquireCmd();
-    SDL_GPUCopyPass* copy = cmd ? SDL_BeginGPUCopyPass(cmd) : NULL;
-    if (!copy)
+    if (gpu_failed || !device || !clut_cache)
         return;
+    if (n_clut_loads + 2 > SDL_arraysize(clut_loads)) {
+        SDL_GPUCommandBuffer* cmd = AcquireCmd(); /* records the queued */
+        if (!cmd)
+            return;
+    }
     clut_cache_reg = clut;
     clut_cache_8bit = depth == 1;
-    clut_cache_row = (clut_cache_row + 1) % CLUT_CACHE_ROWS;
-    clut_cache_loads++;
-    const int first = SDL_min(cw, VRAM_W - cx);
-    const SDL_GPUTextureLocation src = {
-        .texture = vram_render, .x = (Uint32)cx, .y = (Uint32)cy};
-    const SDL_GPUTextureLocation dst = {
-        .texture = clut_cache, .y = clut_cache_row};
-    SDL_CopyGPUTextureToTexture(copy, &src, &dst, (Uint32)first, 1, 1, false);
-    if (first < cw) {
-        const SDL_GPUTextureLocation src2 = {
-            .texture = vram_render, .y = (Uint32)cy};
-        const SDL_GPUTextureLocation dst2 = {
-            .texture = clut_cache, .x = (Uint32)first, .y = clut_cache_row};
-        SDL_CopyGPUTextureToTexture(copy, &src2, &dst2, (Uint32)(cw - first), 1,
-                                    1, false);
+    const Uint32 key = (Uint32)cx | (Uint32)cy << 10 | (Uint32)(cw == 256) << 19;
+    const unsigned slot = (key * 2654435761u) >> 22;
+    if (clut_reuse[slot].generation == clut_generation &&
+        clut_reuse[slot].key == key &&
+        clut_load_count - clut_reuse[slot].load < CLUT_CACHE_ROWS - 1) {
+        clut_cache_row = clut_reuse[slot].row;
+        return;
     }
-    SDL_EndGPUCopyPass(copy);
+    /* the ring's next row (clut_cache_row may name a reused older one) */
+    clut_cache_row = clut_load_count % CLUT_CACHE_ROWS;
+    clut_cache_loads++;
+    clut_reuse[slot].key = key;
+    clut_reuse[slot].generation = clut_generation;
+    clut_reuse[slot].row = (Uint16)clut_cache_row;
+    clut_reuse[slot].load = ++clut_load_count;
+    const int first = SDL_min(cw, VRAM_W - cx);
+    clut_loads[n_clut_loads++] = (ClutLoad){
+        (Uint16)cx, (Uint16)cy, (Uint16)first, (Uint16)clut_cache_row, 0};
+    if (first < cw)
+        clut_loads[n_clut_loads++] = (ClutLoad){
+            0, (Uint16)cy, (Uint16)(cw - first), (Uint16)clut_cache_row,
+            (Uint16)first};
 }
 
 /* Flushes the batch before a textured primitive whose texels or CLUT the
@@ -5198,7 +5424,7 @@ abort_flush:
  * frame boundary. */
 static bool NativeRasterizerWanted(void) {
     return native_rasterizer_requested && !headless_renderer && device &&
-           vram_render && is_platform_init_successful && set_internal_res == 1 &&
+           vram_render && is_platform_init_successful && RequestedScale() == 1 &&
            !set_antialiasing && !set_geometry_correction &&
            !set_effect_geometry_correction && !set_model_filtering &&
            !set_sprite_filtering && !widescreen &&

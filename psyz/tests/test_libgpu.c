@@ -2498,6 +2498,38 @@ ZTEST(gpu, vram_transfers_wrap_and_fills_round) {
         zexpect_u16_eq(i < 8 ? 0 : 0x7fff, line[i]);
 }
 
+/* Auto follows the output: the hidden renderer's 1280x720 shows a 240-line
+ * picture at 3x; antialiasing doubles the drawn scale unless the render
+ * budget (2x the output's pixels) holds it at 4x. */
+ZTEST(gpu, internal_res_auto_and_budget) {
+    const char* headless = getenv("PSYZ_HEADLESS");
+    zskip_targets("psp;ps1");
+    zassert_s32_eq(0, Psyz_VideoSetInternalResolution(2));
+    if (Psyz_VideoGetInternalResolution() != 2 || !headless ||
+        strcmp(headless, "gpu") || getenv("PSYZ_HEADLESS_SIZE")) {
+        Psyz_VideoSetInternalResolution(1);
+        zskip("requires the hidden GPU renderer at its default size");
+    }
+    zassert_s32_eq(0, Psyz_VideoSetInternalResolution(PSYZ_INTERNAL_RES_AUTO));
+    zexpect_s32_eq(3, (int)Psyz_VideoGetInternalResolution());
+    zexpect_s32_eq(3, (int)Psyz_VideoGetDrawScale());
+    Psyz_VideoSetAntialiasing(1);
+    zexpect_s32_eq(3, (int)Psyz_VideoGetInternalResolution());
+    zexpect_s32_eq(6, (int)Psyz_VideoGetDrawScale());
+    Psyz_VideoSetRenderBudget(2.0f);
+    zexpect_s32_eq(4, (int)Psyz_VideoGetDrawScale());
+    /* a fixed scale is held to the budget too */
+    zassert_s32_eq(0, Psyz_VideoSetInternalResolution(8));
+    zexpect_s32_eq(4, (int)Psyz_VideoGetDrawScale());
+    zexpect_s32_eq(4, (int)Psyz_VideoGetInternalResolution());
+    zassert_s32_eq(0, Psyz_VideoSetInternalResolution(2));
+    Psyz_VideoSetRenderBudget(0.0f);
+    zexpect_s32_eq(4, (int)Psyz_VideoGetDrawScale());
+    zexpect_s32_eq(2, (int)Psyz_VideoGetInternalResolution());
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetInternalResolution(1);
+}
+
 ZTEST(gpu, move_image_internal_res) {
     u_short tpage, clut;
     RECT rect = {16, 16, 64, 64};
@@ -2505,7 +2537,7 @@ ZTEST(gpu, move_image_internal_res) {
     u_short readback[16 * 16];
     RECT rectStore = {704, 320, 16, 16};
     zskip_targets("psp;ps1");
-    zassert_s32_eq(-1, Psyz_VideoSetInternalResolution(0));
+    zassert_s32_eq(-1, Psyz_VideoSetInternalResolution(PSYZ_INTERNAL_RES_MAX + 1));
     zassert_s32_eq(0, Psyz_VideoSetInternalResolution(2));
     if (Psyz_VideoGetInternalResolution() != 2) {
         // PSYZ_HEADLESS=1 draws with the CPU rasterizer at 1x only

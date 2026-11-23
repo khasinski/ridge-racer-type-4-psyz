@@ -176,6 +176,9 @@ void Psyz_VideoSetDrawArea(PsyzRect rect);
 
 /** Maximum accepted internal resolution multiplier */
 #define PSYZ_INTERNAL_RES_MAX 8
+/** Internal resolution that follows the output: the whole multiple that
+ * draws the picture at least at the window's (drawable) resolution. */
+#define PSYZ_INTERNAL_RES_AUTO 0
 
 #ifndef __PSP__
 /**
@@ -194,10 +197,32 @@ void Psyz_VideoSetDrawArea(PsyzRect rect);
  * Safe to call at runtime; the change applies on the next presented frame
  * without needing to restart the game.
  *
- * @param multiplier Integer scale factor, between 1 to PSYZ_INTERNAL_RES_MAX
- * @return 0 on success, -1 if multiplier < 1
+ * @param multiplier Integer scale factor, between 1 to PSYZ_INTERNAL_RES_MAX,
+ *        or PSYZ_INTERNAL_RES_AUTO to follow the output's size (the SDL GPU
+ *        backend; others treat it as 1)
+ * @return 0 on success, -1 if the multiplier is not supported
  */
 int Psyz_VideoSetInternalResolution(unsigned multiplier);
+
+/**
+ * @brief Limit the pixels drawn for the picture (default: no limit)
+ *
+ * With a budget, the scale drawn at (the internal resolution, doubled by
+ * antialiasing) is lowered until the picture drawn has at most
+ * output_multiple times the output's pixels, though never below the scale
+ * that matches the output, and at most 12x. A window resize chooses again.
+ * Settings saved for a large monitor then stay affordable on a small one,
+ * and antialiasing at a high scale becomes partial supersampling instead of
+ * four times the pixels. 0 removes the limit (an explicit scale is drawn
+ * as asked). The SDL GPU backend only; others ignore it.
+ *
+ * @return 0 on success, -1 when the renderer failed
+ */
+int Psyz_VideoSetRenderBudget(float output_multiple);
+
+/** @return the scale the frames are drawn at (with antialiasing and the
+ *  render budget applied); Psyz_VideoGetInternalResolution is the shown one */
+unsigned Psyz_VideoGetDrawScale(void);
 
 /**
  * @brief Get the current internal resolution multiplier

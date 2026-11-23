@@ -924,10 +924,15 @@ int Psyz_VideoSetGeometryCorrection(int enabled) {
     return 0;
 }
 
+int Psyz_VideoSetRenderBudget(float output_multiple) {
+    (void)output_multiple;
+    return 0;
+}
+unsigned Psyz_VideoGetDrawScale(void) { return internal_res; }
+
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
-    if (multiplier < 1) {
-        return -1;
-    }
+    if (multiplier == PSYZ_INTERNAL_RES_AUTO)
+        multiplier = 1; /* no output-sized scale here */
     if (multiplier > PSYZ_INTERNAL_RES_MAX) {
         WARNF("internal resolution %dx exceeds maximum value of %dx",
               multiplier, PSYZ_INTERNAL_RES_MAX);

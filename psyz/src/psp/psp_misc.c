@@ -9,8 +9,13 @@ void Psyz_SetTitle(const char* str) { (void)str; }
 void Psyz_SetWindowScale(int scale) { (void)scale; }
 
 int Psyz_VideoSetInternalResolution(unsigned multiplier) {
-    return multiplier == 1 ? 0 : -1;
+    return multiplier <= 1 ? 0 : -1;
 }
+int Psyz_VideoSetRenderBudget(float output_multiple) {
+    (void)output_multiple;
+    return 0;
+}
+unsigned Psyz_VideoGetDrawScale(void) { return 1; }
 
 unsigned Psyz_VideoGetInternalResolution(void) { return 1; }
 
