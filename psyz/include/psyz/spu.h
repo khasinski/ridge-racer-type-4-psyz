@@ -3,7 +3,13 @@
 
 /**
  * @file spu.h
- * @brief Platform-agnostic PS1 SPU emulation endpoints.
+ * @brief The software sound mixer behind libspu/libsnd.
+ *
+ * It plays the game's own sound data as the SPU did: VAG ADPCM voices
+ * with their pitch, Gaussian interpolation, ADSR envelopes, FM and noise,
+ * the reverb, and the CD/XA audio, mixed to 44100 Hz stereo for the host's
+ * audio device. libspu's register writes and transfers reach it directly
+ * (no DMA, interrupt or transfer timing).
  *
  * Software-SPU state access is serialized with the active audio backend's
  * recursive mutex. Callers may hold Psyz_AudioLock to batch register/RAM
@@ -20,7 +26,7 @@ extern "C" {
 #endif
 
 /**
- * PS1 SPU constants (the SPU emulator is platform-agnostic; SDL or any other
+ * Mixer constants (platform-agnostic; SDL or any other
  * audio backend pulls 44100 Hz stereo short frames from Psyz_SpuPullSamples).
  */
 #define PSYZ_SPU_RAM_SIZE (512 * 1024) /**< must be a power of two */
@@ -28,7 +34,7 @@ extern "C" {
 #define PSYZ_SPU_SAMPLE_RATE 44100     /**< match fixed PS1 sample rate */
 
 /**
- * @brief Initialize SPU emulation state
+ * @brief Initialize the mixer state
  *
  * Idempotent; safe to call multiple times.
  */

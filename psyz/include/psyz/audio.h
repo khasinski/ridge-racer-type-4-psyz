@@ -54,7 +54,7 @@ void Psyz_AudioDestroy(void);
  */
 void Psyz_AudioPause(void);
 int Psyz_AudioIsPaused(void);
-/** Host output gain only; does not alter emulated SPU registers or capture PCM.
+/** Host output gain only; does not alter the SPU registers or captured PCM.
  * SDL backend, range 0..100, can be selected before audio initialization. */
 int Psyz_AudioSetOutputVolume(unsigned percent);
 unsigned Psyz_AudioGetOutputVolume(void);

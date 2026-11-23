@@ -282,7 +282,7 @@ static inline int spu_voice_envelope_clock(VoiceState* vs, int rate) {
 
 // process voice ADSR envelope by one sample, calculate ADSR envelope volume
 static inline void spu_voice_envelope_step(VoiceState* vs) {
-    if (vs->delay_ticks) { // simulate PS1 SPU key on latency
+    if (vs->delay_ticks) { // a note starts after the key-on's delay
         vs->delay_ticks--;
         return;
     }

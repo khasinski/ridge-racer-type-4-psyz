@@ -9,9 +9,6 @@ static volatile unsigned* dma_spu_bcr = (unsigned*)0x1F8010C4;
 static volatile unsigned* dma_spu_chcr = (unsigned*)0x1F8010C8;
 static volatile unsigned* dma_dpcr = (unsigned*)0x1F8010F0;
 static volatile unsigned* spu_delay = (unsigned*)0x1F801014;
-#else
-extern unsigned* dma_dpcr;
-extern unsigned* spu_delay;
 #endif
 
 u16 _spu_tsa = 0;
@@ -42,7 +39,9 @@ int _spu_init(int bHot) {
     spu_dma_end(); // a transfer still running ends now
 #endif
 
+#ifndef __psyz
     *dma_dpcr |= DMA_DPCR_SPU_PRIORITY_HIGH | DMA_DPCR_MASK_DMA4_ENABLE;
+#endif
     SPUW(main_vol.left, 0);
     SPUW(main_vol.right, 0);
     SPUW(spucnt, 0);

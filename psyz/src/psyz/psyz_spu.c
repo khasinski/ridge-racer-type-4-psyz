@@ -19,8 +19,11 @@ _Static_assert(
 #define CD_RING_MASK (CD_RING_FRAMES - 1) // ring wrapper
 #define CD_RING_LOW_WATER 1024            // refill when short of N frames
 
-// Full SPU state
-static struct {
+/* The software mixer: the SPU's sound RAM, the game's register bank
+ * (_spu_RXX) and the decoders, envelopes and reverb that turn them into
+ * 44.1 kHz stereo. The audio device's thread (or, in offline runs, the
+ * deterministic field clock) pulls the samples; nothing waits on it. */
+static struct SpuMixer {
     u8 ram[PSYZ_SPU_RAM_SIZE];
 
     // Transfer address (byte address into SPU RAM)
@@ -54,32 +57,23 @@ void Psyz_SpuInit(void) {
     if (!spu.initialized) {
         memset(&spu, 0, sizeof(spu));
         spu.initialized = 1;
-        INFOF("SPU emulation initialized");
+        INFOF("SPU mixer initialized");
     }
     Psyz_AudioUnlock();
 }
 
-static void spu_reset(void) {
+// A hot reset keeps the sound RAM (the banks already transferred).
+void Psyz_SpuReset(int hot) {
+    Psyz_AudioLock();
     _spu_RXX->rxx.spustat = 0;
     for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
         _spu_RXX->rxx.voice[v].volumex = 0;
     }
-    memset(&spu, 0, sizeof(spu));
-}
-
-static void spu_reset_hot(void) {
-    u8 saved_ram[PSYZ_SPU_RAM_SIZE];
-    memcpy(saved_ram, spu.ram, PSYZ_SPU_RAM_SIZE);
-    spu_reset();
-    memcpy(spu.ram, saved_ram, PSYZ_SPU_RAM_SIZE);
-}
-
-void Psyz_SpuReset(int hot) {
-    Psyz_AudioLock();
     if (hot) {
-        spu_reset_hot();
+        const size_t state = offsetof(struct SpuMixer, transfer_addr);
+        memset((u8*)&spu + state, 0, sizeof(spu) - state);
     } else {
-        spu_reset();
+        memset(&spu, 0, sizeof(spu));
     }
     spu.initialized = 1;
     Psyz_AudioUnlock();
