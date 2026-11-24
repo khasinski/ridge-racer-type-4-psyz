@@ -1979,6 +1979,9 @@ typedef struct {
     double exact[3];
 } PgxpIntplEntry;
 #define PGXP_INTPL_RING 64u
+#ifndef PGXP_INTPL_EXACT_PIXELS
+#define PGXP_INTPL_EXACT_PIXELS 1.0
+#endif
 static PgxpIntplEntry pgxp_intpl_ring[PGXP_INTPL_RING];
 static unsigned int pgxp_intpl_next;
 static int pgxp_intpl = 0;
@@ -2002,6 +2005,51 @@ static int PgxpIntplFind(int x, int y, int z, double exact[3]) {
     return 0;
 }
 
+/* A vertex in view space (before the projection's sf scaling). */
+static inline void PgxpViewSpace(const double v[3], double* fx, double* fy,
+                                 double* fz) {
+    if (pgxp_matrix_valid) {
+        *fx = pgxp_trans[0] + pgxp_rot[0][0] * v[0] + pgxp_rot[0][1] * v[1] +
+              pgxp_rot[0][2] * v[2];
+        *fy = pgxp_trans[1] + pgxp_rot[1][0] * v[0] + pgxp_rot[1][1] * v[1] +
+              pgxp_rot[1][2] * v[2];
+        *fz = pgxp_trans[2] + pgxp_rot[2][0] * v[0] + pgxp_rot[2][1] * v[1] +
+              pgxp_rot[2][2] * v[2];
+    } else {
+        *fx = (double)M.t[0] + ((double)M.m[0][0] * v[0] +
+                                (double)M.m[0][1] * v[1] +
+                                (double)M.m[0][2] * v[2]) *
+                                   (1.0 / 4096.0);
+        *fy = (double)M.t[1] + ((double)M.m[1][0] * v[0] +
+                                (double)M.m[1][1] * v[1] +
+                                (double)M.m[1][2] * v[2]) *
+                                   (1.0 / 4096.0);
+        *fz = (double)M.t[2] + ((double)M.m[2][0] * v[0] +
+                                (double)M.m[2][1] * v[1] +
+                                (double)M.m[2][2] * v[2]) *
+                                   (1.0 / 4096.0);
+    }
+}
+
+/* Whether an INTPL vertex takes its exact value (Psyz_GteSetPgxpIntpl): only
+ * where the whole-unit truncation it undoes projects under a screen pixel,
+ * the hairline cracks and sub-pixel strips of far subdivided tiles. Close to
+ * the camera that truncation spans several pixels and the exact vertices
+ * no longer met the polygons around them, drawn from whole-unit vertices:
+ * the sky showed through a tunnel's ceiling at the top of the screen. ix..iz
+ * is the view-space position of the whole-unit vertex, ex..ez that of its
+ * exact value. */
+static inline int PgxpIntplSubpixel(double ix, double iy, double iz,
+                                    double ex, double ey, double ez) {
+    const double h = (double)(unsigned short)H;
+    if (iz * 2.0 <= h || ez * 2.0 <= h) {
+        return 0;
+    }
+    const double dx = ex * (h / ez) - ix * (h / iz);
+    const double dy = ey * (h / ez) - iy * (h / iz);
+    return dx * dx + dy * dy < PGXP_INTPL_EXACT_PIXELS * PGXP_INTPL_EXACT_PIXELS;
+}
+
 static inline PgxpSxyEntry PgxpRecordVertex(
     int sf, int lm, int vx, int vy, int vz, int sx, int sy) {
     PgxpSxyEntry out = {0};
@@ -2014,27 +2062,15 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     }
     double fx, fy, fz;
     double v[3] = {vx, vy, vz};
-    PgxpIntplFind(vx, vy, vz, v);
-    if (pgxp_matrix_valid) {
-        fx = pgxp_trans[0] + pgxp_rot[0][0] * v[0] + pgxp_rot[0][1] * v[1] +
-             pgxp_rot[0][2] * v[2];
-        fy = pgxp_trans[1] + pgxp_rot[1][0] * v[0] + pgxp_rot[1][1] * v[1] +
-             pgxp_rot[1][2] * v[2];
-        fz = pgxp_trans[2] + pgxp_rot[2][0] * v[0] + pgxp_rot[2][1] * v[1] +
-             pgxp_rot[2][2] * v[2];
-    } else {
-        fx = (double)M.t[0] + ((double)M.m[0][0] * v[0] +
-                               (double)M.m[0][1] * v[1] +
-                               (double)M.m[0][2] * v[2]) *
-                                  (1.0 / 4096.0);
-        fy = (double)M.t[1] + ((double)M.m[1][0] * v[0] +
-                               (double)M.m[1][1] * v[1] +
-                               (double)M.m[1][2] * v[2]) *
-                                  (1.0 / 4096.0);
-        fz = (double)M.t[2] + ((double)M.m[2][0] * v[0] +
-                               (double)M.m[2][1] * v[1] +
-                               (double)M.m[2][2] * v[2]) *
-                                  (1.0 / 4096.0);
+    PgxpViewSpace(v, &fx, &fy, &fz);
+    if (PgxpIntplFind(vx, vy, vz, v)) {
+        double ex, ey, ez;
+        PgxpViewSpace(v, &ex, &ey, &ez);
+        if (PgxpIntplSubpixel(fx, fy, fz, ex, ey, ez)) {
+            fx = ex;
+            fy = ey;
+            fz = ez;
+        }
     }
     if (!sf) {
         fx *= 4096.0;

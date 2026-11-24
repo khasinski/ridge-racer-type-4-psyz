@@ -1298,7 +1298,8 @@ ZTEST(gpu, geometry_metadata_follows_sxy_loads_and_library_stores) {
 
 /* With geometry correction a sliver that snaps to zero area keeps the facing
  * of its precise projection (Psyz_GteSetPgxpNclip), and a vertex INTPL
- * interpolated keeps the fraction INTPL truncated (Psyz_GteSetPgxpIntpl). */
+ * interpolated keeps the fraction INTPL truncated (Psyz_GteSetPgxpIntpl)
+ * where that fraction projects under a pixel. */
 ZTEST(gpu, geometry_correction_precise_nclip_and_intpl) {
 #ifdef PSYZ_TEST_SDL_GPU
     extern void Psyz_PgxpNextFrame(void);
@@ -1357,6 +1358,29 @@ ZTEST(gpu, geometry_correction_precise_nclip_and_intpl) {
         Psyz_GteStoreSxyTo(14, &xy);
         zassert_s32_eq(1, Psyz_PgxpLookupVertex(&xy, xy, &x, &y, &w));
         const float want = 160.0f + (on ? 3.5f : 3.0f) * 256.0f / 700.0f;
+        zassert_s32_eq(1, x > want - 0.001f && x < want + 0.001f);
+    }
+    /* Close to the camera (a 4x scaled view at depth 300) the half unit
+     * projects to 1.7 pixels: the vertex stays at the whole unit the other
+     * polygons there are drawn from. */
+    for (unsigned int i = 0; i < 5; i++)
+        Psyz_GteCtrlWrite(i, i == 0 || i == 2 || i == 4 ? 16384 : 0);
+    Psyz_GteCtrlWrite(7, 300);
+    {
+        unsigned int xy;
+        float x, y, w;
+        Psyz_GteDataWrite(8, 0x800);
+        Psyz_GteDataWrite(9, 3);
+        Psyz_GteDataWrite(10, 0);
+        Psyz_GteDataWrite(11, 0);
+        Psyz_GteCommand(0x0980011); /* INTPL */
+        Psyz_GteDataWrite(
+            0, Psyz_GteDataRead(9) | (Psyz_GteDataRead(10) << 16));
+        Psyz_GteDataWrite(1, Psyz_GteDataRead(11));
+        Psyz_GteCommand(0x180001); /* RTPS */
+        Psyz_GteStoreSxyTo(14, &xy);
+        zassert_s32_eq(1, Psyz_PgxpLookupVertex(&xy, xy, &x, &y, &w));
+        const float want = 160.0f + 12.0f * 256.0f / 300.0f;
         zassert_s32_eq(1, x > want - 0.001f && x < want + 0.001f);
     }
     Psyz_GteSetPgxpIntpl(0);
