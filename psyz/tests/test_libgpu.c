@@ -95,6 +95,7 @@ static void gpu_teardown(void) {
 #if defined(__psyz) && !defined(__PSP__)
     Psyz_VideoSetAntialiasing(0);
     Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDepthBuffer(0);
     Psyz_VideoSetWidescreen(0);
     Psyz_GteSetPgxpIntpl(0);
     Psyz_GteSetPgxpNclip(0);
@@ -1300,6 +1301,250 @@ ZTEST(gpu, geometry_metadata_follows_sxy_loads_and_library_stores) {
  * of its precise projection (Psyz_GteSetPgxpNclip), and a vertex INTPL
  * interpolated keeps the fraction INTPL truncated (Psyz_GteSetPgxpIntpl)
  * where that fraction projects under a pixel. */
+/* ===== Depth buffer (Psyz_VideoSetDepthBuffer) =====
+ * Flat quads whose corners carry precise GTE vertices (as RR4's packets do)
+ * at a chosen view depth, drawn in ordering-table order inside a depth view
+ * the "game" marks with its own GP0 command, like RR4's 1Eh. */
+#ifdef PSYZ_TEST_SDL_GPU
+extern void Psyz_PgxpNextFrame(void);
+extern void Psyz_GteStorePgxpVertex(const void*, unsigned int, float, float, float);
+typedef struct {
+    O_TAG;
+    u_long code[1];
+} DepthMark;
+static int DepthMarkCommand(const u_long* words, int available, void* user) {
+    (void)available;
+    (void)user;
+    Psyz_VideoDepthView((int)(words[0] & 1));
+    return 1;
+}
+static void DepthMarkSet(DepthMark* m, int begin) {
+    setlen(m, 1);
+    m->code[0] = 0x1E000000u | (begin ? 1u : 0u);
+}
+/* A square at (x, y) of side n, colour rgb; with w > 0 its corners are
+ * precise vertices at view depth w (layer: the ordering bias it was given,
+ * Psyz_GteSetPgxpDepthLayer). */
+static void DepthQuad(POLY_F4* p, int x, int y, int n, u8 r, u8 g, u8 b,
+                      float w, int semi) {
+    SetPolyF4(p);
+    setRGB0(p, r, g, b);
+    setSemiTrans(p, semi);
+    setXY4(p, x, y, x + n, y, x, y + n, x + n, y + n);
+    if (w > 0.0f) {
+        short* xy[4] = {&p->x0, &p->x1, &p->x2, &p->x3};
+        for (int i = 0; i < 4; ++i) {
+            unsigned int word;
+            memcpy(&word, xy[i], 4);
+            Psyz_GteStorePgxpVertex(xy[i], word, (float)xy[i][0] + 0.5f,
+                                    (float)xy[i][1] + 0.5f, w);
+        }
+    }
+}
+static u16 DepthPixel(int x, int y) {
+    u16 pixel;
+    RECT point = {x, y, 1, 1};
+    StoreImage(&point, (u_long*)&pixel);
+    DrawSync(0);
+    return pixel & 0x7FFF;
+}
+#define DEPTH_RED 0x001F
+#define DEPTH_GREEN 0x03E0
+#define DEPTH_BLUE 0x7C00
+/* Draws (in ordering-table order) a mark, then quads a, b, c (NULL: none);
+ * returns the pixel at (40, 40). */
+static u16 DepthScene(int mark, POLY_F4* a, POLY_F4* b, POLY_F4* c) {
+    static OT_TYPE ot[8];
+    static DepthMark begin, end;
+    ClearOTagR(ot, 8);
+    DepthMarkSet(&begin, 1);
+    DepthMarkSet(&end, 0);
+    addPrim(&ot[0], &end);
+    if (c) addPrim(&ot[1], c);
+    if (b) addPrim(&ot[2], b);
+    if (a) addPrim(&ot[3], a);
+    if (mark) addPrim(&ot[7], &begin);
+    DrawOTag(&ot[7]);
+    DrawSync(0);
+    return DepthPixel(40, 40);
+}
+static bool DepthSetup(void) {
+    if (CpuRasterizerOnly() ||
+        !(Psyz_VideoGetFeatures() & PSYZ_VIDEO_FEATURE_DEPTH_BUFFER))
+        return false;
+    Psyz_GpuRegisterCommandHandler(0x1E, DepthMarkCommand, NULL);
+    Psyz_VideoSetInternalResolution(1);
+    zassert_s32_eq(0, Psyz_VideoSetDepthBuffer(1));
+    zassert_s32_eq(1, Psyz_VideoDepthBufferActive());
+    RECT all = {0, 0, 256, 240};
+    ClearImage(&all, 0, 0, 0);
+    DrawSync(0);
+    return true;
+}
+#endif
+
+/* A far polygon drawn after a near one is hidden by it; off, or outside a
+ * marked view, the later one is drawn over as by the ordering table. */
+ZTEST(gpu, depth_buffer_hides_a_later_farther_polygon) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!DepthSetup())
+        return;
+    POLY_F4 near, far;
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    unsigned long long views0, prims0, views1, prims1;
+    Psyz_VideoGetDepthStats(&views0, &prims0);
+    zassert_u16_eq(DEPTH_RED, DepthScene(1, &near, &far, NULL));
+    Psyz_VideoGetDepthStats(&views1, &prims1);
+    zassert_s32_eq(1, (int)(views1 - views0));
+    zassert_s32_eq(2, (int)(prims1 - prims0));
+    /* nearer, later: drawn over */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 900.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 300.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &near, &far, NULL));
+    /* no view marked: ordering-table order */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(0, &near, &far, NULL));
+    /* the depth buffer off: ordering-table order */
+    Psyz_VideoSetDepthBuffer(0);
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &near, &far, NULL));
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
+/* 2D (no precise vertices) is drawn over the depth-tested world and does not
+ * hide what the world draws after it; a semi-transparent world polygon is
+ * tested but writes no depth; each view starts with a cleared depth. */
+ZTEST(gpu, depth_buffer_leaves_2d_and_semi_transparency_to_the_order) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!DepthSetup())
+        return;
+    POLY_F4 near, flat, far;
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    DepthQuad(&flat, 30, 30, 40, 0, 255, 0, 0.0f, 0);
+    zassert_u16_eq(DEPTH_GREEN, DepthScene(1, &near, &flat, NULL));
+    /* a 2D overlay drawn first does not hide a later world polygon */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&flat, 20, 20, 40, 0, 255, 0, 0.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &flat, &far, NULL));
+    /* semi-transparent far behind near: hidden */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 1);
+    zassert_u16_eq(DEPTH_RED, DepthScene(1, &near, &far, NULL));
+    /* semi-transparent near writes no depth: an opaque far one after it
+     * covers it, as in the ordering table */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 1);
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &near, &far, NULL));
+    /* the next view's clear: a far polygon alone is drawn */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&far, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &far, NULL, NULL));
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
+/* Vertices projected under PSYZ_PGXP_DEPTH_NONE (a sky dome) are drawn in
+ * order, untested; a face's ordering bias keeps a marking on the road it
+ * lies on (same depth), as the ordering table did. */
+ZTEST(gpu, depth_buffer_classes_and_layers) {
+#ifdef PSYZ_TEST_SDL_GPU
+    extern void Psyz_GteSetPgxpDepthClass(int);
+    extern void Psyz_GteSetPgxpDepthLayer(int, int);
+    extern void Psyz_GteCopyPgxpSxy(const void*, const void*, unsigned int);
+    if (!DepthSetup())
+        return;
+    POLY_F4 near, sky, road, marking, src;
+    Psyz_PgxpNextFrame();
+    DepthQuad(&near, 20, 20, 40, 255, 0, 0, 300.0f, 0);
+    /* a copy made under the NONE class carries it (RR_SXY_COPY) */
+    DepthQuad(&src, 30, 30, 40, 0, 0, 255, 900.0f, 0);
+    sky = src;
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_NONE);
+    for (int i = 0; i < 4; ++i) {
+        short* from = (&src.x0) + i * 2;
+        short* to = (&sky.x0) + i * 2;
+        unsigned int word;
+        memcpy(&word, from, 4);
+        Psyz_GteCopyPgxpSxy(from, to, word);
+    }
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_WORLD);
+    zassert_u16_eq(DEPTH_BLUE, DepthScene(1, &near, &sky, NULL));
+    /* road (bias 30) then a marking on it (bias 5) at the same depth, then
+     * the road again: the marking stays */
+    Psyz_PgxpNextFrame();
+    DepthQuad(&src, 20, 20, 40, 0, 0, 0, 500.0f, 0);
+    road = src;
+    setRGB0(&road, 0, 0, 255);
+    marking = src;
+    setRGB0(&marking, 0, 255, 0);
+    POLY_F4 road2 = road;
+    POLY_F4* copies[3] = {&road, &marking, &road2};
+    const int bias[3] = {30, 5, 30};
+    for (int k = 0; k < 3; ++k) {
+        Psyz_GteSetPgxpDepthLayer(1, bias[k]);
+        for (int i = 0; i < 4; ++i) {
+            short* from = (&src.x0) + i * 2;
+            short* to = (&copies[k]->x0) + i * 2;
+            unsigned int word;
+            memcpy(&word, from, 4);
+            Psyz_GteCopyPgxpSxy(from, to, word);
+        }
+    }
+    Psyz_GteSetPgxpDepthLayer(0, 0);
+    zassert_u16_eq(DEPTH_GREEN, DepthScene(1, &road, &marking, &road2));
+    /* a decal on the road (same depth, no layers) is drawn over it, and
+     * does not hide a polygon drawn after it just in front of the road */
+    POLY_F4 decal, low;
+    Psyz_PgxpNextFrame();
+    DepthQuad(&road, 20, 20, 40, 0, 0, 255, 500.0f, 0);
+    DepthQuad(&src, 20, 20, 40, 0, 0, 0, 500.0f, 0);
+    decal = src;
+    setRGB0(&decal, 0, 255, 0);
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_DECAL);
+    for (int i = 0; i < 4; ++i) {
+        short* from = (&src.x0) + i * 2;
+        short* to = (&decal.x0) + i * 2;
+        unsigned int word;
+        memcpy(&word, from, 4);
+        Psyz_GteCopyPgxpSxy(from, to, word);
+    }
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_WORLD);
+    zassert_u16_eq(DEPTH_GREEN, DepthScene(1, &road, &decal, NULL));
+    Psyz_PgxpNextFrame();
+    DepthQuad(&road, 20, 20, 40, 0, 0, 255, 500.0f, 0);
+    DepthQuad(&src, 20, 20, 40, 0, 0, 0, 500.0f, 0);
+    decal = src;
+    setRGB0(&decal, 0, 255, 0);
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_DECAL);
+    for (int i = 0; i < 4; ++i) {
+        short* from = (&src.x0) + i * 2;
+        short* to = (&decal.x0) + i * 2;
+        unsigned int word;
+        memcpy(&word, from, 4);
+        Psyz_GteCopyPgxpSxy(from, to, word);
+    }
+    Psyz_GteSetPgxpDepthClass(PSYZ_PGXP_DEPTH_WORLD);
+    DepthQuad(&low, 30, 30, 40, 255, 0, 0, 495.0f, 0);
+    zassert_u16_eq(DEPTH_RED, DepthScene(1, &road, &decal, &low));
+#else
+    zskip("requires the SDL GPU renderer");
+#endif
+}
+
 ZTEST(gpu, geometry_correction_precise_nclip_and_intpl) {
 #ifdef PSYZ_TEST_SDL_GPU
     extern void Psyz_PgxpNextFrame(void);

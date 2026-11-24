@@ -264,6 +264,7 @@ enum {
     PSYZ_VIDEO_FEATURE_FILTERING = 1 << 2,     /**< model/sprite filtering */
     PSYZ_VIDEO_FEATURE_GEOMETRY = 1 << 3,      /**< geometry correction */
     PSYZ_VIDEO_FEATURE_WIDESCREEN = 1 << 4,    /**< Psyz_VideoSetWidescreen */
+    PSYZ_VIDEO_FEATURE_DEPTH_BUFFER = 1 << 5,  /**< Psyz_VideoSetDepthBuffer */
 };
 
 /**
@@ -338,6 +339,41 @@ int Psyz_VideoGetDynamicLighting(void);
 /** Subpixel PGXP geometry correction for fieldfx spells and special effects. */
 int Psyz_VideoSetEffectGeometryCorrection(int enabled);
 int Psyz_VideoGetEffectGeometryCorrection(void);
+
+/**
+ * @brief Depth buffer for the 3D world
+ *
+ * Instead of only the ordering table's order, the polygons of the 3D world
+ * are depth-tested per pixel: an opaque polygon whose vertices all came from
+ * the GTE this frame (their precise projection, as for geometry correction)
+ * is tested and writes 1 / its view depth; a semi-transparent one is only
+ * tested. Everything else (2D, sprites, lines, vertices projected under
+ * PSYZ_PGXP_DEPTH_NONE, see Psyz_GteSetPgxpDepthClass) is drawn as before,
+ * in ordering-table order and untested. Depth is used only inside views the
+ * game marks with Psyz_VideoDepthView. The SDL GPU renderer only
+ * (PSYZ_VIDEO_FEATURE_DEPTH_BUFFER); not with the CPU rasterizer, so at 1x
+ * it draws on the GPU. Default: off.
+ *
+ * @return 0 on success, -1 when the renderer cannot have it
+ */
+int Psyz_VideoSetDepthBuffer(int enabled);
+int Psyz_VideoGetDepthBuffer(void);
+/** @return 1 while the depth buffer is set and the device can draw it */
+int Psyz_VideoDepthBufferActive(void);
+/**
+ * @brief Mark the start (begin != 0) or end of a depth-tested view
+ *
+ * Call it in ordering-table order, from a GP0 command handler (see
+ * Psyz_GpuRegisterCommandHandler), right after the view's drawing area is
+ * set: the depth of the target is cleared and the 3D polygons drawn while
+ * the drawing area is this one are depth-tested, until the view ends or the
+ * next one begins. Polygons drawn under another drawing area (an off-screen
+ * render) are not. Does nothing while the depth buffer is off.
+ */
+void Psyz_VideoDepthView(int begin);
+/** Views begun and polygons depth-tested since the start (diagnostics). */
+void Psyz_VideoGetDepthStats(unsigned long long* views,
+                             unsigned long long* primitives);
 
 /**
  * @brief Widescreen: present a 4:3 game at 16:9 with more of its picture

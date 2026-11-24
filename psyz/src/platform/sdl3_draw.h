@@ -44,7 +44,18 @@ typedef struct {
      * exact[1..3] = U, V, R, G at VRAM (0, 0), per X, per Y (12.12, mod
      * 2^32); exact[4] = B at (0, 0), per X, per Y. */
     unsigned int exact[5][4];
+    /* Depth buffer (Psyz_VideoSetDepthBuffer): 1 / view depth of a vertex the
+     * GTE projected this frame (writePacket), 0 without one, -1 for a vertex
+     * of the PSYZ_PGXP_DEPTH_NONE class; the primitive's DEPTH_* mode. Only
+     * depth goes to the shader. */
+    float depth;
+    unsigned int depth_mode;
 } Vertex;
+
+/* How a primitive takes part in the depth buffer: not at all (2D, the sky,
+ * anything without GTE vertices), tested and written (an opaque polygon of
+ * the 3D world) or only tested (a semi-transparent one). */
+enum { DEPTH_NONE, DEPTH_WRITE, DEPTH_TEST, DEPTH_MODES };
 
 
 // ===== SDL3 reserved TPAGE flags, invalid on real hardware =====
@@ -125,15 +136,39 @@ static int writePacket(Vertex* v, int code, int n, u_long* packet, u16* pOut) {
     v->y = s11(((short*)packet)[1]);
     v->t = 0;
     {
-        int pgxp_kind = Psyz_PgxpLookupVertex(
+        unsigned int pgxp_flags = 0;
+        float depth_w = 0.0f;
+        int pgxp_kind = Psyz_PgxpLookupVertexFlags(
             packet, *(const unsigned int*)packet, &v->pgxp_pos[0],
-            &v->pgxp_pos[1], &v->pgxp_pos[2]);
-        if (!pgxp_kind) {
+            &v->pgxp_pos[1], &v->pgxp_pos[2], &pgxp_flags, &depth_w);
+        v->depth = 0.0f;
+        if (pgxp_kind && (pgxp_flags & 16u)) {
+            /* a depth only: drawn at the whole-pixel word */
             v->pgxp_pos[0] = (float)v->x + 0.5f;
             v->pgxp_pos[1] = (float)v->y + 0.5f;
             v->pgxp_pos[2] = -1.0f;
-        } else if (pgxp_kind == 1) {
-            v->t = TPAGE_MODEL;
+            v->depth = (pgxp_flags & 2u) ? -1.0f
+                       : depth_w >= 1.0f ? 1.0f / depth_w
+                                         : 0.0f;
+        } else if (!pgxp_kind) {
+            v->pgxp_pos[0] = (float)v->x + 0.5f;
+            v->pgxp_pos[1] = (float)v->y + 0.5f;
+            v->pgxp_pos[2] = -1.0f;
+        } else {
+            if (pgxp_kind == 1) {
+                v->t = TPAGE_MODEL;
+            }
+            /* -1 (no depth class) or 0 (saturated projection) leave the
+             * polygon out of the depth buffer (ClassifyDepth) */
+            v->depth = (pgxp_flags & 2u) ? -1.0f
+                       : depth_w >= 1.0f ? 1.0f / depth_w
+                                         : 0.0f;
+            /* its face's ordering bias (ClassifyDepth): bit 7, bits 8..15;
+             * a decal: bit 6 */
+            if (pgxp_flags & 8u)
+                v->depth_mode = 0x80u | (pgxp_flags & 0xFF00u);
+            if (pgxp_flags & 32u)
+                v->depth_mode |= 0x40u;
         }
     }
     packet++;

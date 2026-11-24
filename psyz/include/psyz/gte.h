@@ -183,6 +183,33 @@ void Psyz_GteSetPgxpNclip(int enabled);
  * active. Subdivided edges then stay on the straight edge of an undivided
  * neighbour instead of opening hairline cracks. Default: off. */
 void Psyz_GteSetPgxpIntpl(int enabled);
+/* The depth class of the vertices projected from now on, until the next
+ * call or the next Psyz_PgxpNextFrame (which restores PSYZ_PGXP_DEPTH_WORLD).
+ * With the depth buffer (Psyz_VideoSetDepthBuffer) a polygon whose vertices
+ * all came from the GTE this frame is depth-tested as part of the 3D world;
+ * one with a PSYZ_PGXP_DEPTH_NONE vertex keeps the ordering table's order
+ * only: a sky dome or backdrop projected close to the camera, a 3D overlay
+ * drawn over the world. Copies (Psyz_GteCopyPgxpSxy) keep the class of the
+ * vertex and add the current one. */
+#define PSYZ_PGXP_DEPTH_WORLD 0
+#define PSYZ_PGXP_DEPTH_NONE 1
+/* A decal on the surface drawn before it (a road marking): depth-tested a
+ * little in front of where it is, never written, so it neither fights the
+ * surface it lies on nor hides what is drawn after it. */
+#define PSYZ_PGXP_DEPTH_DECAL 2
+void Psyz_GteSetPgxpDepthClass(int depth_class);
+/* The ordering-table bias (in entries, larger is farther) of the face whose
+ * vertices are projected or copied from now on, while active is non-zero.
+ * The depth buffer evaluates every 3D polygon's depth on the plane of its
+ * precise vertices, so faces on one surface (a road and its markings) have
+ * the same depth; the bias then decides between them as the ordering table
+ * did: a smaller one is drawn over a larger one at the same depth (a few
+ * millionths of the depth an entry, far below any visible distance). */
+void Psyz_GteSetPgxpDepthLayer(int active, int ordering_bias);
+/* The view depth sz (the GTE's SZ) of the screen word sxy stored at dst, a
+ * vertex projected in an earlier frame (a trail's history): the depth buffer
+ * tests the polygons drawn from it; its screen position stays the word's. */
+void Psyz_GteStorePgxpDepth(const void* dst, unsigned int sxy, int sz);
 /* A copy of the screen word sxy from src to dst: the precise vertex
  * recorded for src (if it still holds sxy) now belongs to dst too. */
 void Psyz_GteCopyPgxpSxy(

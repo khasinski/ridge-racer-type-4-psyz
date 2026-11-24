@@ -337,6 +337,31 @@ static SDL_GPUGraphicsPipeline* pipe_tri[BLEND_COUNT];
  * shader computes the same blend from the same pixel as from the copy. */
 static SDL_GPUGraphicsPipeline* pipe_direct_fetch;
 static bool destination_fetch;
+/* ===== Depth buffer (Psyz_VideoSetDepthBuffer) =====
+ * The 3D world can be drawn with a depth buffer instead of only in its
+ * ordering table's order: a polygon whose vertices all came from the GTE this
+ * frame (the precise-vertex cache, writePacket) carries 1 / view depth per
+ * vertex; opaque ones are tested (GREATER_OR_EQUAL, cleared to 0: larger is
+ * nearer) and written, semi-transparent ones only tested. Everything else
+ * (2D, sprites, lines, PSYZ_PGXP_DEPTH_NONE vertices) is drawn untested, in
+ * ordering-table order, as without it. Only the target that is shown has a
+ * depth texture (the scaled one, else the native one), and only while the
+ * game marks a view (Psyz_VideoDepthView, in ordering-table order through a
+ * GP0 command): its drawing area at the mark, cleared there; drawing
+ * elsewhere (an off-screen render) is untested. */
+static bool set_depth_buffer;
+static SDL_GPUTextureFormat depth_format;
+static bool depth_format_known, depth_unavailable;
+static SDL_GPUTexture* depth_texture;
+static Uint32 depth_texture_w, depth_texture_h;
+static SDL_GPUGraphicsPipeline* pipe_depth[DEPTH_MODES][BLEND_COUNT];
+static SDL_GPUGraphicsPipeline* pipe_depth_fetch[DEPTH_MODES];
+/* kept for the depth pipelines, created when the depth buffer is first used */
+static SDL_GPUShader *depth_psx_vs, *depth_psx_fs, *depth_fetch_fs;
+static bool depth_view_active, depth_clear_pending;
+static SDL_Rect depth_view_rect;
+static bool batch_depth; /* the queued batch has depth-tested primitives */
+static unsigned long long depth_stats_primitives, depth_stats_views;
 static SDL_GPUGraphicsPipeline* pipe_clear = NULL;
 static SDL_GPUCommandBuffer* pending_cmd = NULL;
 /* SDL D3D12 has 2048 sampler descriptors per command buffer. Keep half
@@ -1152,8 +1177,15 @@ static SDL_GPUShader* CreateShader(
     return shader;
 }
 
+static SDL_GPUGraphicsPipeline* CreatePsxPipelineDepth(
+    SDL_GPUShader* vs, SDL_GPUShader* fs, BlendMode mode, int depth);
 static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
     SDL_GPUShader* vs, SDL_GPUShader* fs, BlendMode mode) {
+    return CreatePsxPipelineDepth(vs, fs, mode, -1);
+}
+/* depth: -1 without a depth target, else the DEPTH_* mode of its draws */
+static SDL_GPUGraphicsPipeline* CreatePsxPipelineDepth(
+    SDL_GPUShader* vs, SDL_GPUShader* fs, BlendMode mode, int depth) {
     const SDL_GPUVertexBufferDescription vb_desc = {
         .slot = 0,
         .pitch = sizeof(Vertex),
@@ -1208,6 +1240,9 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
         {.location = 13, .buffer_slot = 0,
          .format = SDL_GPU_VERTEXELEMENTFORMAT_UINT4,
          .offset = offsetof(Vertex, exact[4])},
+        {.location = 14, .buffer_slot = 0,
+         .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT,
+         .offset = offsetof(Vertex, depth)},
     };
     // the shader outputs alpha 0 on B-F texels and alpha 1 on opaque ones
     static const SDL_GPUColorTargetBlendState blend[BLEND_COUNT] = {
@@ -1270,7 +1305,7 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
         .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
         .blend_state = blend_state,
     };
-    const SDL_GPUGraphicsPipelineCreateInfo info = {
+    SDL_GPUGraphicsPipelineCreateInfo info = {
         .vertex_shader = vs,
         .fragment_shader = fs,
         .vertex_input_state =
@@ -1287,12 +1322,154 @@ static SDL_GPUGraphicsPipeline* CreatePsxPipeline(
                 .num_color_targets = 1,
             },
     };
+    if (depth >= 0) {
+        /* reversed depth (1 / view depth): nearer is larger. Depth clamp
+         * (no depth clip): an exact polygon's box extrapolates its plane. */
+        info.target_info.has_depth_stencil_target = true;
+        info.target_info.depth_stencil_format = depth_format;
+        info.depth_stencil_state.enable_depth_test = depth != DEPTH_NONE;
+        info.depth_stencil_state.enable_depth_write = depth == DEPTH_WRITE;
+        info.depth_stencil_state.compare_op =
+            SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;
+    }
     SDL_GPUGraphicsPipeline* pipe =
         SDL_CreateGPUGraphicsPipeline(device, &info);
     if (!pipe) {
         ERRORF("SDL_CreateGPUGraphicsPipeline: %s", SDL_GetError());
     }
     return pipe;
+}
+
+/* The depth texture's format: 32-bit float if the device has it (1 / depth
+ * keeps its relative precision at any distance), else the best other. */
+static bool PickDepthFormat(void) {
+    static const SDL_GPUTextureFormat formats[] = {
+        SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
+        SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT,
+        SDL_GPU_TEXTUREFORMAT_D24_UNORM,
+        SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT,
+        SDL_GPU_TEXTUREFORMAT_D16_UNORM,
+    };
+    for (unsigned i = 0; i < LENU(formats); ++i) {
+        if (SDL_GPUTextureSupportsFormat(device, formats[i],
+                                         SDL_GPU_TEXTURETYPE_2D,
+                                         SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)) {
+            depth_format = formats[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ReleaseDepthTexture(void) {
+    if (depth_texture && device)
+        SDL_ReleaseGPUTexture(device, depth_texture);
+    depth_texture = NULL;
+    depth_texture_w = depth_texture_h = 0;
+    depth_view_active = false;
+    depth_clear_pending = false;
+}
+
+static void ReleaseDepthPipelines(void) {
+    for (int d = 0; d < DEPTH_MODES; ++d) {
+        for (int i = 0; i < BLEND_COUNT; ++i) {
+            if (pipe_depth[d][i])
+                SDL_ReleaseGPUGraphicsPipeline(device, pipe_depth[d][i]);
+            pipe_depth[d][i] = NULL;
+        }
+        if (pipe_depth_fetch[d])
+            SDL_ReleaseGPUGraphicsPipeline(device, pipe_depth_fetch[d]);
+        pipe_depth_fetch[d] = NULL;
+    }
+}
+
+/* all: the pipelines and the shaders kept for them too (the device goes) */
+static void ReleaseDepthResources(bool all) {
+    ReleaseDepthTexture();
+    if (!all || !device)
+        return;
+    ReleaseDepthPipelines();
+    if (depth_psx_vs) SDL_ReleaseGPUShader(device, depth_psx_vs);
+    if (depth_psx_fs) SDL_ReleaseGPUShader(device, depth_psx_fs);
+    if (depth_fetch_fs) SDL_ReleaseGPUShader(device, depth_fetch_fs);
+    depth_psx_vs = depth_psx_fs = depth_fetch_fs = NULL;
+    depth_format_known = depth_unavailable = false;
+}
+
+/* The pipelines DrawTargetRuns binds in a pass with the depth texture:
+ * every blend it uses (DIRECT, CHECK; the fetch one) in every DEPTH_ mode. */
+static bool CreateDepthPipelines(void) {
+    static const BlendMode used[] = {BLEND_DIRECT, BLEND_CHECK};
+    for (int d = 0; d < DEPTH_MODES; ++d) {
+        for (unsigned i = 0; i < LENU(used); ++i) {
+            pipe_depth[d][used[i]] = CreatePsxPipelineDepth(
+                depth_psx_vs, depth_psx_fs, used[i], d);
+            if (!pipe_depth[d][used[i]])
+                return false;
+        }
+        if (destination_fetch) {
+            pipe_depth_fetch[d] = CreatePsxPipelineDepth(
+                depth_psx_vs, depth_fetch_fs, BLEND_DIRECT, d);
+            if (!pipe_depth_fetch[d])
+                return false;
+        }
+    }
+    return true;
+}
+
+/* The target the depth buffer belongs to: the one that is shown. */
+static unsigned DepthTargetIndex(void) { return scaled_vram_render ? 1u : 0u; }
+static void DepthTargetSize(Uint32* w, Uint32* h) {
+    const unsigned n = scaled_vram_render ? internal_res : 1u;
+    *w = VRAM_W * n;
+    *h = VRAM_H * n;
+}
+
+/* The format, pipelines and a depth texture the size of the depth target;
+ * false when the device cannot have them (then never again). */
+static bool EnsureDepthResources(void) {
+    if (depth_unavailable)
+        return false;
+    if (!depth_format_known) {
+        if (!PSX_SHADERS_CURRENT || !depth_psx_vs || !depth_psx_fs ||
+            (destination_fetch && !depth_fetch_fs) || !PickDepthFormat()) {
+            WARNF("depth buffer unavailable on this device");
+            depth_unavailable = true;
+            return false;
+        }
+        depth_format_known = true;
+    }
+    if (!pipe_depth[DEPTH_NONE][BLEND_DIRECT]) {
+        if (!CreateDepthPipelines()) {
+            ERRORF("depth buffer pipelines: %s", SDL_GetError());
+            ReleaseDepthResources(true);
+            depth_unavailable = true;
+            return false;
+        }
+    }
+    Uint32 w, h;
+    DepthTargetSize(&w, &h);
+    if (depth_texture && depth_texture_w == w && depth_texture_h == h)
+        return true;
+    ReleaseDepthTexture();
+    const SDL_GPUTextureCreateInfo info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = depth_format,
+        .usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+        .width = w,
+        .height = h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    };
+    depth_texture = SDL_CreateGPUTexture(device, &info);
+    if (!depth_texture) {
+        ERRORF("depth texture %ux%u: %s", w, h, SDL_GetError());
+        return false;
+    }
+    depth_texture_w = w;
+    depth_texture_h = h;
+    INFOF("depth buffer: %ux%u, format %d", w, h, (int)depth_format);
+    return true;
 }
 
 // used only for a fast hardware ClearImage
@@ -1460,7 +1637,7 @@ static bool CreateGpuResources(void) {
         if (fetch_fs) {
             pipe_direct_fetch =
                 CreatePsxPipeline(psx_vs, fetch_fs, BLEND_DIRECT);
-            SDL_ReleaseGPUShader(device, fetch_fs);
+            depth_fetch_fs = fetch_fs; /* released with the device */
         }
         destination_fetch = pipe_direct_fetch != NULL;
     }
@@ -1476,12 +1653,9 @@ static bool CreateGpuResources(void) {
         }
         pipe_clear = CreateClearPipeline(clear_vs, clear_fs);
     }
-    if (psx_vs) {
-        SDL_ReleaseGPUShader(device, psx_vs);
-    }
-    if (psx_fs) {
-        SDL_ReleaseGPUShader(device, psx_fs);
-    }
+    /* kept for the depth pipelines (CreateDepthPipelines) */
+    depth_psx_vs = psx_vs;
+    depth_psx_fs = psx_fs;
     if (clear_vs) {
         SDL_ReleaseGPUShader(device, clear_vs);
     }
@@ -2091,7 +2265,7 @@ static void ApplyPendingInternalRes(void) {
     Psyz_PgxpSetActive(
         !UseSoftwareBackend() &&
         (geometry_correction || effect_geometry_correction ||
-         model_filtering));
+         model_filtering || set_depth_buffer));
     Psyz_PgxpSetCulling(geometry_correction);
     Psyz_PgxpSetEffectEnabled(effect_geometry_correction);
     UpdateScissor();
@@ -2853,6 +3027,7 @@ static void ReleaseGpuDevice(void) {
         SDL_ReleaseGPUGraphicsPipeline(device, pipe_direct_fetch);
     pipe_direct_fetch = NULL;
     destination_fetch = false;
+    ReleaseDepthResources(true);
     if (pipe_clear) {
         SDL_ReleaseGPUGraphicsPipeline(device, pipe_clear);
         pipe_clear = NULL;
@@ -3387,7 +3562,7 @@ int Psyz_VideoSetGeometryCorrection(int enabled) {
         geometry_correction = set_geometry_correction;
         Psyz_PgxpSetActive(!headless_renderer &&
                            (set_geometry_correction || set_effect_geometry_correction ||
-                            set_model_filtering));
+                            set_model_filtering || set_depth_buffer));
         Psyz_PgxpSetCulling(set_geometry_correction);
     }
     return 0;
@@ -3410,7 +3585,7 @@ int Psyz_VideoSetModelFiltering(int enabled) {
         model_filtering = set_model_filtering;
         Psyz_PgxpSetActive(!headless_renderer &&
                            (set_geometry_correction || set_effect_geometry_correction ||
-                            set_model_filtering));
+                            set_model_filtering || set_depth_buffer));
     }
     return 0;
 }
@@ -3438,12 +3613,66 @@ int Psyz_VideoSetEffectGeometryCorrection(int enabled) {
         effect_geometry_correction = set_effect_geometry_correction;
         Psyz_PgxpSetActive(!headless_renderer &&
                            (set_geometry_correction || set_effect_geometry_correction ||
-                            set_model_filtering));
+                            set_model_filtering || set_depth_buffer));
     }
     return 0;
 }
 int Psyz_VideoGetEffectGeometryCorrection(void) {
     return set_effect_geometry_correction ? 1 : 0;
+}
+
+int Psyz_VideoSetDepthBuffer(int enabled) {
+    if (gpu_failed || (fallback_presenter && enabled)) return -1;
+    if (set_depth_buffer == (enabled != 0)) return 0;
+    if (device && !UseSoftwareBackend())
+        Draw_FlushBuffer();
+    set_depth_buffer = enabled != 0;
+    depth_view_active = false;
+    if (!set_depth_buffer)
+        ReleaseDepthTexture();
+    if (sdl3_window && is_platform_init_successful) {
+        /* at 1x: the GPU rasterizer draws the depth-tested world */
+        UpdateNativeRasterizer();
+        ApplyPendingInternalRes();
+        /* (which returns early when the scale is unchanged) */
+        Psyz_PgxpSetActive(!UseSoftwareBackend() &&
+                           (geometry_correction || effect_geometry_correction ||
+                            model_filtering || set_depth_buffer));
+    } else {
+        Psyz_PgxpSetActive(!headless_renderer &&
+                           (set_geometry_correction || set_effect_geometry_correction ||
+                            set_model_filtering || set_depth_buffer));
+    }
+    return 0;
+}
+int Psyz_VideoGetDepthBuffer(void) { return set_depth_buffer ? 1 : 0; }
+int Psyz_VideoDepthBufferActive(void) {
+    return set_depth_buffer && !depth_unavailable && !gpu_failed &&
+           !fallback_presenter && !headless_renderer && PSX_SHADERS_CURRENT;
+}
+
+void Psyz_VideoDepthView(int begin) {
+    if (!begin || !set_depth_buffer || gpu_failed || !device ||
+        UseSoftwareBackend()) {
+        depth_view_active = false;
+        return;
+    }
+    /* the previous view's depth primitives are drawn before the clear */
+    if (batch_depth)
+        Draw_FlushBuffer();
+    depth_view_active = false;
+    if (!EnsureDepthResources() || scissor_rect.w <= 0 || scissor_rect.h <= 0)
+        return;
+    depth_view_rect = scissor_rect;
+    depth_view_active = true;
+    depth_clear_pending = true;
+    ++depth_stats_views;
+}
+
+void Psyz_VideoGetDepthStats(unsigned long long* views,
+                             unsigned long long* primitives) {
+    if (views) *views = depth_stats_views;
+    if (primitives) *primitives = depth_stats_primitives;
 }
 
 int Psyz_VideoSetWidescreen(int enabled) {
@@ -3766,6 +3995,123 @@ int Draw_ExequeSync() { return 0; }
 // optimization to avoid sampling the VRAM on an untextured batch draw
 static bool batch_has_texture = false;
 static void ClutCacheUpdate(u16 tpage, u16 clut);
+
+/* The depth mode of a polygon (Vertex.depth_mode), while a depth view is
+ * marked and its drawing area is the current one: tested when every vertex
+ * has a 3D world depth, written too when it is opaque. */
+#ifndef DEPTH_LAYER_UNITS
+#define DEPTH_LAYER_UNITS 0.5f
+#endif
+#ifndef DEPTH_DECAL_UNITS
+#define DEPTH_DECAL_UNITS 48.0f
+#endif
+static void ClassifyDepth(Vertex* v, int n) {
+    int mode = DEPTH_NONE;
+    if (depth_view_active && scissor_rect.x == depth_view_rect.x &&
+        scissor_rect.y == depth_view_rect.y &&
+        scissor_rect.w == depth_view_rect.w &&
+        scissor_rect.h == depth_view_rect.h) {
+        mode = v[0].a != 0xFF || (v[0].depth_mode & 0x40u) ? DEPTH_TEST
+                                                            : DEPTH_WRITE;
+        int with_depth = 0, none_class = 0;
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            with_depth += v[i].depth > 0.0f;
+            none_class += v[i].depth < 0.0f;
+            sum += v[i].depth > 0.0f ? v[i].depth : 0.0f;
+        }
+        /* A semi-transparent effect drawn from this frame's and earlier
+         * frames' vertices (a light trail): tested at the depth of the ones
+         * it has. It writes no depth, so an estimate hides it only behind
+         * what is clearly in front. */
+        if (mode == DEPTH_TEST && with_depth && with_depth < n && !none_class) {
+            for (int i = 0; i < n; ++i)
+                if (!(v[i].depth > 0.0f))
+                    v[i].depth = sum / (float)with_depth;
+            with_depth = n;
+        }
+        if (with_depth < n) {
+            /* PSYZ_DEPTH_DEBUG=5: what is left untested in a view, some
+             * vertices with a depth (yellow) or none (magenta) */
+            static int untested = -1;
+            if (untested < 0) {
+                const char* e = SDL_getenv("PSYZ_DEPTH_DEBUG");
+                untested = e && *e == '5';
+            }
+            for (int i = 0; untested && i < n; ++i) {
+                v[i].r = 255;
+                v[i].g = with_depth ? 255 : 0;
+                v[i].b = with_depth ? 0 : 255;
+            }
+            mode = DEPTH_NONE;
+        }
+    }
+    /* Faces on one surface (a road and its markings) lie within a unit or
+     * so of each other (subdivided tiles take whole-unit vertices): the
+     * ordering bias of the face (writePacket) moves it by DEPTH_LAYER_UNITS
+     * of view depth an entry, so a smaller one stays in front as in the
+     * ordering table, and a semi-transparent surface (a shadow, a glow)
+     * stays in front of the one it lies on. Far below what hides a car
+     * behind a wall or a crest. */
+    const unsigned layer_bits = v[0].depth_mode;
+    float shift = 0.0f;
+    if (mode != DEPTH_NONE) {
+        if (v[0].depth_mode & 0x80u)
+            shift += DEPTH_LAYER_UNITS *
+                     (float)(signed char)((v[0].depth_mode >> 8) & 0xFFu);
+        if (mode == DEPTH_TEST)
+            shift -= 2.0f * DEPTH_LAYER_UNITS;
+        /* a decal stands this far in front of its surface for the test:
+         * the snapped vertices of a far, flat road tilt its tiles' planes
+         * against the marking's by more than the ordering layers */
+        if (layer_bits & 0x40u)
+            shift -= DEPTH_DECAL_UNITS;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (mode == DEPTH_NONE) {
+            v[i].depth = 0.0f;
+        } else if (shift != 0.0f) {
+            const float w = SDL_max(1.0f / v[i].depth + shift, 1.0f);
+            v[i].depth = 1.0f / w;
+        }
+        v[i].depth_mode = (unsigned)mode;
+    }
+    if (mode != DEPTH_NONE) {
+        batch_depth = true;
+        ++depth_stats_primitives;
+    }
+    /* PSYZ_DEPTH_DEBUG (diagnostics): 1 tints written polygons red, 2
+     * tested-only ones blue, 3 both, 4 the faces by ordering bias (none
+     * grey, negative red, 0..9 yellow, 10..19 cyan, 20+ magenta). */
+    static int debug = -1;
+    if (debug < 0) {
+        const char* e = SDL_getenv("PSYZ_DEPTH_DEBUG");
+        debug = e && *e ? SDL_atoi(e) : 0;
+    }
+    if (debug && mode != DEPTH_NONE) {
+        unsigned char r = 0, g = 0, b = 0;
+        bool tint = true;
+        if (debug == 4) {
+            const int bias = (layer_bits & 0x80u)
+                                 ? (signed char)((layer_bits >> 8) & 0xFFu)
+                                 : 999;
+            r = bias == 999 ? 128 : bias < 0 || bias >= 20 ? 255 : bias < 10 ? 255 : 0;
+            g = bias == 999 ? 128 : bias < 0 || bias >= 20 ? 0 : 255;
+            b = bias == 999 ? 128 : bias >= 20 ? 255 : bias >= 10 ? 255 : 0;
+        } else if (debug == 3 || (int)mode == debug) {
+            r = mode == DEPTH_TEST ? 40 : 255;
+            g = 40;
+            b = mode == DEPTH_TEST ? 255 : 40;
+        } else {
+            tint = false;
+        }
+        for (int i = 0; tint && i < n; ++i) {
+            v[i].r = r;
+            v[i].g = g;
+            v[i].b = b;
+        }
+    }
+}
 /* Retain the PS1's signed 12-fractional-bit attribute gradients while the
  * GPU rasterizes the geometry, including at higher internal resolutions. */
 static void SetPolygonAttributes(Vertex* vertices) {
@@ -3918,6 +4264,17 @@ static int EmitExactTriangle(const Vertex* a, const Vertex* b, const Vertex* c,
         q->uv_bounds[2] = SDL_max(a->u, SDL_max(b->u, c->u));
         q->uv_bounds[3] = SDL_max(a->v, SDL_max(b->v, c->v));
         memcpy(q->exact, exact, sizeof(exact));
+        if (a->depth_mode != DEPTH_NONE) {
+            /* the triangle's plane of 1 / depth, extrapolated to the box
+             * (clamped per fragment; only covered samples are kept) */
+            const double d0 = a->depth, d1 = b->depth, d2 = c->depth;
+            const double ddx = ((d1 - d0) * (y[2] - y[0]) -
+                                (d2 - d0) * (y[1] - y[0])) / (double)area;
+            const double ddy = ((d2 - d0) * (x[1] - x[0]) -
+                                (d1 - d0) * (x[2] - x[0])) / (double)area;
+            q->depth = (float)(d0 + ddx * (cx - sx - x[0]) +
+                               ddy * (cy - sy - y[0]));
+        }
     }
     }
     return emitted;
@@ -4292,6 +4649,8 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         v[i].pgxp_pos[1] = 0.0f;
         v[i].pgxp_pos[2] = -1.0f;
         v[i].t = 0;
+        v[i].depth = 0.0f;
+        v[i].depth_mode = DEPTH_NONE;
     }
     if (isShadeTex) {
         v->r = (unsigned char)(*packets >> 0);
@@ -4372,6 +4731,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             if (!isTextured) {
                 WidenFullWidthFill(vertex_cur, nVertices);
             }
+            ClassifyDepth(vertex_cur, nVertices);
 
             {
                 bool pgxp_valid = true;
@@ -5059,6 +5419,7 @@ void Draw_ResetBuffer(void) {
     vertex_cur = vertex_buf;
     index_cur = index_buf;
     batch_has_texture = false;
+    batch_depth = false;
     batch_drawn = (SDL_Rect){0, 0, 0, 0};
     batch_read = (SDL_Rect){0, 0, 0, 0};
     batch_clut_oldest = 0;
@@ -5076,6 +5437,7 @@ typedef struct SemiBox {
 typedef struct DrawSegment {
     int start, end;
     bool semi;
+    unsigned depth; /* DEPTH_ mode, in a pass with the depth texture */
     int mark; /* draw_marks index of its drawing state */
 } DrawSegment;
 #define DRAW_SEGMENTS_MAX 32
@@ -5120,6 +5482,8 @@ typedef struct DrawTargetBatch {
     SDL_GPUTexture* extra_texture;
     SDL_GPUSampler* extra_sampler;
     bool grid_same;
+    /* with the depth buffer: its texture (the batch has depth primitives) */
+    SDL_GPUTexture* depth_texture;
 } DrawTargetBatch;
 
 static bool BatchSemi(const DrawTargetBatch* b, u32 i) {
@@ -5128,6 +5492,10 @@ static bool BatchSemi(const DrawTargetBatch* b, u32 i) {
 static bool BatchExact(const DrawTargetBatch* b, u32 i) {
     return b->native ? b->native[i].exact != 0
                      : b->vertices[i].exact[0][3] != 0;
+}
+static unsigned BatchDepth(const DrawTargetBatch* b, u32 i) {
+    return b->depth_texture && !b->native ? b->vertices[i].depth_mode
+                                          : DEPTH_NONE;
 }
 
 static bool PrimitiveBox(const DrawTargetBatch* b, int start, int end,
@@ -5311,6 +5679,8 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             }
             int seg_start = end;
             bool semi = BatchSemi(b, ix[seg_start]);
+            /* a segment keeps to one depth mode (its pipeline) */
+            const unsigned depth = BatchDepth(b, ix[seg_start]);
             int seg_end =
                 seg_start + (BatchExact(b, ix[seg_start]) ? 6 : 3);
             /* The two triangles of one quad (two shared vertices) cover
@@ -5318,11 +5688,13 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             if (semi && seg_end + 3 <= mark_end &&
                 !BatchExact(b, ix[seg_start]) &&
                 BatchSemi(b, ix[seg_end]) &&
+                BatchDepth(b, ix[seg_end]) == depth &&
                 SharedVertices(ix, seg_start, seg_end) >= 2)
                 seg_end += 3;
             if (!semi || destination_fetch) {
                 while (seg_end < mark_end &&
-                       BatchSemi(b, ix[seg_end]) == semi)
+                       BatchSemi(b, ix[seg_end]) == semi &&
+                       BatchDepth(b, ix[seg_end]) == depth)
                     seg_end += 3;
             }
             if (seg_end > mark_end)
@@ -5346,7 +5718,7 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
                 box.x0 = box.x1 = 0;
             boxes[n_segments] = box;
             segments[n_segments++] =
-                (DrawSegment){seg_start, seg_end, semi, mark};
+                (DrawSegment){seg_start, seg_end, semi, depth, mark};
             n_draws += (semi || PSX_SHADERS_CURRENT) ? 1 : 2;
         }
         if (!n_segments) {
@@ -5395,8 +5767,21 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             .store_op = SDL_GPU_STOREOP_STORE,
         };
         ++frame_stats_batches;
-        SDL_GPURenderPass* pass =
-            SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
+        /* The depth view's clear (Psyz_VideoDepthView) is the first depth
+         * pass's load. */
+        const SDL_GPUDepthStencilTargetInfo depth_target = {
+            .texture = b->depth_texture,
+            .clear_depth = 0.0f,
+            .load_op = depth_clear_pending ? SDL_GPU_LOADOP_CLEAR
+                                           : SDL_GPU_LOADOP_LOAD,
+            .store_op = SDL_GPU_STOREOP_STORE,
+            .stencil_load_op = SDL_GPU_LOADOP_DONT_CARE,
+            .stencil_store_op = SDL_GPU_STOREOP_DONT_CARE,
+        };
+        if (b->depth_texture)
+            depth_clear_pending = false;
+        SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(
+            cmd, &target, 1, b->depth_texture ? &depth_target : NULL);
         const SDL_GPUBufferBinding vbind = {.buffer = b->vbuf, .offset = b->vertex_offset};
         SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
         const SDL_GPUBufferBinding ibind = {.buffer = b->ibuf, .offset = b->index_offset};
@@ -5436,12 +5821,17 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             SDL_PushGPUFragmentUniformData(
                 cmd, 0, color_pass, sizeof(color_pass));
 
+            const BlendMode blend = semi       ? BLEND_DIRECT
+                                    : checked  ? BLEND_CHECK
+                                    : combined ? BLEND_DIRECT
+                                               : BLEND_ADD;
             SDL_BindGPUGraphicsPipeline(
-                pass, semi && destination_fetch ? pipe_direct_fetch :
-                      pipe_tri[semi      ? BLEND_DIRECT
-                               : checked ? BLEND_CHECK
-                               : combined ? BLEND_DIRECT
-                                         : BLEND_ADD]);
+                pass, b->depth_texture
+                          ? (semi && destination_fetch
+                                 ? pipe_depth_fetch[segments[s].depth]
+                                 : pipe_depth[segments[s].depth][blend])
+                          : semi && destination_fetch ? pipe_direct_fetch
+                                                      : pipe_tri[blend]);
             SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
             /* Legacy shaders use alpha as an operation selector and need
              * a separate write of the real mask bit. */
@@ -6312,12 +6702,19 @@ void Draw_FlushBuffer(void) {
         }
         if (!target_index)
             NativeWrite(drawn, false); /* after the queued draws there */
+        Uint32 depth_w = 0, depth_h = 0;
+        DepthTargetSize(&depth_w, &depth_h);
+        const bool with_depth = batch_depth && depth_texture &&
+                                target_index == DepthTargetIndex() &&
+                                depth_texture_w == depth_w &&
+                                depth_texture_h == depth_h;
         const DrawTargetBatch target = {
             target_index ? scaled_vram_render : vram_render, target_index,
             target_index ? internal_res : 1, vertex_buf, NULL, index_buf,
             n_indices, vbuf, ibuf, vtx_offset,
             index_at * (Uint32)sizeof(*index_buf), mark_end,
-            views[target_index], extra_texture, extra_sampler, grid_same};
+            views[target_index], extra_texture, extra_sampler, grid_same,
+            with_depth ? depth_texture : NULL};
         if (!DrawTargetRuns(&target))
             goto abort_flush;
     }
@@ -6349,7 +6746,7 @@ static bool NativeRasterizerWanted(void) {
            vram_render && is_platform_init_successful && RequestedScale() == 1 &&
            !set_antialiasing && !set_geometry_correction &&
            !set_effect_geometry_correction && !set_model_filtering &&
-           !set_sprite_filtering && !widescreen &&
+           !set_sprite_filtering && !widescreen && !set_depth_buffer &&
            dither_mode != PSYZ_DITHER_OFF &&
            !(sprite_atlases_enabled && sprite_atlas_count);
 }
@@ -6388,6 +6785,10 @@ static void UpdateNativeRasterizer(void) {
     free(vram);
     free(rgba);
     Psyz_GpuResendDrawState();
+    /* precise vertices for the GPU rasterizer's enhancements only */
+    Psyz_PgxpSetActive(!UseSoftwareBackend() &&
+                       (geometry_correction || effect_geometry_correction ||
+                        model_filtering || set_depth_buffer));
 }
 
 static void PresentNativeVram(void) {
@@ -6413,7 +6814,10 @@ unsigned Psyz_VideoGetFeatures(void) {
         return 0;
     return PSYZ_VIDEO_FEATURE_UPSCALE | PSYZ_VIDEO_FEATURE_ANTIALIASING |
            PSYZ_VIDEO_FEATURE_FILTERING | PSYZ_VIDEO_FEATURE_GEOMETRY |
-           PSYZ_VIDEO_FEATURE_WIDESCREEN;
+           PSYZ_VIDEO_FEATURE_WIDESCREEN |
+           (PSX_SHADERS_CURRENT && !depth_unavailable
+                ? PSYZ_VIDEO_FEATURE_DEPTH_BUFFER
+                : 0);
 }
 
 const char* Psyz_VideoGetRendererName(void) {

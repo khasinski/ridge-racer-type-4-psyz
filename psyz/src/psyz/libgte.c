@@ -1833,6 +1833,7 @@ typedef struct {
     unsigned int queued;
     unsigned int is_effect;
     float x, y, w;
+    float dw; /* view depth for the depth buffer (exact INTPL position) */
 } PgxpAddrEntry;
 
 typedef struct {
@@ -1840,6 +1841,7 @@ typedef struct {
     unsigned int gen;
     unsigned int is_effect;
     float x, y, w;
+    float dw;
 } PgxpSxyEntry;
 
 /* 262144 entries: a race frame stores about 40000 precise vertices, and
@@ -1863,6 +1865,44 @@ static int pgxp_active = 0;
 static int pgxp_culling = 1;
 static int pgxp_effect_enabled = 0;
 static int pgxp_effect_mode = 0;
+/* The flags word of a precise vertex (is_effect): bit 0 an effect vertex
+ * (Psyz_GteSetPgxpEffectMode), bit 1 a vertex that takes no part in the
+ * depth buffer (Psyz_GteSetPgxpDepthClass: sky, backdrops). */
+#define PGXP_FLAG_EFFECT 1u
+#define PGXP_FLAG_NO_DEPTH 2u
+/* bit 3: bits 8..15 hold an ordering bias (Psyz_GteSetPgxpDepthLayer) */
+#define PGXP_FLAG_LAYER 8u
+/* bit 4: a depth only (Psyz_GteStorePgxpDepth): no precise position */
+#define PGXP_FLAG_DEPTH_ONLY 16u
+/* bit 5: a decal (PSYZ_PGXP_DEPTH_DECAL) */
+#define PGXP_FLAG_DECAL 32u
+#define PGXP_LAYER_BITS (PGXP_FLAG_LAYER | 0xFF00u)
+static unsigned int pgxp_depth_flags = 0;
+static unsigned int PgxpNewFlags(void) {
+    return (unsigned int)pgxp_effect_mode | pgxp_depth_flags;
+}
+/* A copy keeps its source's flags; the current class and layer apply too. */
+static unsigned int PgxpCopyFlags(unsigned int src) {
+    if (pgxp_depth_flags & PGXP_FLAG_LAYER)
+        src &= ~PGXP_LAYER_BITS;
+    if (pgxp_depth_flags & (PGXP_FLAG_LAYER | PGXP_FLAG_DECAL))
+        src &= ~PGXP_FLAG_DECAL; /* the face being copied decides */
+    return src | pgxp_depth_flags;
+}
+void Psyz_GteSetPgxpDepthClass(int depth_class) {
+    pgxp_depth_flags = (pgxp_depth_flags & PGXP_LAYER_BITS) |
+                       (depth_class == PSYZ_PGXP_DEPTH_NONE    ? PGXP_FLAG_NO_DEPTH
+                        : depth_class == PSYZ_PGXP_DEPTH_DECAL ? PGXP_FLAG_DECAL
+                                                               : 0u);
+}
+void Psyz_GteSetPgxpDepthLayer(int active, int ordering_bias) {
+    pgxp_depth_flags &= ~PGXP_LAYER_BITS;
+    if (active)
+        pgxp_depth_flags |= PGXP_FLAG_LAYER |
+                            ((unsigned int)(ordering_bias < -128 ? -128
+                                            : ordering_bias > 127 ? 127
+                                                                  : ordering_bias) & 0xFFu) << 8;
+}
 static int pgxp_library_stores = 0;
 void Psyz_GteSetPgxpLibraryStores(int enabled) {
     pgxp_library_stores = enabled != 0;
@@ -1915,6 +1955,7 @@ void Psyz_PgxpNextFrame(void) {
     }
     pgxp_matrix_valid = 0;
     pgxp_effect_mode = 0;
+    pgxp_depth_flags = 0;
 }
 
 void Psyz_GteSetPgxpMatrix(const double rot[3][3], const double trans[3]) {
@@ -1963,6 +2004,7 @@ static inline void PgxpStoreAddr(const void* dst, PgxpSxyEntry entry) {
         .x = entry.x,
         .y = entry.y,
         .w = entry.w,
+        .dw = entry.dw,
     };
 }
 
@@ -2050,6 +2092,29 @@ static inline int PgxpIntplSubpixel(double ix, double iy, double iz,
     return dx * dx + dy * dy < PGXP_INTPL_EXACT_PIXELS * PGXP_INTPL_EXACT_PIXELS;
 }
 
+/* The view depth a vertex gives the depth buffer, or -1 where the GTE's
+ * projection saturates (closer than half the projection distance, or behind
+ * the camera): its screen position is then no perspective projection, and a
+ * plane of depth through it would cut through what lies in front. */
+static inline float PgxpDepthW(double z) {
+    const double h = (double)(unsigned short)H;
+    return z * 2.0 > h && z > 0.0 ? (float)(z > 1.0 ? z : 1.0) : -1.0f;
+}
+/* As PgxpDepthW, also -1 where the vertex's screen position is clamped (the
+ * GPU's 11-bit range) or the whole-pixel projection disagrees with the
+ * precise one: a road tile reaching under the camera, drawn as the PS1
+ * draws it, has no plane of depth that matches the surface around it. */
+static inline float PgxpDepthWOnScreen(double z, double x, double y,
+                                       int disagree) {
+    const double h = (double)(unsigned short)H;
+    if (disagree || !(z * 2.0 > h))
+        return -1.0f;
+    const double sx = (double)OFX + x * (h / z), sy = (double)OFY + y * (h / z);
+    if (!(sx > -1000.0 && sx < 1000.0 && sy > -1000.0 && sy < 1000.0))
+        return -1.0f;
+    return PgxpDepthW(z);
+}
+
 static inline PgxpSxyEntry PgxpRecordVertex(
     int sf, int lm, int vx, int vy, int vz, int sx, int sy) {
     PgxpSxyEntry out = {0};
@@ -2072,6 +2137,11 @@ static inline PgxpSxyEntry PgxpRecordVertex(
             fz = ez;
         }
     }
+    /* The depth buffer's view depth is the one the vertex is drawn at:
+     * where INTPL truncated it, the whole-unit position, like its screen
+     * position (an exact depth there tilted the tile against its neighbours
+     * and the markings on it). */
+    const double depth_x = fx, depth_y = fy, depth_z = fz;
     if (!sf) {
         fx *= 4096.0;
         fy *= 4096.0;
@@ -2113,10 +2183,13 @@ static inline PgxpSxyEntry PgxpRecordVertex(
     out = (PgxpSxyEntry){
         .sxy = sxy,
         .gen = pgxp_frame_gen,
-        .is_effect = (unsigned int)pgxp_effect_mode,
+        .is_effect = PgxpNewFlags(),
         .x = sx_f,
         .y = sy_f,
         .w = w_f,
+        .dw = PgxpDepthWOnScreen(depth_z, sf ? depth_x : depth_x * 4096.0,
+                                 sf ? depth_y : depth_y * 4096.0,
+                                 trace_clip || trace_disagree),
     };
     set[1] = set[0];
     set[0] = out;
@@ -2141,10 +2214,28 @@ void Psyz_GteStorePgxpVertex(
     PgxpStoreAddr(dst, (PgxpSxyEntry){
                            .sxy = sxy,
                            .gen = pgxp_frame_gen,
-                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .is_effect = PgxpNewFlags(),
                            .x = x,
                            .y = y,
                            .w = w,
+                           .dw = w,
+                       });
+}
+
+void Psyz_GteStorePgxpDepth(const void* dst, unsigned int sxy, int sz) {
+    if (!pgxp_active || !dst) {
+        return;
+    }
+    const float x = (float)(short)(sxy & 0xFFFFu) + 0.5f;
+    const float y = (float)(short)(sxy >> 16) + 0.5f;
+    PgxpStoreAddr(dst, (PgxpSxyEntry){
+                           .sxy = sxy,
+                           .gen = pgxp_frame_gen,
+                           .is_effect = PgxpNewFlags() | PGXP_FLAG_DEPTH_ONLY,
+                           .x = x,
+                           .y = y,
+                           .w = (float)(sz > 1 ? sz : 1),
+                           .dw = PgxpDepthW((double)sz),
                        });
 }
 
@@ -2212,15 +2303,17 @@ void Psyz_GteProjectFloatVertex(
     PgxpStoreAddr(dst, (PgxpSxyEntry){
                            .sxy = sxy,
                            .gen = pgxp_frame_gen,
-                           .is_effect = (unsigned int)pgxp_effect_mode,
+                           .is_effect = PgxpNewFlags(),
                            .x = sx_f,
                            .y = sy_f,
                            .w = w_f,
+                           .dw = PgxpDepthW(fz),
                        });
 }
 
-int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
-                          float* x, float* y, float* w) {
+int Psyz_PgxpLookupVertexFlags(const void* packet_sxy_addr, unsigned int sxy,
+                               float* x, float* y, float* w,
+                               unsigned int* flags, float* depth_w) {
     if (!pgxp_active) {
         return 0;
     }
@@ -2231,20 +2324,27 @@ int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
         for (unsigned int i = 0; i < PGXP_ADDR_WAYS; ++i) {
             if ((aset[i].gen == pgxp_frame_gen || aset[i].queued) &&
                 aset[i].addr == addr && aset[i].sxy == sxy) {
-                if (aset[i].is_effect && !pgxp_effect_enabled) {
+                if ((aset[i].is_effect & PGXP_FLAG_EFFECT) && !pgxp_effect_enabled) {
                     if(pgxp_reason_trace)++pgxp_reasons.lookup_miss;
                     return 0;
                 }
                 *x = aset[i].x;
                 *y = aset[i].y;
                 *w = aset[i].w;
+                if (flags) *flags = aset[i].is_effect;
+                if (depth_w) *depth_w = aset[i].dw;
                 if (pgxp_reason_trace) ++pgxp_reasons.lookup_hit;
-                return aset[i].is_effect ? 2 : 1;
+                return (aset[i].is_effect & PGXP_FLAG_EFFECT) ? 2 : 1;
             }
         }
     }
     if (pgxp_reason_trace) ++pgxp_reasons.lookup_miss;
     return 0;
+}
+
+int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
+                          float* x, float* y, float* w) {
+    return Psyz_PgxpLookupVertexFlags(packet_sxy_addr, sxy, x, y, w, NULL, NULL);
 }
 
 int Psyz_GtePgxpNclip3(
@@ -2295,17 +2395,19 @@ void Psyz_GteCopyPgxpSxy(const void* src, const void* dst, unsigned int sxy) {
     if (!pgxp_active || !dst) {
         return;
     }
-    float x = 0.0f, y = 0.0f, w = 0.0f;
-    int kind = Psyz_PgxpLookupVertex(src, sxy, &x, &y, &w);
+    float x = 0.0f, y = 0.0f, w = 0.0f, dw = 0.0f;
+    unsigned int flags = 0;
+    int kind = Psyz_PgxpLookupVertexFlags(src, sxy, &x, &y, &w, &flags, &dw);
     if (kind) {
         if (pgxp_reason_trace) ++pgxp_reasons.copy_hit;
         PgxpStoreAddr(dst, (PgxpSxyEntry){
                                .sxy = sxy,
                                .gen = pgxp_frame_gen,
-                               .is_effect = (unsigned int)(kind == 2),
+                               .is_effect = PgxpCopyFlags(flags),
                                .x = x,
                                .y = y,
                                .w = w,
+                               .dw = dw,
                            });
     } else {
         if (pgxp_reason_trace) ++pgxp_reasons.copy_miss;
@@ -2965,7 +3067,7 @@ static int PgxpFifoNclip(int int_area) {
         const PgxpSxyEntry* e = &pgxp_fifo[i];
         if (e->gen != pgxp_frame_gen ||
             e->sxy != (unsigned int)SXY(sx[i], sy[i]) ||
-            (e->is_effect && !pgxp_effect_enabled)) {
+            ((e->is_effect & PGXP_FLAG_EFFECT) && !pgxp_effect_enabled)) {
             return int_area;
         }
     }
@@ -3680,16 +3782,18 @@ void Psyz_GteLoadSxyFrom(unsigned reg, const void* src) {
     if (pgxp_active && reg >= 12u && reg <= 15u) {
         unsigned int fifo_idx = reg == 15u ? 2u : (reg - 12u);
         PgxpSxyEntry entry = {0};
-        float x, y, w;
-        int kind = Psyz_PgxpLookupVertex(src, word, &x, &y, &w);
+        float x, y, w, dw = 0.0f;
+        unsigned int flags = 0;
+        int kind = Psyz_PgxpLookupVertexFlags(src, word, &x, &y, &w, &flags, &dw);
         if (kind) {
             entry = (PgxpSxyEntry){
                 .sxy = word,
                 .gen = pgxp_frame_gen,
-                .is_effect = (unsigned int)(kind == 2),
+                .is_effect = flags,
                 .x = x,
                 .y = y,
                 .w = w,
+                .dw = dw,
             };
         }
         pgxp_fifo[fifo_idx] = entry;

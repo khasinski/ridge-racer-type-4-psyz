@@ -40,6 +40,16 @@ int Psyz_VideoSetEffectGeometryCorrection(int enabled) {
 
 int Psyz_VideoGetEffectGeometryCorrection(void) { return 0; }
 
+int Psyz_VideoSetDepthBuffer(int enabled) { return enabled ? -1 : 0; }
+int Psyz_VideoGetDepthBuffer(void) { return 0; }
+int Psyz_VideoDepthBufferActive(void) { return 0; }
+void Psyz_VideoDepthView(int begin) { (void)begin; }
+void Psyz_VideoGetDepthStats(unsigned long long* views,
+                             unsigned long long* primitives) {
+    if (views) *views = 0;
+    if (primitives) *primitives = 0;
+}
+
 int Draw_SetHorizontalGrid(
     unsigned int source_width, unsigned int target_width) {
     if (source_width == 0 || target_width == 0) {

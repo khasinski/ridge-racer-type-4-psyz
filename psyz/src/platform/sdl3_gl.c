@@ -1663,6 +1663,11 @@ int Psyz_VideoSetDynamicLighting(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetDynamicLighting(void){return 0;}
 int Psyz_VideoSetEffectGeometryCorrection(int enabled){(void)enabled;return -1;}
 int Psyz_VideoGetEffectGeometryCorrection(void){return 0;}
+int Psyz_VideoSetDepthBuffer(int enabled){return enabled?-1:0;}
+int Psyz_VideoGetDepthBuffer(void){return 0;}
+int Psyz_VideoDepthBufferActive(void){return 0;}
+void Psyz_VideoDepthView(int begin){(void)begin;}
+void Psyz_VideoGetDepthStats(unsigned long long* views,unsigned long long* primitives){if(views)*views=0;if(primitives)*primitives=0;}
 
 /* Upscaling only: widescreen, antialiasing, filtering and
  * geometry correction are stubs here. */

@@ -18,6 +18,10 @@ layout(location = 10) in uvec4 exactBase;
 layout(location = 11) in uvec4 exactPerX;
 layout(location = 12) in uvec4 exactPerY;
 layout(location = 13) in uvec4 exactBlue;
+// depth buffer (sdl3_gpu.c, Psyz_VideoSetDepthBuffer): 1 / view depth of a
+// 3D world vertex, larger is nearer (cleared to 0, GREATER_OR_EQUAL); 0 for
+// everything else, which is drawn without a depth test
+layout(location = 14) in float vertexDepth;
 
 // widescreen: {x squeeze, centre x before the draw-grid viewport,
 //              sub-pixel shift x, y (game pixels)}
@@ -81,7 +85,9 @@ void main() {
     float y = ((vy + widescreen.w + drawOffset.y) / (512.0 / 2.0)) - 1.0;
     // SDL_GPU NDC y=-1 is the bottom while texture row 0 is the top; negate Y
     // so VRAM row 0 lands on texture row 0, like the GL FBO convention.
-    gl_Position = vec4(x * w, -y * w, 0.0, w);
+    // The rasterizer interpolates z / w linearly on the screen, as 1 / depth
+    // is across a plane, whether or not w carries the perspective.
+    gl_Position = vec4(x * w, -y * w, vertexDepth * w, w);
     // gouraud colors
     vertexColor = color;
     if (polygon != 0u) {

@@ -152,5 +152,12 @@ void Psyz_GteCopyQueuedPgxpSxy(
     const void* src, const void* dst, unsigned int sxy);
 int Psyz_PgxpLookupVertex(const void* packet_sxy_addr, unsigned int sxy,
                           float* x, float* y, float* w);
+/* As Psyz_PgxpLookupVertex; *flags: bit 0 effect, bit 1 no depth
+ * (Psyz_GteSetPgxpDepthClass), bit 3 a layer whose ordering bias is the
+ * signed byte of bits 8..15 (Psyz_GteSetPgxpDepthLayer), bit 4 a depth
+ * only (Psyz_GteStorePgxpDepth), bit 5 a decal (PSYZ_PGXP_DEPTH_DECAL). */
+int Psyz_PgxpLookupVertexFlags(const void* packet_sxy_addr, unsigned int sxy,
+                               float* x, float* y, float* w,
+                               unsigned int* flags, float* depth_w);
 
 #endif
