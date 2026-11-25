@@ -482,5 +482,5 @@ unsigned char psx_vert_msl[] = {
   0x75, 0x74, 0x3b, 0x0a, 0x7d, 0x0a, 0x0a
 };
 unsigned int psx_vert_msl_len = 5755;
-#define psx_vert_msl_revision 1
-#define psx_vert_msl_source_sha256 "e3f966f8752976333459ac4b9bcb5d3c3db05d66c2b89626fbcdb941b5d82ac3"
+#define psx_vert_msl_revision 2
+#define psx_vert_msl_source_sha256 "17fe79fc93745d613ae0ea6324c4ecea9bb5cd13023f5857c602b446ec578166"

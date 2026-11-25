@@ -136,5 +136,13 @@ int Draw_SetNativeDefer(int enabled);
 // submissions.
 unsigned Draw_SetCommandDescriptorLimit(unsigned limit);
 unsigned long long Draw_GetCommandRollovers(void);
+// Without framebuffer fetch: semi-transparent primitives read target copies
+// made per level (1, the default) or per run drawn in order (0); returns the
+// previous setting. Draw_GetTargetPasses counts the render passes drawn.
+int Draw_SetTargetLevels(int enabled);
+unsigned long long Draw_GetTargetPasses(void);
+// Lines drawn whole by the shader where it matches the pixel runs (1, the
+// default) or as runs of pixels only (0); returns the previous setting.
+int Draw_SetExactLines(int enabled);
 
 #endif

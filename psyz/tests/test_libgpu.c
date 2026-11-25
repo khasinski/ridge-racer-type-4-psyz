@@ -949,13 +949,13 @@ typedef struct BoundaryFrame {
 
 /* Draws the scene twice (the second frame's batches can wait for the
  * native VRAM: its buffer has been shown) and keeps the second frame. */
-static BoundaryFrame DrawBoundaryFrames(void) {
+static BoundaryFrame DrawFramesOf(void (*scene)(int frame)) {
     BoundaryFrame f = {0};
     DISPENV disp;
     SetDefDispEnv(&disp, 0, 0, 320, 240);
     PutDispEnv(&disp);
     for (int frame = 0; frame < 2; ++frame) {
-        DrawCommandBoundaryScene(frame);
+        scene(frame);
         VSync(0);
         PutDispEnv(&disp);
     }
@@ -966,6 +966,111 @@ static BoundaryFrame DrawBoundaryFrames(void) {
     StoreImage(&all, (u_long*)f.native);
     DrawSync(0);
     return f;
+}
+
+static BoundaryFrame DrawBoundaryFrames(void) {
+    return DrawFramesOf(DrawCommandBoundaryScene);
+}
+
+/* Particles: 600 small textured quads in one batch (one texture page),
+ * semi-transparent in clusters that overlap one another (chains) and
+ * scattered ones that do not, some opaque between them, in the four blend
+ * modes by cluster. */
+static void DrawParticleScene(int frame) {
+    static u16 texels[32 * 32];
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x)
+            texels[y * 32 + x] =
+                (u16)(((x * 3) & 31) | (((y * 5) & 31) << 5) |
+                      (((x + y) & 31) << 10) | ((x * y) % 5 ? 0x8000 : 0));
+    RECT page = {640, 0, 32, 32};
+    LoadImage(&page, (u_long*)texels);
+    RECT clear = {0, 0, 320, 240};
+    ClearImage(&clear, 40, 20, 60);
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 240);
+    env.dtd = 1;
+    PutDrawEnv(&env);
+    static POLY_FT4 quads[600];
+    for (int i = 0; i < 600; ++i) {
+        const int cluster = i % 6;
+        int x, y;
+        if (cluster < 4) { /* chains around four centres */
+            x = 40 + cluster * 70 + (i * 7 + frame) % 23;
+            y = 60 + (i * 11) % 31 + cluster * 20;
+        } else { /* scattered */
+            x = (i * 97 + frame * 13) % 300;
+            y = (i * 61) % 220;
+        }
+        POLY_FT4* q = &quads[i];
+        setPolyFT4(q);
+        setRGB0(q, 64 + i % 128, 96 + (i * 3) % 64, 200 - i % 100);
+        setXYWH(q, x, y, 6 + i % 9, 5 + i % 7);
+        setUVWH(q, i % 20, (i * 3) % 20, 8, 8);
+        q->tpage = getTPage(2, cluster & 3, 640, 0);
+        setSemiTrans(q, i % 7 != 3);
+        if (i + 1 < 600)
+            catPrim(q, &quads[i + 1]);
+        else
+            termPrim(q);
+    }
+    /* one list: the primitives go to the GPU as one batch */
+    DrawOTag((OT_TYPE*)&quads[0]);
+    DrawSync(0);
+}
+
+/* Lines: 1200 Gouraud and flat lines in every direction and length (up
+ * to 300 pixels), semi-transparent or not, in the four blend modes, some
+ * leaving the drawing area, the VRAM or the 11-bit coordinate range,
+ * with dithering, in one list (fireworks are hundreds of short Gouraud
+ * lines). */
+static void DrawLineScene(int frame) {
+    RECT clear = {0, 0, 320, 240};
+    ClearImage(&clear, 30, 40, 50);
+    DRAWENV env;
+    SetDefDrawEnv(&env, 0, 0, 320, 240);
+    env.dtd = 1;
+    PutDrawEnv(&env);
+    static LINE_G2 lines[1200];
+    unsigned seed = 12345u + (unsigned)frame;
+    for (int i = 0; i < 1200; ++i) {
+        LINE_G2* l = &lines[i];
+        seed = seed * 1103515245u + 12345u;
+        const int len = i % 10 == 0 ? 300 : 1 + (int)((seed >> 16) % 24);
+        seed = seed * 1103515245u + 12345u;
+        int x = (int)((seed >> 16) % 360) - 20;
+        seed = seed * 1103515245u + 12345u;
+        int y = (int)((seed >> 16) % 280) - 20;
+        if (i % 50 == 7) { /* from far outside: past the 11-bit range */
+            x = i % 100 == 7 ? -1000 : 1010;
+            y = i % 150 == 7 ? 1015 : -990;
+        }
+        seed = seed * 1103515245u + 12345u;
+        const int angle = (int)((seed >> 16) % 64);
+        static const signed char dirs[16][2] = {
+            {16, 0}, {16, 3}, {16, 7}, {16, 11}, {16, 16}, {11, 16},
+            {7, 16}, {3, 16}, {0, 16}, {-3, 16}, {-7, 16}, {-11, 16},
+            {-16, 16}, {-16, 11}, {-16, 7}, {-16, 3}};
+        const int d = angle % 16, sgn = angle / 16 % 2 ? -1 : 1;
+        setLineG2(l);
+        if (i % 5 == 4)
+            setLineF2(l);
+        setRGB0(l, (i * 37) & 255, (i * 91) & 255, 255 - (i & 255));
+        setRGB1(l, (i * 53) & 255, 255 - ((i * 7) & 255), (i * 29) & 255);
+        setXY2(l, x, y, x + sgn * dirs[d][0] * len / 16,
+               y + sgn * dirs[d][1] * len / 16);
+        setSemiTrans(l, i % 3 != 0);
+        if (i + 1 < 1200)
+            catPrim(l, &lines[i + 1]);
+        else
+            termPrim(l);
+    }
+    /* the blend mode of semi-transparent lines comes from the draw mode */
+    DR_MODE mode;
+    SetDrawMode(&mode, 0, 1, getTPage(0, frame & 3, 0, 0), NULL);
+    DrawPrim(&mode);
+    DrawOTag((OT_TYPE*)&lines[0]);
+    DrawSync(0);
 }
 
 static void ExpectSameFrames(const BoundaryFrame* a, const BoundaryFrame* b) {
@@ -1055,6 +1160,84 @@ ZTEST(gpu, deferred_native_draws_match_immediate_ones) {
         ExpectSameFrames(&immediate, &deferred);
         FreeFrames(&immediate);
         FreeFrames(&deferred);
+    }
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* Without framebuffer fetch (D3D12, Vulkan, PSYZ_GPU_FETCH=0) the batch's
+ * segments are drawn in levels, a render pass and one set of target copies
+ * each, instead of a pass at every semi-transparent primitive that overlaps
+ * the run before it. The scene (400 overlapping quads, two thirds of them
+ * semi-transparent in the four blend modes, mask bits, drawing areas,
+ * lines, a quad textured from its own display buffer) must come out the
+ * same either way, at 1x, 2x and 4x, and so must particles drawn in one
+ * batch (chains of overlapping semi-transparent quads among scattered
+ * ones), in fewer passes. */
+ZTEST(gpu, target_copy_levels_keep_drawing_order) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!SdlGpuHidden()) zskip("requires hidden SDL GPU output");
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
+    const unsigned scales[] = {1, 2, 4};
+    for (unsigned s = 0; s < 3; ++s) {
+        Psyz_VideoSetInternalResolution(scales[s]);
+        for (int scene = 0; scene < 2; ++scene) {
+            void (*draw)(int) =
+                scene ? DrawParticleScene : DrawCommandBoundaryScene;
+            const int previous = Draw_SetTargetLevels(0);
+            unsigned long long passes = Draw_GetTargetPasses();
+            BoundaryFrame ordered = DrawFramesOf(draw);
+            const unsigned long long ordered_passes =
+                Draw_GetTargetPasses() - passes;
+            Draw_SetTargetLevels(1);
+            passes = Draw_GetTargetPasses();
+            BoundaryFrame leveled = DrawFramesOf(draw);
+            const unsigned long long leveled_passes =
+                Draw_GetTargetPasses() - passes;
+            Draw_SetTargetLevels(previous);
+            printf("%ux scene %d: %llu render passes in order, %llu in "
+                   "levels\n",
+                   scales[s], scene, ordered_passes, leveled_passes);
+            zexpect_s32_eq(1, leveled_passes <= ordered_passes);
+            /* with target copies (a pass per primitive in order) */
+            if (scene && ordered_passes > 100)
+                zexpect_s32_eq(1, leveled_passes * 2 < ordered_passes);
+            ExpectSameFrames(&ordered, &leveled);
+            FreeFrames(&ordered);
+            FreeFrames(&leveled);
+        }
+    }
+    Psyz_VideoSetInternalResolution(1);
+#else
+    zskip("requires SDL GPU");
+#endif
+}
+
+/* Lines drawn whole by the shader (one quad each, its stepping per VRAM
+ * pixel) come out as the pixel runs did, at 1x, 2x and 4x, dithered. */
+ZTEST(gpu, exact_lines_match_pixel_runs) {
+#ifdef PSYZ_TEST_SDL_GPU
+    if (!SdlGpuHidden()) zskip("requires hidden SDL GPU output");
+    Psyz_VideoSetWidescreen(0);
+    Psyz_VideoSetAntialiasing(0);
+    Psyz_VideoSetGeometryCorrection(0);
+    Psyz_VideoSetDitheringMode(PSYZ_DITHER_AUTO);
+    const unsigned scales[] = {1, 2, 4};
+    for (unsigned s = 0; s < 3; ++s) {
+        Psyz_VideoSetInternalResolution(scales[s]);
+        const int previous = Draw_SetExactLines(0);
+        BoundaryFrame runs = DrawFramesOf(DrawLineScene);
+        Draw_SetExactLines(1);
+        BoundaryFrame whole = DrawFramesOf(DrawLineScene);
+        Draw_SetExactLines(previous);
+        ExpectSameFrames(&runs, &whole);
+        FreeFrames(&runs);
+        FreeFrames(&whole);
     }
     Psyz_VideoSetInternalResolution(1);
 #else
@@ -4393,6 +4576,61 @@ ZTEST(gpu, clut_cache_reloads_on_change_or_clear) {
     zexpect_u16_eq(0x001F, ReadPixel(1, 310));
     zexpect_u16_eq(0x001F, ReadPixel(17, 310));
     zexpect_u16_eq(0x03E0, ReadPixel(33, 310));
+}
+
+/* A palette loaded again reuses its earlier cache row only while nothing
+ * wrote its VRAM row: an upload, a primitive drawn over it and a copy onto
+ * it each make the next load read the new colours. */
+ZTEST(gpu, clut_cache_reload_sees_every_vram_write) {
+    zskip_targets("psp");
+    u16 texel = 0x1111; /* four 4-bit texels of index 1 */
+    RECT page = {640, 0, 1, 1};
+    LoadImage(&page, (u_long*)&texel);
+    u16 red[16] = {0, 0x001F}, green[16] = {0, 0x03E0}, blue[16] = {0, 0x7C00};
+    RECT clut_a = {0, 480, 16, 1}, clut_b = {16, 480, 16, 1};
+    LoadImage(&clut_a, (u_long*)red);
+    LoadImage(&clut_b, (u_long*)green);
+    DrawSync(0);
+    const u32 state[] = {0xE3000000, 0xE4000000 | (511 << 10) | 1023,
+                         0xE5000000, 0xE6000000,
+                         0xE1000000 | (u32)getTPage(0, 0, 640, 0)};
+    SubmitGP0(state, 5);
+    const u32 clut_at_a = (u32)GetClut(0, 480) << 16;
+    const u32 clut_at_b = (u32)GetClut(16, 480) << 16;
+    int x = 0;
+#define SPRITE_WITH(clut_word)                                             \
+    do {                                                                   \
+        const u32 sprite[] = {0x7C808080, (310u << 16) | (u32)x,           \
+                              (clut_word) | 0};                            \
+        SubmitGP0(sprite, 3);                                              \
+        x += 16;                                                           \
+    } while (0)
+    SPRITE_WITH(clut_at_a); /* 0: red */
+    SPRITE_WITH(clut_at_b); /* 16: green */
+    SPRITE_WITH(clut_at_a); /* 32: red again, nothing written */
+    LoadImage(&clut_a, (u_long*)blue);
+    DrawSync(0);
+    SubmitGP0(state, 5);
+    SPRITE_WITH(clut_at_b); /* 48: green */
+    SPRITE_WITH(clut_at_a); /* 64: blue (uploaded) */
+    const u32 tile[] = {0x68FFFFFF, (480u << 16) | 1}; /* 1x1 white */
+    SubmitGP0(tile, 2);
+    SPRITE_WITH(clut_at_b); /* 80: green */
+    SPRITE_WITH(clut_at_a); /* 96: white (drawn) */
+    SPRITE_WITH(clut_at_b); /* 112: green */
+    SPRITE_WITH(clut_at_a); /* 128: white, nothing written since */
+    RECT from = {16, 480, 16, 1};
+    MoveImage(&from, 0, 480);
+    DrawSync(0);
+    SubmitGP0(state, 5);
+    SPRITE_WITH(clut_at_b); /* 144: green */
+    SPRITE_WITH(clut_at_a); /* 160: green (copied) */
+#undef SPRITE_WITH
+    DrawSync(0);
+    const u16 expected[] = {0x001F, 0x03E0, 0x001F, 0x03E0, 0x7C00, 0x03E0,
+                            0x7FFF, 0x03E0, 0x7FFF, 0x03E0, 0x03E0};
+    for (int i = 0; i < 11; ++i)
+        zexpect_u16_eq(expected[i], ReadPixel(i * 16 + 1, 310));
 }
 
 #if defined(__psyz) && !defined(__PSP__)

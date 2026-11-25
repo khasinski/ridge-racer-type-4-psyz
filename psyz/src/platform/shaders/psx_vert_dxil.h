@@ -859,5 +859,5 @@ unsigned char psx_vert_dxil[] = {
   0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 unsigned int psx_vert_dxil_len = 10280;
-#define psx_vert_dxil_revision 1
-#define psx_vert_dxil_source_sha256 "e3f966f8752976333459ac4b9bcb5d3c3db05d66c2b89626fbcdb941b5d82ac3"
+#define psx_vert_dxil_revision 2
+#define psx_vert_dxil_source_sha256 "17fe79fc93745d613ae0ea6324c4ecea9bb5cd13023f5857c602b446ec578166"

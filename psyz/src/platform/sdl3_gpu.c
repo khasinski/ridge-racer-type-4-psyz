@@ -119,7 +119,7 @@ static bool DrawBatchFull(unsigned vertices, unsigned indices);
  * shaders/psx.*.glsl, copied into the headers by build_shaders.sh). Headers
  * built from older sources keep the previous behaviour: no exact polygons,
  * mask bit or CLUT cache, and the old upscaled sample positions. */
-#define PSX_SHADER_REVISION 1
+#define PSX_SHADER_REVISION 2
 #if defined(PSX_VERT_REVISION) && defined(PSX_FRAG_REVISION) && \
     PSX_VERT_REVISION == PSX_SHADER_REVISION && \
     PSX_FRAG_REVISION == PSX_SHADER_REVISION
@@ -131,6 +131,64 @@ static bool DrawBatchFull(unsigned vertices, unsigned indices);
 typedef struct {
     int x, y;
 } Posi;
+/* PSYZ_GPU_COUNTERS=file: one line a present with the GPU work recorded
+ * since the previous one: render passes, copy passes, texture-to-texture
+ * copies and their pixels (thousands), draws, pipeline binds, command
+ * buffer submissions, blits and the CPU microseconds the target-copy levels
+ * took to order (diagnostics; the counting is always on and
+ * costs an increment a call). */
+static struct GpuCounters {
+    Uint64 passes, copy_passes, copies, copy_px, draws, binds, submits, blits;
+    Uint64 level_ticks; /* DrawTargetLevels' ordering (CPU) */
+    Uint64 vertices, line_runs; /* queued; quads of line pixels */
+} gpu_counters;
+#define SDL_BeginGPURenderPass(c, t, n, d) \
+    (++gpu_counters.passes, SDL_BeginGPURenderPass(c, t, n, d))
+#define SDL_BeginGPUCopyPass(c) \
+    (++gpu_counters.copy_passes, SDL_BeginGPUCopyPass(c))
+#define SDL_CopyGPUTextureToTexture(p, f, t, w, h, d, c) \
+    (++gpu_counters.copies, gpu_counters.copy_px += (Uint64)(w) * (h), \
+     SDL_CopyGPUTextureToTexture(p, f, t, w, h, d, c))
+#define SDL_DrawGPUIndexedPrimitives(p, n, i, f, o, s) \
+    (++gpu_counters.draws, SDL_DrawGPUIndexedPrimitives(p, n, i, f, o, s))
+#define SDL_DrawGPUPrimitives(p, n, i, f, s) \
+    (++gpu_counters.draws, SDL_DrawGPUPrimitives(p, n, i, f, s))
+#define SDL_BindGPUGraphicsPipeline(p, g) \
+    (++gpu_counters.binds, SDL_BindGPUGraphicsPipeline(p, g))
+#define SDL_SubmitGPUCommandBuffer(c) \
+    (++gpu_counters.submits, SDL_SubmitGPUCommandBuffer(c))
+#define SDL_SubmitGPUCommandBufferAndAcquireFence(c) \
+    (++gpu_counters.submits, SDL_SubmitGPUCommandBufferAndAcquireFence(c))
+#define SDL_BlitGPUTexture(c, i) \
+    (++gpu_counters.blits, SDL_BlitGPUTexture(c, i))
+static void GpuCountersPresent(void) {
+    static int state = -1;
+    static FILE* log;
+    if (state < 0) {
+        const char* path = SDL_getenv("PSYZ_GPU_COUNTERS");
+        log = path && *path ? fopen(path, "w") : NULL;
+        state = log != NULL;
+        if (log)
+            fprintf(log, "# field passes copy_passes copies copy_kpx draws "
+                         "binds submits blits level_us vertices line_runs\n");
+    }
+    if (state > 0) {
+        const struct GpuCounters* c = &gpu_counters;
+        fprintf(log, "%d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                Psyz_VideoVSync(-1), (unsigned long long)c->passes,
+                (unsigned long long)c->copy_passes,
+                (unsigned long long)c->copies,
+                (unsigned long long)(c->copy_px / 1000),
+                (unsigned long long)c->draws, (unsigned long long)c->binds,
+                (unsigned long long)c->submits, (unsigned long long)c->blits,
+                (unsigned long long)(c->level_ticks * 1000000 /
+                                     SDL_GetPerformanceFrequency()),
+                (unsigned long long)c->vertices,
+                (unsigned long long)c->line_runs);
+    }
+    memset(&gpu_counters, 0, sizeof(gpu_counters));
+}
+
 
 #define VRAM_BYTES (VRAM_W * VRAM_H * 4)
 
@@ -769,9 +827,27 @@ static void RecordClutLoads(SDL_GPUCommandBuffer* cmd) {
  * recorded (AcquireCmd) starts a new generation. */
 enum { CLUT_REUSE_SLOTS = 1024 };
 static struct {
-    Uint32 key, generation, load;
+    Uint32 key, generation, load, serial, epoch;
     Uint16 row;
 } clut_reuse[CLUT_REUSE_SLOTS];
+/* A palette whose VRAM pixels nothing wrote since its load also reads the
+ * same texels, however many commands came between: its row serves it while
+ * the ring has not come round to it (on D3D12 and Vulkan each copy is two
+ * pairs of resource barriers, about a hundred a race frame). Every write to
+ * the native VRAM goes through MarkVramDirty, which stamps the 64-pixel
+ * blocks of the rows it covers; a load records the stamp it saw. The
+ * cache's texture is new with each device (clut_cache_epoch). */
+static Uint32 vram_write_serial = 1, clut_cache_epoch;
+/* the stamp of each row's 64-pixel blocks */
+#define VRAM_WRITE_BLOCK 64
+static Uint32 vram_block_written[VRAM_H][VRAM_W / VRAM_WRITE_BLOCK];
+/* the newest stamp in row y, x0..x1 - 1 */
+static Uint32 VramWrittenSince(int y, int x0, int x1) {
+    Uint32 newest = 0;
+    for (int b = x0 / VRAM_WRITE_BLOCK; b <= (x1 - 1) / VRAM_WRITE_BLOCK; ++b)
+        newest = SDL_max(newest, vram_block_written[y][b]);
+    return newest;
+}
 static Uint32 clut_generation = 1;
 static Uint32 clut_load_count; /* rows loaded: a row is reused for a later
                                   load only while the ring has not come
@@ -1551,6 +1627,7 @@ static bool CreateGpuResources(void) {
     clut_info.width = 256;
     clut_info.height = CLUT_CACHE_ROWS;
     clut_cache = SDL_CreateGPUTexture(device, &clut_info);
+    ++clut_cache_epoch;
     if (!vram_render || !vram_sample || !blend_sample || !clut_cache) {
         ERRORF("SDL_CreateGPUTexture: %s", SDL_GetError());
         return false;
@@ -1998,6 +2075,11 @@ static void MarkVramDirty(SDL_Rect r) {
     if (x1 <= x0 || y1 <= y0) {
         return;
     }
+    ++vram_write_serial;
+    for (int y = y0; y < y1; ++y)
+        for (int b = x0 / VRAM_WRITE_BLOCK; b <= (x1 - 1) / VRAM_WRITE_BLOCK;
+             ++b)
+            vram_block_written[y][b] = vram_write_serial;
     if (vram_dirty.w <= 0 || vram_dirty.h <= 0) {
         vram_dirty = (SDL_Rect){x0, y0, x1 - x0, y1 - y0};
         return;
@@ -2069,11 +2151,14 @@ static bool CreateScaledVramTarget(unsigned n) {
     ReleaseTransientDisplayTextures();
     if (!SubmitCmdAndWait() || !SDL_WaitForGPUIdle(device))
         return false;
+    /* Only drawn into and copied from (the presentation copies the shown
+     * region first): without SAMPLER usage its resting state on D3D12 and
+     * Vulkan is the render target's, so a render pass needs no transition
+     * of the whole texture in and out of it. */
     const SDL_GPUTextureCreateInfo info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage =
-            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
         .width = VRAM_W * n,
         .height = VRAM_H * n,
         .layer_count_or_depth = 1,
@@ -2866,7 +2951,8 @@ static void PlatformBackend_Present(void) {
                     game_aspect = (float)VRAM_W / (float)VRAM_H;
                 }
 
-                if (!rgb24 && !debug_show_vram)
+                /* (the scaled target is not sampled: copied first) */
+                if (!rgb24)
                     src = PrepareDisplayTexture(cmd, src);
 
                 WndSize win = {(int)sc_w, (int)sc_h};
@@ -3034,6 +3120,8 @@ static void PlatformBackend_Present(void) {
                 gpu_time_draw, present_ms);
         gpu_time_draw = 0.0;
     } else SubmitFrame();
+    if (!ws_capture_active)
+        GpuCountersPresent();
 }
 
 /* Releases the device and everything made on it (idle already). */
@@ -4397,7 +4485,11 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     const SDL_Rect row = {cx, cy, cw, 1}, wrapped = {0, cy, cx + cw - VRAM_W, 1};
     if (RectsIntersect(row, batch_drawn) || RectsIntersect(wrapped, batch_drawn))
         DRAW_FLUSH_FOR(DRAW_FLUSH_FEEDBACK);
-    else if (clut_cache_loads + 1 >= CLUT_CACHE_ROWS)
+    else if (clut_cache_loads + 1 >= CLUT_CACHE_ROWS ||
+             (batch_clut_oldest &&
+              clut_load_count + 1 >= batch_clut_oldest + CLUT_CACHE_ROWS - 1))
+        /* a load would come round to a row the batch reads (an older row
+         * a palette reuses counts from its own load) */
         DRAW_FLUSH_FOR(DRAW_FLUSH_CLUT);
     if (gpu_failed || !device || !clut_cache)
         return;
@@ -4413,9 +4505,19 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     clut_cache_8bit = depth == 1;
     const Uint32 key = (Uint32)cx | (Uint32)cy << 10 | (Uint32)(cw == 256) << 19;
     const unsigned slot = (key * 2654435761u) >> 22;
-    if (clut_reuse[slot].generation == clut_generation &&
-        clut_reuse[slot].key == key &&
-        clut_load_count - clut_reuse[slot].load < CLUT_CACHE_ROWS - 1) {
+    /* Across commands only from the newer half of the ring, so draws that
+     * read a reused row (queued native draws included, NativeClutReuse)
+     * rarely reach the ring's end while still young. */
+    if (clut_reuse[slot].key == key &&
+        clut_load_count - clut_reuse[slot].load < CLUT_CACHE_ROWS - 1 &&
+        (clut_reuse[slot].generation == clut_generation ||
+         (clut_reuse[slot].epoch == clut_cache_epoch &&
+          clut_load_count - clut_reuse[slot].load < CLUT_CACHE_ROWS / 2 &&
+          VramWrittenSince(cy, cx, SDL_min(cx + cw, VRAM_W)) <=
+              clut_reuse[slot].serial &&
+          (cx + cw <= VRAM_W ||
+           VramWrittenSince(cy, 0, cx + cw - VRAM_W) <=
+               clut_reuse[slot].serial)))) {
         clut_cache_row = clut_reuse[slot].row;
         clut_cache_row_load = clut_reuse[slot].load;
         return;
@@ -4428,6 +4530,8 @@ static void ClutCacheUpdate(u16 tpage, u16 clut) {
     clut_reuse[slot].key = key;
     clut_reuse[slot].generation = clut_generation;
     clut_reuse[slot].row = (Uint16)clut_cache_row;
+    clut_reuse[slot].serial = vram_write_serial;
+    clut_reuse[slot].epoch = clut_cache_epoch;
     clut_reuse[slot].load = ++clut_load_count;
     clut_cache_row_load = clut_load_count;
     const int first = SDL_min(cw, VRAM_W - cx);
@@ -4561,6 +4665,7 @@ static void BatchTextureFeedback(const u_long* words, int max_len) {
 static void DrawLineRun(int x, int y, int n, int r, int g, int b, bool semi,
                         u16 tpage) {
     Draw_EnsureBufferWillNotOverflow(4, 6);
+    ++gpu_counters.line_runs;
     Vertex* q = vertex_cur;
     memset(q, 0, 4 * sizeof(*q));
     for (int k = 0; k < 4; k++) {
@@ -4578,6 +4683,75 @@ static void DrawLineRun(int x, int y, int n, int r, int g, int b, bool semi,
     static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
     for (int k = 0; k < 6; k++)
         index_cur[k] = (u32)(n_vertices + order[k]);
+    Draw_EnqueueBuffer(4, 6);
+}
+
+/* PSYZ_GPU_LINES=0 (or Draw_SetExactLines(0)): lines as pixel runs only. */
+static int exact_lines = -1;
+static bool ExactLines(void) {
+    if (exact_lines < 0) {
+        const char* env = SDL_getenv("PSYZ_GPU_LINES");
+        exact_lines = !(env && !strcmp(env, "0"));
+    }
+    return exact_lines > 0;
+}
+int Draw_SetExactLines(int enabled) {
+    const int previous = ExactLines() ? 1 : 0;
+    if (device)
+        Draw_FlushBuffer();
+    exact_lines = enabled != 0;
+    return previous;
+}
+
+/* A whole line as one quad, its box (clipped to the drawing area), with the
+ * stepping the shader repeats for each VRAM pixel (psx.frag,
+ * exactLineSample): the same pixels and colours as the runs below, without
+ * a quad (four 168-byte vertices) for every pixel whose colour changes. No
+ * pixel of the line wraps (11-bit coordinates). (x0, y0) is its first pixel
+ * after the swap, minor/step its minor axis in 32.32, c/step_c its colour
+ * in 12.12. */
+static void EmitExactLine(int x0, int y0, int x1, int y1, int k, bool y_major,
+                          bool decreasing, int64_t minor, int64_t step,
+                          const int32_t* c, const int32_t* step_c, bool semi,
+                          u16 tpage) {
+    const int bx0 = SDL_max(SDL_min(x0, x1), SDL_max(scissor_rect.x, 0));
+    const int by0 = SDL_max(SDL_min(y0, y1), SDL_max(scissor_rect.y, 0));
+    const int bx1 = SDL_min(SDL_max(x0, x1) + 1,
+                            SDL_min(scissor_rect.x + scissor_rect.w, VRAM_W));
+    const int by1 = SDL_min(SDL_max(y0, y1) + 1,
+                            SDL_min(scissor_rect.y + scissor_rect.h, VRAM_H));
+    if (bx0 >= bx1 || by0 >= by1)
+        return;
+    Draw_EnsureBufferWillNotOverflow(4, 6);
+    Vertex* q = vertex_cur;
+    memset(q, 0, 4 * sizeof(*q));
+    const unsigned int exact[5][4] = {
+        {((unsigned)x0 & 0xFFFFu) | (unsigned)y0 << 16,
+         (unsigned)k | (y_major ? 0x10000u : 0u) |
+             (decreasing ? 0x20000u : 0u),
+         0, 1u | 8u},
+        {(uint32_t)c[0], (uint32_t)c[1], (uint32_t)c[2], (uint32_t)minor},
+        {(uint32_t)step_c[0], (uint32_t)step_c[1], (uint32_t)step_c[2],
+         (uint32_t)((uint64_t)minor >> 32)},
+        {(uint32_t)step, (uint32_t)((uint64_t)step >> 32), 0, 0},
+        {0, 0, 0, 0}};
+    for (int i = 0; i < 4; i++) {
+        q[i].x = (short)(((i & 1) ? bx1 : bx0) - draw_offset.x);
+        q[i].y = (short)(((i & 2) ? by1 : by0) - draw_offset.y);
+        q[i].r = (u8)(c[0] >> 12);
+        q[i].g = (u8)(c[1] >> 12);
+        q[i].b = (u8)(c[2] >> 12);
+        q[i].a = semi ? 0x80 : 0xFF;
+        q[i].pgxp_pos[0] = (float)q[i].x;
+        q[i].pgxp_pos[1] = (float)q[i].y;
+        q[i].pgxp_pos[2] = -1.0f;
+        memcpy(q[i].exact, exact, sizeof(exact));
+        SET_TC(&q[i], tpage, -1);
+    }
+    static const unsigned short order[6] = {0, 1, 2, 1, 3, 2};
+    for (int i = 0; i < 6; i++)
+        index_cur[i] = (u32)(n_vertices + order[i]);
+    ++gpu_counters.line_runs;
     Draw_EnqueueBuffer(4, 6);
 }
 
@@ -4626,6 +4800,20 @@ static void DrawLinePixels(int x0, int y0, int r0, int g0, int b0, int x1,
     int32_t c[3];
     for (int i = 0; i < 3; i++)
         c[i] = (c0[i] << 12) | (1 << 11);
+    /* (high colour keeps the runs: it shades with the vertex colour) */
+    /* (within 11-bit signed coordinates no pixel wraps; the drawing area
+     * clips the rest) */
+    if (ExactLines() && ExactPolygonsActive() &&
+        dither_mode != PSYZ_DITHER_OFF && x0 >= -1024 && x1 >= -1024 &&
+        y0 >= -1024 && y1 >= -1024 && x0 < 1024 && x1 < 1024 &&
+        y0 < 1024 && y1 < 1024) {
+        /* the major axis steps by exactly one pixel (+-2^32) */
+        const bool y_major = dy >= dx && k > 0;
+        EmitExactLine(x0, y0, x1, y1, k, y_major, y_major && step_y < 0,
+                      y_major ? x : y, y_major ? step_x : step_y, c, step_c,
+                      semi, tpage);
+        return;
+    }
     int run_x = 0, run_y = 0, run_n = 0, run_c[3] = {0, 0, 0};
     for (int i = 0; i <= k; i++) {
         /* outside the drawing area (the scissor) unless within the VRAM */
@@ -5677,8 +5865,379 @@ static void ComputeDrawView(DrawView* view, unsigned target_index,
     view->mask_check = mask_check_bit;
 }
 
+/* ===== Target copies in levels (no framebuffer fetch) =====
+ * Without framebuffer fetch a semi-transparent primitive reads its
+ * destination from a copy of the target made before its render pass. Drawn
+ * in order, a pass ended at every semi-transparent primitive that overlapped
+ * anything drawn earlier in it: a race frame took tens to hundreds of render
+ * passes and as many copies, and on D3D12 and Vulkan every pass and every
+ * copy is a set of whole-texture barriers, where the GPU waits for all the
+ * work before it. Now each segment (a run of opaque primitives, or one
+ * semi-transparent primitive) gets a level: the highest level of the earlier
+ * segments it overlaps, plus one when it is semi-transparent. Level L is
+ * drawn in one render pass, its segments in their order, from one copy made
+ * after levels 0..L-1. For any pixel the segments that touch it overlap one
+ * another, so their levels never decrease in drawing order and they are
+ * drawn in the same order as before; a semi-transparent one reads exactly
+ * the segments before it that touch its pixels (all of a lower level), and
+ * none after it (those are of its level or higher, drawn after the copy).
+ * Boxes are the same conservative target-pixel bounds the copies use. The
+ * copies of a level are merged into few rectangles: they are all read from
+ * the same pre-pass target, so a larger rectangle copies the same texels.
+ * PSYZ_GPU_LEVELS=0 draws in order as before (diagnostics). */
+static int gpu_levels = -1;
+static unsigned long long target_passes;
+static bool GpuLevels(void) {
+    if (gpu_levels < 0) {
+        const char* env = SDL_getenv("PSYZ_GPU_LEVELS");
+        gpu_levels = !(env && !strcmp(env, "0"));
+    }
+    return gpu_levels > 0;
+}
+int Draw_SetTargetLevels(int enabled) {
+    const int previous = GpuLevels() ? 1 : 0;
+    if (device)
+        Draw_FlushBuffer();
+    gpu_levels = enabled != 0;
+    return previous;
+}
+unsigned long long Draw_GetTargetPasses(void) { return target_passes; }
+
+#define LEVEL_WINDOW 4096
+#define LEVEL_COPIES 64
+/* Segments past the first LEVEL_EXACT of a window take their level from a
+ * height map instead of comparing with every earlier box: the highest level
+ * drawn so far on each VRAM pixel (a target box covers the VRAM pixels its
+ * target pixels lie in), one array access a VRAM pixel of the box instead of
+ * a box test an earlier segment (a frame of fireworks has thousands of
+ * them). It can only give a level higher than needed, never lower: the
+ * pixels of overlapping boxes share VRAM pixels. Entries carry the window's
+ * stamp in the high 16 bits (level + 1 in the low ones). A box's VRAM
+ * pixels are those its target pixels lie in; overlapping boxes share one. */
+#define LEVEL_EXACT 512
+static Uint32 level_map[VRAM_H][VRAM_W];
+static Uint32 level_stamp;
+/* A box of more than LEVEL_BIG VRAM pixels (a run of opaque course
+ * polygons, a full-screen fade) works on 16x16-pixel tiles instead:
+ * level_tiles holds every box's level, level_big_tiles the big boxes' only.
+ * A small box reads its pixels and level_big_tiles, a big one level_tiles. */
+#define LEVEL_BIG 1024
+#define LEVEL_TILE 16
+static Uint32 level_tiles[VRAM_H / LEVEL_TILE][VRAM_W / LEVEL_TILE];
+static Uint32 level_big_tiles[VRAM_H / LEVEL_TILE][VRAM_W / LEVEL_TILE];
+static Uint32 LevelRead(const Uint32* v, Uint32 stamp, Uint32 high) {
+    return (*v & 0xFFFF0000u) == stamp && (*v & 0xFFFFu) > high
+               ? *v & 0xFFFFu
+               : high;
+}
+static void LevelWrite(Uint32* v, Uint32 mark) {
+    if ((*v & 0xFFFF0000u) != (mark & 0xFFFF0000u) || *v < mark)
+        *v = mark;
+}
+static void LevelCells(const SemiBox* box, unsigned scale, int* x0, int* y0,
+                       int* x1, int* y1) {
+    *x0 = SDL_clamp(box->x0 / (int)scale, 0, VRAM_W - 1);
+    *y0 = SDL_clamp(box->y0 / (int)scale, 0, VRAM_H - 1);
+    *x1 = SDL_clamp((box->x1 - 1) / (int)scale, 0, VRAM_W - 1);
+    *y1 = SDL_clamp((box->y1 - 1) / (int)scale, 0, VRAM_H - 1);
+}
+static bool BoxesOverlap(const SemiBox* a, const SemiBox* b) {
+    return a->x0 < b->x1 && b->x0 < a->x1 && a->y0 < b->y1 && b->y0 < a->y1;
+}
+static Sint64 BoxArea(const SemiBox* a) {
+    return (Sint64)(a->x1 - a->x0) * (a->y1 - a->y0);
+}
+static SemiBox BoxUnion(const SemiBox* a, const SemiBox* b) {
+    return (SemiBox){SDL_min(a->x0, b->x0), SDL_min(a->y0, b->y0),
+                     SDL_max(a->x1, b->x1), SDL_max(a->y1, b->y1)};
+}
+
+static bool DrawTargetLevels(const DrawTargetBatch* b) {
+    static DrawSegment segments[LEVEL_WINDOW];
+    static SemiBox boxes[LEVEL_WINDOW];
+    static int levels[LEVEL_WINDOW];
+    static bool boxed[LEVEL_WINDOW];
+    static SemiBox copies[LEVEL_COPIES];
+    const u32* ix = b->indices;
+    const int n_indices = b->n_indices;
+    SDL_GPUTexture* render_target = b->target;
+    const unsigned target_index = b->target_index;
+    const unsigned target_scale = b->target_scale;
+    SDL_GPUTexture* destination_sample =
+        target_index && scaled_blend_sample ? scaled_blend_sample : blend_sample;
+    /* merging two copies costs at most this many pixels more (8x8 VRAM
+     * pixels: neighbouring boxes merge, scattered ones are copied apart) */
+    const Sint64 copy_slack = (Sint64)(8 * target_scale) * (8 * target_scale);
+    int start = 0, mark = 0;
+    while (start < n_indices) {
+        int n_segments = 0, max_level = 0;
+        int end = start;
+        const Uint64 ordering_start = SDL_GetPerformanceCounter();
+        if (++level_stamp == 0x10000) {
+            memset(level_map, 0, sizeof(level_map));
+            memset(level_tiles, 0, sizeof(level_tiles));
+            memset(level_big_tiles, 0, sizeof(level_big_tiles));
+            level_stamp = 1;
+        }
+        const Uint32 stamp = level_stamp << 16;
+        while (end < n_indices && n_segments < LEVEL_WINDOW) {
+            while (b->mark_end[mark] <= end)
+                ++mark;
+            const int mark_end = b->mark_end[mark];
+            const DrawView* view = &b->views[mark];
+            if (!view->visible) {
+                end = mark_end; // an empty drawing area draws nothing
+                continue;
+            }
+            const int seg_start = end;
+            const bool semi = BatchSemi(b, ix[seg_start]);
+            const unsigned depth = BatchDepth(b, ix[seg_start]);
+            int seg_end = seg_start + (BatchExact(b, ix[seg_start]) ? 6 : 3);
+            /* the two triangles of one quad cover disjoint pixels */
+            if (semi && seg_end + 3 <= mark_end &&
+                !BatchExact(b, ix[seg_start]) &&
+                BatchSemi(b, ix[seg_end]) &&
+                BatchDepth(b, ix[seg_end]) == depth &&
+                SharedVertices(ix, seg_start, seg_end) >= 2)
+                seg_end += 3;
+            if (!semi) {
+                while (seg_end < mark_end && !BatchSemi(b, ix[seg_end]) &&
+                       BatchDepth(b, ix[seg_end]) == depth)
+                    seg_end += 3;
+            }
+            if (seg_end > mark_end)
+                seg_end = mark_end;
+            end = seg_end;
+            SemiBox box;
+            const bool visible =
+                PrimitiveBox(b, seg_start, seg_end, view, &box);
+            if (semi && !visible)
+                continue; // outside the drawing area: draws nothing
+            int level = 0;
+            if (visible) {
+                int cx0, cy0, cx1, cy1;
+                LevelCells(&box, target_scale, &cx0, &cy0, &cx1, &cy1);
+                if (n_segments < LEVEL_EXACT) {
+                    /* the most this segment can get: stop once reached */
+                    const int top = max_level + (semi ? 1 : 0);
+                    for (int t = n_segments; t-- > 0 && level < top;) {
+                        if (boxed[t] && BoxesOverlap(&boxes[t], &box)) {
+                            const int l = levels[t] + (semi ? 1 : 0);
+                            if (l > level)
+                                level = l;
+                        }
+                    }
+                }
+                const bool big =
+                    (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > LEVEL_BIG;
+                const int tx0 = cx0 / LEVEL_TILE, tx1 = cx1 / LEVEL_TILE;
+                const int ty0 = cy0 / LEVEL_TILE, ty1 = cy1 / LEVEL_TILE;
+                if (n_segments >= LEVEL_EXACT) {
+                    Uint32 high = 0; /* level + 1 of the highest below */
+                    for (int y = ty0; y <= ty1; ++y)
+                        for (int x = tx0; x <= tx1; ++x)
+                            high = LevelRead(big ? &level_tiles[y][x]
+                                                 : &level_big_tiles[y][x],
+                                             stamp, high);
+                    for (int y = cy0; !big && y <= cy1; ++y)
+                        for (int x = cx0; x <= cx1; ++x)
+                            high = LevelRead(&level_map[y][x], stamp, high);
+                    if (high)
+                        level = (int)high - 1 + (semi ? 1 : 0);
+                }
+                const Uint32 mark = stamp | (Uint32)(level + 1);
+                for (int y = ty0; y <= ty1; ++y)
+                    for (int x = tx0; x <= tx1; ++x) {
+                        LevelWrite(&level_tiles[y][x], mark);
+                        if (big)
+                            LevelWrite(&level_big_tiles[y][x], mark);
+                    }
+                for (int y = cy0; !big && y <= cy1; ++y)
+                    for (int x = cx0; x <= cx1; ++x)
+                        LevelWrite(&level_map[y][x], mark);
+            }
+            boxes[n_segments] = box;
+            boxed[n_segments] = visible;
+            levels[n_segments] = level;
+            if (level > max_level)
+                max_level = level;
+            segments[n_segments++] =
+                (DrawSegment){seg_start, seg_end, semi, depth, mark};
+        }
+        start = end;
+        gpu_counters.level_ticks +=
+            SDL_GetPerformanceCounter() - ordering_start;
+        for (int level = 0; n_segments && level <= max_level; ++level) {
+            /* this level's draws (contiguous segments of one state merge)
+             * and copies */
+            unsigned n_draws = 0;
+            int n_copies = 0, last = -1;
+            for (int i = 0; i < n_segments; ++i) {
+                if (levels[i] != level)
+                    continue;
+                const DrawSegment* s = &segments[i];
+                if (last < 0 || segments[last].end != s->start ||
+                    segments[last].mark != s->mark ||
+                    segments[last].semi != s->semi ||
+                    segments[last].depth != s->depth)
+                    ++n_draws;
+                last = i;
+                if (!s->semi)
+                    continue;
+                SemiBox copy = boxes[i];
+                bool merged = false;
+                for (int k = 0; k < n_copies && !merged; ++k) {
+                    const SemiBox u = BoxUnion(&copies[k], &copy);
+                    if (BoxArea(&u) <= BoxArea(&copies[k]) + BoxArea(&copy) +
+                                           copy_slack) {
+                        copies[k] = u;
+                        merged = true;
+                    }
+                }
+                if (!merged) {
+                    if (n_copies == LEVEL_COPIES) {
+                        /* one rectangle for the rest */
+                        copies[n_copies - 1] =
+                            BoxUnion(&copies[n_copies - 1], &copy);
+                    } else {
+                        copies[n_copies++] = copy;
+                    }
+                }
+            }
+            if (!n_draws)
+                continue;
+            SDL_GPUCommandBuffer* cmd =
+                ReserveDrawDescriptors(4u * n_draws);
+            if (!cmd)
+                return false;
+            if (n_copies) {
+                SDL_GPUCopyPass* blend_copy = SDL_BeginGPUCopyPass(cmd);
+                for (int k = 0; k < n_copies; ++k) {
+#if defined(__APPLE__)
+                    /* Small unaligned destination snapshots intermittently
+                     * produce stale texels on Metal: whole 16-pixel blocks */
+                    const SemiBox region = {copies[k].x0 & ~15,
+                        copies[k].y0 & ~15,
+                        SDL_min((copies[k].x1 + 15) & ~15,
+                                VRAM_W * (int)target_scale),
+                        SDL_min((copies[k].y1 + 15) & ~15,
+                                VRAM_H * (int)target_scale)};
+#else
+                    const SemiBox region = copies[k];
+#endif
+                    SDL_GPUTextureLocation from = {.texture = render_target,
+                                                   .x = (Uint32)region.x0,
+                                                   .y = (Uint32)region.y0};
+                    SDL_GPUTextureLocation to = from;
+                    to.texture = destination_sample;
+                    SDL_CopyGPUTextureToTexture(
+                        blend_copy, &from, &to,
+                        (Uint32)(region.x1 - region.x0),
+                        (Uint32)(region.y1 - region.y0), 1, false);
+                }
+                SDL_EndGPUCopyPass(blend_copy);
+            }
+            const SDL_GPUColorTargetInfo target = {
+                .texture = render_target,
+                .load_op = SDL_GPU_LOADOP_LOAD,
+                .store_op = SDL_GPU_STOREOP_STORE,
+            };
+            ++frame_stats_batches;
+            ++target_passes;
+            const SDL_GPUDepthStencilTargetInfo depth_target = {
+                .texture = b->depth_texture,
+                .clear_depth = 0.0f,
+                .load_op = depth_clear_pending ? SDL_GPU_LOADOP_CLEAR
+                                               : SDL_GPU_LOADOP_LOAD,
+                .store_op = SDL_GPU_STOREOP_STORE,
+                .stencil_load_op = SDL_GPU_LOADOP_DONT_CARE,
+                .stencil_store_op = SDL_GPU_STOREOP_DONT_CARE,
+            };
+            if (b->depth_texture)
+                depth_clear_pending = false;
+            SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(
+                cmd, &target, 1, b->depth_texture ? &depth_target : NULL);
+            const SDL_GPUBufferBinding vbind = {.buffer = b->vbuf,
+                                                .offset = b->vertex_offset};
+            SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
+            const SDL_GPUBufferBinding ibind = {.buffer = b->ibuf,
+                                                .offset = b->index_offset};
+            SDL_BindGPUIndexBuffer(pass, &ibind,
+                                   SDL_GPU_INDEXELEMENTSIZE_32BIT);
+            const SDL_GPUTextureSamplerBinding sampler_binding[4] = {
+                {.texture = vram_sample, .sampler = vram_sampler},
+                {.texture = destination_sample, .sampler = vram_sampler},
+                {.texture = b->extra_texture, .sampler = b->extra_sampler},
+                {.texture = clut_cache, .sampler = vram_sampler}};
+            SDL_BindGPUFragmentSamplers(pass, 0, sampler_binding,
+                                        PSX_SHADERS_CURRENT ? 4 : 3);
+            int pass_mark = -1;
+            SDL_GPUGraphicsPipeline* bound = NULL;
+            for (int i = 0; i < n_segments; ++i) {
+                if (levels[i] != level)
+                    continue;
+                const DrawSegment* s = &segments[i];
+                /* contiguous segments of one state: one draw */
+                int j = i;
+                while (j + 1 < n_segments && levels[j + 1] == level &&
+                       segments[j + 1].start == segments[j].end &&
+                       segments[j + 1].mark == s->mark &&
+                       segments[j + 1].semi == s->semi &&
+                       segments[j + 1].depth == s->depth)
+                    ++j;
+                const DrawView* view = &b->views[s->mark];
+                if (s->mark != pass_mark) {
+                    pass_mark = s->mark;
+                    SDL_SetGPUViewport(pass, &view->viewport);
+                    SDL_SetGPUScissor(pass, &view->scissor);
+                    SDL_PushGPUVertexUniformData(
+                        cmd, 0, view->offset_ubo, sizeof(view->offset_ubo));
+                }
+                const u32 pass_flags = view->pass_flags;
+                const bool semi = s->semi;
+                const Uint32 first = (Uint32)s->start;
+                const Uint32 count = (Uint32)(segments[j].end - s->start);
+                const bool checked =
+                    PSX_SHADERS_CURRENT && !semi && view->mask_check;
+                const bool combined = PSX_SHADERS_CURRENT && !semi;
+                const u32 color_pass[4] = {
+                    semi ? 2u : combined ? 3u : 0u, target_scale,
+                    b->grid_same, pass_flags};
+                SDL_PushGPUFragmentUniformData(cmd, 0, color_pass,
+                                               sizeof(color_pass));
+                const BlendMode blend = semi       ? BLEND_DIRECT
+                                        : checked  ? BLEND_CHECK
+                                        : combined ? BLEND_DIRECT
+                                                   : BLEND_ADD;
+                SDL_GPUGraphicsPipeline* pipe =
+                    b->depth_texture ? pipe_depth[s->depth][blend]
+                                     : pipe_tri[blend];
+                if (pipe != bound) {
+                    SDL_BindGPUGraphicsPipeline(pass, pipe);
+                    bound = pipe;
+                }
+                SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+                if (!semi && !combined) {
+                    const u32 mask_pass[4] = {1, target_scale, b->grid_same,
+                                              pass_flags};
+                    SDL_PushGPUFragmentUniformData(cmd, 0, mask_pass,
+                                                   sizeof(mask_pass));
+                    SDL_BindGPUGraphicsPipeline(pass, pipe_tri[BLEND_MASK]);
+                    bound = pipe_tri[BLEND_MASK];
+                    SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, 0, 0);
+                }
+                i = j;
+            }
+            SDL_EndGPURenderPass(pass);
+        }
+    }
+    return true;
+}
+
 /* Draws a batch into one target; false when the command buffer failed. */
 static bool DrawTargetRuns(const DrawTargetBatch* b) {
+    if (!destination_fetch && GpuLevels())
+        return DrawTargetLevels(b);
     const u32* ix = b->indices;
     const int n_indices = b->n_indices;
     SDL_GPUTexture* render_target = b->target;
@@ -5806,6 +6365,7 @@ static bool DrawTargetRuns(const DrawTargetBatch* b) {
             .store_op = SDL_GPU_STOREOP_STORE,
         };
         ++frame_stats_batches;
+        ++target_passes;
         /* The depth view's clear (Psyz_VideoDepthView) is the first depth
          * pass's load. */
         const SDL_GPUDepthStencilTargetInfo depth_target = {
@@ -6599,6 +7159,7 @@ static bool DrawBatchFull(unsigned vertices, unsigned indices) {
 static void DrawCountFlush(unsigned reason) {
     (void)reason;
     frame_stats_vertices += n_vertices;
+    gpu_counters.vertices += n_vertices;
     ++frame_stats_flushes;
     if (reason == DRAW_FLUSH_OVERFLOW || reason == DRAW_FLUSH_MARKS || reason == DRAW_FLUSH_CLUT)
         ++frame_stats_overflows;

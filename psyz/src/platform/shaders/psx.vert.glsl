@@ -1,5 +1,5 @@
 #version 450
-// PSYZ_SHADER_REVISION 1
+// PSYZ_SHADER_REVISION 2
 // The interface sdl3_gpu.c drives (its PSX_SHADER_REVISION): bump both when
 // it changes, so stale generated headers fall back to the old behaviour.
 

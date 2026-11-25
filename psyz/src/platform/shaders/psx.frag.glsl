@@ -1,5 +1,5 @@
 #version 450
-// PSYZ_SHADER_REVISION 1
+// PSYZ_SHADER_REVISION 2
 // The interface sdl3_gpu.c drives (its PSX_SHADER_REVISION): bump both when
 // it changes, so stale generated headers fall back to the old behaviour.
 
@@ -98,6 +98,36 @@ bool exactSample() {
     return true;
 }
 
+// Exact PS1 line (exTri.w bit 3, sdl3_gpu.c EmitExactLine): the GPU steps
+// the major axis one pixel at a time, the minor axis in 32.32 and the
+// colour in 12.12. exTri.x = start (x | y << 16, VRAM), exTri.y = steps |
+// y-major << 16 | major axis decreasing << 17; exBase.xyz / exPerX.xyz =
+// colour start / step; exBase.w, exPerX.w = minor start (low, high word),
+// exPerY.xy = minor step (low, high). The VRAM pixel q is on the line
+// when the minor coordinate at its major step is q's; it then sets the
+// colour there.
+bool exactLineSample() {
+    int n = int(max(passMode.y, 1u));
+    ivec2 q = ivec2(floorDiv(int(gl_FragCoord.x), n),
+                    floorDiv(int(gl_FragCoord.y), n));
+    ivec2 start = exactVertex(exTri.x);
+    int steps = int(exTri.y & 0xFFFFu);
+    bool yMajor = (exTri.y & 0x10000u) != 0u;
+    int major = yMajor ? q.y - start.y : q.x - start.x;
+    if ((exTri.y & 0x20000u) != 0u) major = -major;
+    if (major < 0 || major > steps) return false;
+    // minor = high word of start + major * step (64-bit, major < 1024)
+    uint i = uint(major);
+    uint a = i * (exPerY.x & 0xFFFFu), b = i * (exPerY.x >> 16);
+    uint lo = b << 16, low = lo + a;
+    uint high = (b >> 16) + (low < lo ? 1u : 0u) + i * exPerY.y;
+    uint sum = low + exBase.w;
+    high += exPerX.w + (sum < low ? 1u : 0u);
+    if (int(high) != (yMajor ? q.x : q.y)) return false;
+    exactColor8 = vec3((uvec3(exBase.xyz + exPerX.xyz * i) >> 12) & 255u);
+    return true;
+}
+
 uvec2 resolveTexel() {
     if (exactPolygon) return (exactUV & texWindow.xy) | texWindow.zw;
     // PS1 interpolates at integer pixel coordinates, the GPU at pixel centres.
@@ -160,7 +190,9 @@ vec4 fetchModelTexel(ivec2 position) {
 
 void main() {
     exactPolygon = exTri.w != 0u;
-    if (exactPolygon && !exactSample()) discard;
+    if ((exTri.w & 8u) != 0u) {
+        if (!exactLineSample()) discard;
+    } else if (exactPolygon && !exactSample()) discard;
     // Outpainted room margins are presentation-only. They must never reach
     // the native target, even if camera motion moves a margin into its bounds.
     // Explicit queued dialogue glyph: new alpha is presentation-only.
