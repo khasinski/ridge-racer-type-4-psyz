@@ -42,6 +42,14 @@ else()
     set_target_properties(psyz_clock_tests PROPERTIES
         C_STANDARD 11 C_STANDARD_REQUIRED ON)
     add_test(NAME psyz_clock_tests COMMAND psyz_clock_tests)
+    # Fake clock: the frame limiter's pacing against modelled displays.
+    add_executable(psyz_pacing_tests test_pacing.c)
+    set_target_properties(psyz_pacing_tests PROPERTIES
+        C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    if(NOT MSVC)
+        target_link_libraries(psyz_pacing_tests PRIVATE m)
+    endif()
+    add_test(NAME psyz_pacing_tests COMMAND psyz_pacing_tests)
     add_test(NAME psyz_tests COMMAND ${PROJECT_NAME}
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()

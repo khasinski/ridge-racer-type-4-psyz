@@ -12,6 +12,7 @@
 #include <psyz/overlay.h>
 #include <psyz/overlay_sdl3.h>
 #include "../internal.h"
+#include "field_pacing.h"
 #ifdef PLATFORM_IOS
 #include "../ios/ios_platform.h"
 #endif
@@ -237,6 +238,8 @@ int Psyz_VideoSetAspectMode(PsyzAspectMode mode) {
 PsyzAspectMode Psyz_VideoGetAspectMode(void) { return aspect_mode; }
 
 static Uint32 last_vsync_us = 0; // time of the last blocking Psyz_VideoVSync
+/* When the blocking Psyz_VideoVSync in progress was called. */
+static Uint64 vsync_entry_ns;
 /* The blank the frame limiter waited for (WaitForNextFrame). */
 static Uint32 wall_blank_us;
 static bool wall_blank_valid;
@@ -274,6 +277,70 @@ static unsigned game_speed = 1;
 static Uint64 last_present_time = 0;
 static bool present_skip = false; // this frame is not shown
 static bool frame_presented = false; // swapchain image was acquired and queued this frame
+
+/* PSYZ_SIM_DISPLAY=<hz>[,vrr][,images=<n>] (the hidden GPU renderer,
+ * PSYZ_HEADLESS=gpu): a modelled display (field_pacing.h) takes the
+ * swapchain's place, at that refresh, with a swapchain of n images (3):
+ * synced presents queue for its refreshes, a blocking acquire waits for a
+ * free image, a non-blocking one finds none while all are queued. The
+ * refresh rate is the one the vsync mode is chosen for. PSYZ_SIM_VSYNC=
+ * auto|on|off is the vsync mode (auto). PSYZ_SIM_DISPLAY_LOG=file writes a
+ * line a refresh, "<ms> <frame> <repeat>": the frame is the count of
+ * blocking VSync calls when it was presented (the game's frame), repeat 1
+ * when the refresh shows nothing new. */
+static PsyzSimDisplay sim_display;
+static bool sim_display_on;
+static FILE* sim_display_log;
+
+static void SimDisplayLogRefresh(void* user, uint64_t t_ns, uint32_t frame,
+                                 bool repeat) {
+    (void)user;
+    if (sim_display_log)
+        fprintf(sim_display_log, "%.3f %u %d\n", (double)t_ns / 1e6, frame,
+                repeat);
+}
+
+static void SimDisplayInitFromEnv(void) {
+    const char* env = SDL_getenv("PSYZ_SIM_DISPLAY");
+    if (!env || !*env)
+        return;
+    double hz = SDL_atof(env);
+    if (hz < 1.0 || hz > 1000.0)
+        return;
+    bool vrr = SDL_strstr(env, "vrr") != NULL;
+    const char* images = SDL_strstr(env, "images=");
+    Psyz_SimDisplayInit(&sim_display, hz, vrr, images ? (unsigned)SDL_atoi(images + 7) : 3,
+                        SDL_GetTicksNS());
+    const char* log = SDL_getenv("PSYZ_SIM_DISPLAY_LOG");
+    if (log && *log && (sim_display_log = fopen(log, "w"))) {
+        fprintf(sim_display_log, "# ms frame repeat (%.3f Hz%s, %u images)\n",
+                hz, vrr ? " vrr" : "", sim_display.images);
+        sim_display.on_refresh = SimDisplayLogRefresh;
+    }
+    sim_display_on = true;
+    INFOF("modelled display: %.3f Hz%s, %u swapchain images", hz,
+          vrr ? " variable refresh" : "", sim_display.images);
+}
+
+/* The modelled display's acquire: waits for a free image (block) or finds
+ * none; the present then queues the frame. */
+static bool SimDisplayAcquirePresent(bool block) {
+    Uint64 now = SDL_GetTicksNS();
+    Psyz_SimDisplayAdvance(&sim_display, now);
+    while (Psyz_SimDisplayFull(&sim_display)) {
+        if (!block) {
+            sim_display.skipped++;
+            return false;
+        }
+        const Uint64 free_ns = Psyz_SimDisplayNextFreeNs(&sim_display, now);
+        if (free_ns > now)
+            SDL_DelayPrecise(free_ns - now);
+        now = SDL_GetTicksNS();
+        Psyz_SimDisplayAdvance(&sim_display, now);
+    }
+    Psyz_SimDisplayPresent(&sim_display, Psyz_VSyncWaits(), now);
+    return true;
+}
 
 static Uint32 WallVblankCount(void) {
     return (Uint32)((double)SDL_GetTicksNS() * target_frame_rate * game_speed /
@@ -342,53 +409,43 @@ static SDL_DisplayID WindowDisplay(void) {
     return display ? display : SDL_GetPrimaryDisplay();
 }
 
+/* The fields always come from the wall clock (WallVblankCount); the vsync
+ * mode only chooses how frames are presented (field_pacing.h). Driver
+ * VSync is never the game's clock: with it at 0.4 a 60 Hz display beat
+ * against the 59.82 Hz fields and the game ran at half speed for about
+ * three seconds in every six. */
 static void ConfigureVSync(double target_fps) {
     present_sync = false;
-    if (vsync_mode == PSYZ_VSYNC_ON) {
-        use_driver_vsync = PlatformBackend_SetDriverVsync(true);
-        INFOF("vsync forced ON (driver VSync)");
-        return;
-    }
-    if (vsync_mode == PSYZ_VSYNC_OFF) {
-        PlatformBackend_SetDriverVsync(false);
-        use_driver_vsync = false;
-        INFOF("vsync forced OFF (frame limiter)");
-        return;
-    }
-    if (vsync_mode == PSYZ_VSYNC_LIMITLESS) {
-        PlatformBackend_SetDriverVsync(false);
-        use_driver_vsync = false;
-        INFOF("vsync forced OFF, internal frame limiter disabled");
-        return;
-    }
-
+    use_driver_vsync = false;
     SDL_DisplayID display_id = WindowDisplay();
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
-    double detected_framerate = 60.0;
+    double detected_framerate = 0.0;
     if (mode && mode->refresh_rate > 0.0f) {
         detected_framerate = mode->refresh_rate;
     }
+    if (sim_display_on)
+        detected_framerate = sim_display.hz;
 
-    const double target_time = 1.0 / target_fps;
-    const double tolerance_us = target_time * 0.05;
-    bool can_use_driver_vsync =
-        fabs((1.0 / detected_framerate) - target_time) < tolerance_us;
-
-    if (can_use_driver_vsync && PlatformBackend_SetDriverVsync(true)) {
-        use_driver_vsync = true;
-        INFOF("detected %.2f Hz monitor, use driver VSync", detected_framerate);
-    } else if (detected_framerate > target_fps * 1.05 &&
-               PlatformBackend_SetPresentSync(true)) {
-        use_driver_vsync = false;
-        present_sync = true;
-        INFOF("detected %.2f Hz monitor, frame limiter paces %.2f Hz synced "
-              "presents", detected_framerate, target_fps);
-    } else {
+    PsyzPacing pacing = Psyz_PacingChoose((int)vsync_mode, detected_framerate,
+                                          target_fps, true, true);
+    if (pacing == PSYZ_PACING_SYNCED &&
+        !(present_sync = PlatformBackend_SetPresentSync(true)))
+        pacing = Psyz_PacingChoose((int)vsync_mode, detected_framerate,
+                                   target_fps, false, true);
+    if (pacing == PSYZ_PACING_BLOCKING &&
+        !(use_driver_vsync = PlatformBackend_SetDriverVsync(true)))
+        pacing = PSYZ_PACING_IMMEDIATE;
+    if (pacing == PSYZ_PACING_IMMEDIATE || pacing == PSYZ_PACING_UNPACED)
         PlatformBackend_SetDriverVsync(false);
-        use_driver_vsync = false;
-        INFOF("detected %.2f Hz monitor but targeting %.2f, use frame limiter",
-              detected_framerate, target_fps);
-    }
+    static const char* const names[] = {
+        "synced presents", "immediate presents (may tear)",
+        "presents that wait for the display", "no frame limiter"};
+    INFOF("vsync %s, %.2f Hz display: %.3f Hz fields from the frame limiter, %s",
+          vsync_mode == PSYZ_VSYNC_ON    ? "on"
+          : vsync_mode == PSYZ_VSYNC_OFF ? "off"
+          : vsync_mode == PSYZ_VSYNC_LIMITLESS ? "limitless"
+                                               : "auto",
+          detected_framerate, target_fps, names[pacing]);
 }
 
 static void ApplyFullscreenMode(void);
@@ -519,27 +576,26 @@ static void WaitForNextFrame(void) {
     (void)elapsed_us;
     Psyz_WebWaitForNextFrame();
 #else
-    /* Above normal speed driver VSync no longer paces every frame (most are
-     * not shown), so the limiter does, at the faster rate. Also fall back to
-     * software pacing when no swapchain image was presented (e.g. minimized). */
-    if ((!use_driver_vsync || !frame_presented || game_speed > 1) &&
-        vsync_mode != PSYZ_VSYNC_LIMITLESS) {
-        /* Wait for the next blank of the wall clock that counts the blanks
-         * (WallVblankCount), as the console waits for the next vertical
-         * blank: the fields keep one phase, a frame that overran a field
-         * waits for the following blank rather than starting at once, and
-         * VSync(1) counts lines from that blank. */
+    /* The fields come from the wall clock in every vsync mode: a present
+     * that waited for the display (driver VSync) does not pace them. */
+    if (vsync_mode != PSYZ_VSYNC_LIMITLESS) {
+        /* Wait for the first blank of the wall clock that counts the blanks
+         * (WallVblankCount) after VSync was called, as the console waits
+         * for the next vertical blank: the fields keep one phase, a frame
+         * that overran a field waits for the following blank rather than
+         * starting at once, and VSync(1) counts lines from that blank. A
+         * present that waited past that blank has spent the wait. */
         (void)elapsed_us;
         const double field_ns = 1e9 / (target_frame_rate * game_speed);
         const Uint64 now_ns = SDL_GetTicksNS();
         const Uint64 blank_ns =
-            (Uint64)((floor((double)now_ns / field_ns) + 1.0) * field_ns);
+            Psyz_FieldWaitUntilNs(vsync_entry_ns, now_ns, field_ns);
         /* Sleep to a margin before the blank and spin the rest. The margin
          * follows the sleeps' recent overshoot (the system's timer slack,
          * often over 1 ms on macOS), so the wait ends at the blank. */
         static double sleep_margin_ns = 1000000.0;
         const Uint64 margin = (Uint64)sleep_margin_ns;
-        if (blank_ns > now_ns + margin) {
+        if (blank_ns && blank_ns > now_ns + margin) {
             const Uint64 wake = blank_ns - margin;
             SDL_DelayNS(wake - now_ns);
             const double over = (double)(Sint64)(SDL_GetTicksNS() - wake);
@@ -549,8 +605,10 @@ static void WaitForNextFrame(void) {
         }
         while (SDL_GetTicksNS() < blank_ns) {
         }
-        wall_blank_us = (Uint32)(blank_ns / 1000);
-        wall_blank_valid = true;
+        if (blank_ns) {
+            wall_blank_us = (Uint32)(blank_ns / 1000);
+            wall_blank_valid = true;
+        }
     }
 #endif
 
@@ -757,8 +815,7 @@ static bool SkipPresent(void) {
 /* The host time to the next blank of the frame limiter's field clock (the
  * blank VSync(0) waits for), UINT64_MAX when fields are not paced by it. */
 uint64_t Psyz_VideoNsUntilBlank(void) {
-    if (vsync_mode == PSYZ_VSYNC_LIMITLESS || host_clock_pause_depth ||
-        (use_driver_vsync && game_speed == 1))
+    if (vsync_mode == PSYZ_VSYNC_LIMITLESS || host_clock_pause_depth)
         return UINT64_MAX;
     const double field_ns = 1e9 / (target_frame_rate * game_speed);
     const Uint64 now_ns = SDL_GetTicksNS();
@@ -771,6 +828,50 @@ void Psyz_VideoWaitBlank(void) {
         return;
     limitless_vblank_base++;
     Psyz_VSyncBlank();
+}
+
+/* Long frames on the real-time clock, in the log (at most a line a
+ * second; the game's frame is what it did between a VSync(0) and its first
+ * VSync(1) poll or next VSync(0)): "[Frame pacing] long frame". A frame
+ * that takes longer than a field loses that field, as on the console; the
+ * line says whether the game's own work or the present/wait took it. */
+static Uint64 pacing_return_ns, pacing_poll_ns;
+static Uint64 pacing_log_ns;
+static unsigned pacing_long, pacing_long_logged;
+static double pacing_worst_work_ms, pacing_worst_vsync_ms;
+
+static void PacingNoteFrame(Uint64 entry_ns, Uint64 return_ns) {
+    if (vsync_mode == PSYZ_VSYNC_LIMITLESS || host_clock_pause_depth ||
+        !pacing_return_ns) {
+        pacing_return_ns = return_ns;
+        pacing_poll_ns = 0;
+        return;
+    }
+    const double field_ms = 1000.0 / (target_frame_rate * game_speed);
+    const Uint64 work_end = pacing_poll_ns ? pacing_poll_ns : entry_ns;
+    const double work_ms = (double)(work_end - pacing_return_ns) / 1e6;
+    /* VSync(0) itself: the wait for its blank and the present (one field
+     * at most, unless the present waited for the display past it) */
+    const double vsync_ms = (double)(return_ns - entry_ns) / 1e6;
+    if (work_ms > field_ms || vsync_ms > field_ms * 1.25) {
+        pacing_long++;
+        if (work_ms > pacing_worst_work_ms)
+            pacing_worst_work_ms = work_ms;
+        if (vsync_ms > pacing_worst_vsync_ms)
+            pacing_worst_vsync_ms = vsync_ms;
+    }
+    if (pacing_long != pacing_long_logged &&
+        return_ns - pacing_log_ns >= 1000000000u) {
+        INFOF("[Frame pacing] long frame: %u since the last line, worst game "
+              "work %.1f ms, worst VSync %.1f ms (field %.2f ms, at %.1f s)",
+              pacing_long - pacing_long_logged, pacing_worst_work_ms,
+              pacing_worst_vsync_ms, field_ms, (double)return_ns / 1e9);
+        pacing_long_logged = pacing_long;
+        pacing_worst_work_ms = pacing_worst_vsync_ms = 0.0;
+        pacing_log_ns = return_ns;
+    }
+    pacing_return_ns = return_ns;
+    pacing_poll_ns = 0;
 }
 
 int Psyz_VideoVSync(int mode) {
@@ -814,6 +915,7 @@ int Psyz_VideoVSync(int mode) {
                                 game_speed) >> 6);
     }
     if (mode == 0) {
+        vsync_entry_ns = SDL_GetTicksNS();
         const Uint64 work_end = SDL_GetPerformanceCounter();
         PresentDue(); /* none came since the last blank */
         if (PacedPresents()) {
@@ -840,6 +942,9 @@ int Psyz_VideoVSync(int mode) {
         last_vsync_us = wall_blank_valid ? wall_blank_us
                                          : (Uint32)(SDL_GetTicksNS() / 1000);
         wall_blank_valid = false;
+        PacingNoteFrame(vsync_entry_ns, SDL_GetTicksNS());
+    } else if (mode == 1 && !pacing_poll_ns) {
+        pacing_poll_ns = SDL_GetTicksNS();
     }
     return ret;
 }

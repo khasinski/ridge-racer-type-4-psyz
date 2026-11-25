@@ -410,6 +410,9 @@ static bool present_commit_pending;
 static Uint64 present_window_start;
 static unsigned present_window_frames;
 static float actual_present_fps;
+/* presents that found no free swapchain image (not shown), in all and
+ * since the latest [Presentation FPS] line */
+static unsigned long long present_no_image, present_no_image_logged;
 float Psyz_GpuGetPresentedFps(void){return actual_present_fps;}
 static void RecordPresentedCommit(void) {
     if (!present_commit_pending)
@@ -439,10 +442,13 @@ static void RecordPresentedCommit(void) {
     Uint64 elapsed = now - present_window_start;
     if (elapsed >= 1000) {
         actual_present_fps = 1000.0f * present_window_frames / (float)elapsed;
-        INFOF("[Presentation FPS] actual=%.1f output=%s elapsed_ms=%llu",
+        INFOF("[Presentation FPS] actual=%.1f output=%s elapsed_ms=%llu "
+              "no_image=%llu",
               actual_present_fps,
               hidden_gpu_renderer ? "offscreen" : "display",
-              (unsigned long long)elapsed);
+              (unsigned long long)elapsed,
+              present_no_image - present_no_image_logged);
+        present_no_image_logged = present_no_image;
         present_window_start = now;
         present_window_frames = 0;
     }
@@ -1841,6 +1847,14 @@ bool InitPlatform() {
         return false;
     }
 
+    /* Three frames in flight (SDL's default is two): the swapchain gets
+     * three images on Direct3D 12 and Vulkan, so a synced present at about
+     * the display's own rate (a 60 Hz display, 59.82 Hz fields) finds a
+     * free one although the image before it is still queued or on screen,
+     * and the frame limiter's non-blocking acquire does not drop it. The
+     * queue stays short: the fields come no faster than the refreshes. */
+    if (!hidden_gpu_renderer && !SDL_SetGPUAllowedFramesInFlight(device, 3))
+        WARNF("SDL_SetGPUAllowedFramesInFlight: %s", SDL_GetError());
     // useful for offscreen rendering with SDL_VIDEODRIVER=offscreen
     swapchain_ok = !hidden_gpu_renderer &&
                    SDL_ClaimWindowForGPUDevice(device, sdl3_window);
@@ -1873,6 +1887,15 @@ bool InitPlatform() {
     if (hidden_gpu_renderer)
         vsync_mode = SDL_getenv("PSYZ_HEADLESS_PACED") ? PSYZ_VSYNC_OFF
                                                        : PSYZ_VSYNC_LIMITLESS;
+    if (hidden_gpu_renderer) {
+        SimDisplayInitFromEnv();
+        if (sim_display_on) {
+            const char* v = SDL_getenv("PSYZ_SIM_VSYNC");
+            vsync_mode = v && !SDL_strcmp(v, "on")    ? PSYZ_VSYNC_ON
+                         : v && !SDL_strcmp(v, "off") ? PSYZ_VSYNC_OFF
+                                                      : PSYZ_VSYNC_AUTO;
+        }
+    }
     Sdl3Common_TimingInit();
 
     is_platform_init_successful = true;
@@ -1900,6 +1923,10 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
         return fallback_renderer &&
                SDL_SetRenderVSync(fallback_renderer, enable ? 1 : 0) &&
                enable;
+    if (hidden_gpu_renderer && sim_display_on) {
+        sim_display.synced = enable;
+        return enable;
+    }
     if (!device || !swapchain_ok) {
         return false;
     }
@@ -1927,8 +1954,13 @@ static bool PlatformBackend_SetDriverVsync(bool enable) {
 }
 
 /* VSYNC presents never queue up while the limiter paces them below the
- * display's rate. */
+ * display's rate, and the acquire does not wait (PlatformBackend_Present).
+ * The fallback presenter's SDL renderer has no non-blocking synced
+ * present: its synced present waits for the display (PSYZ_PACING_BLOCKING
+ * in ConfigureVSync, which counts that wait towards the field's). */
 static bool PlatformBackend_SetPresentSync(bool enable) {
+    if (fallback_presenter)
+        return false;
     return PlatformBackend_SetDriverVsync(enable);
 }
 
@@ -2768,6 +2800,10 @@ static void PlatformBackend_Present(void) {
             swapchain = ws_capture;
             sc_w = ws_capture_width;
             sc_h = ws_capture_height;
+        } else if (hidden_gpu_renderer && sim_display_on &&
+                   !SimDisplayAcquirePresent(use_driver_vsync)) {
+            /* the modelled display has no free image: not shown */
+            present_no_image++;
         } else if (hidden_gpu_renderer) {
             HiddenPresentSize();
             sc_w = hidden_w; sc_h = hidden_h;
@@ -2780,7 +2816,8 @@ static void PlatformBackend_Present(void) {
             }
             swapchain = hidden_present_target;
         } else if (use_driver_vsync) {
-            /* driver VSync paces the game: wait for the image */
+            /* presents that wait for the display (ConfigureVSync: not
+             * chosen while synced presents work, which they do here) */
             if (!SDL_WaitAndAcquireGPUSwapchainTexture(
                     cmd, sdl3_window, &swapchain, &sc_w, &sc_h))
                 WARNF("SDL_WaitAndAcquireGPUSwapchainTexture: %s", SDL_GetError());
@@ -2791,6 +2828,8 @@ static void PlatformBackend_Present(void) {
              * own rate). Without a free image this frame is not shown; its
              * drawing is still submitted. */
             WARNF("SDL_AcquireGPUSwapchainTexture: %s", SDL_GetError());
+        } else if (!swapchain) {
+            present_no_image++; /* every image queued: not an error */
         }
         if (swapchain) {
             if (!ws_capture_active){frame_presented=true;present_commit_pending=!host_clock_pause_depth;}

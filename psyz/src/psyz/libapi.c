@@ -146,10 +146,15 @@ static unsigned int WaitBlank(unsigned int now) {
     return now;
 }
 
+static unsigned vsync_waits;
+unsigned Psyz_VSyncWaits(void) { return vsync_waits; }
+
 int VSync(int mode) {
     Psyz_KernelPoll();
     if (mode < 0)
         return Psyz_VideoVSync(-1);
+    if (mode != 1)
+        vsync_waits++;
     // a wait (not a query, which interrupt callbacks also make)
     if (WallBlanks()) {
         ServiceWallBlanks();

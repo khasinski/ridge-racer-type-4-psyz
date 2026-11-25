@@ -113,6 +113,9 @@ unsigned Psyz_GpuCrtcBlankLines(void);
 // The work of one blank (libapi.c): pad refresh, the VSync hook, the
 // vblank interrupt.
 void Psyz_VSyncBlank(void);
+// The blocking VSync calls so far (libapi.c): the game's frames, for the
+// display model's log (PSYZ_SIM_DISPLAY).
+unsigned Psyz_VSyncWaits(void);
 // libpad (libpad.c): its handler runs at each vblank once PadStartCom ran;
 // Psyz_LibpadVBlank is that handler.
 int Psyz_PadDriverRunning(void);
